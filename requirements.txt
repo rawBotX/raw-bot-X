@@ -1,0 +1,7 @@
+nest-asyncio
+requests
+pytz
+beautifulsoup4
+selenium
+python-telegram-bot
+python-dotenv

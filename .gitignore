@@ -1,0 +1,35 @@
+# Sensible Konfiguration (niemals hochladen!)
+config.env
+
+# Cookie-Dateien (beinhalten Session-Informationen)
+*.cookies.json
+
+# Dynamische Daten & Backups (können groß werden, sind spezifisch für einen Lauf)
+admins.json
+settings.json
+posts_count.json
+ratings.json
+schedule.json
+add_contacts_*.txt
+follower_backup_*.txt
+global_followed_users.txt
+keywords.json
+settings.json
+
+# Python Cache und kompilierte Dateien
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtuelle Umgebung (falls du eine verwendest)
+venv/
+*.venv/
+env/
+*.env/
+
+# IDE/Editor spezifische Dateien (Beispiele)
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
