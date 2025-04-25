@@ -72,7 +72,6 @@ ascii_art = [
 r"                                                           ",
 r"                                                           ",
 r"                                                           ",
-r"                                                           ",
 r"              \\\\\\\\\                   /////            ",
 r"                \\\   \\\               /////              ",
 r"                  \\\   \\\        _  /////                ",
@@ -88,10 +87,7 @@ r"                   /////          \\\   \\\                ",
 r"                 /////              \\\   \\\              ",
 r"               /////                  \\\\\\\\\            ",
 r"                                                           ",
-r"                                                           ",
-r"                                                           ",
-r"                                                           ",
-r"                                                           ",
+r"                                                           ", 
 r"                                                           "
 ]
 
@@ -250,6 +246,7 @@ current_account = 0
 driver = None
 application = None
 last_like_time = time.time()
+last_driver_restart_time = time.time() 
 # Counter für Login-Versuche
 login_attempts = 0
 # Neue Variablen für Pause-Mechanismus
@@ -6313,6 +6310,67 @@ async def run():
                     continue # Zum nächsten Schleifendurchlauf
 
                 # 3. Wenn wir hier sind, ist der Bot NICHT pausiert
+
+                # --- NEU: Periodischer WebDriver-Neustart ---
+                global last_driver_restart_time, driver # Zugriff auf Globals
+                restart_interval_seconds = 4 * 60 * 60 # 4 Stunden
+
+                if time.time() - last_driver_restart_time > restart_interval_seconds:
+                    print(f"INFO: {restart_interval_seconds / 3600:.1f} Stunden seit letztem Driver-Neustart vergangen. Starte neu...")
+                    await send_telegram_message("🔄 Starte geplanten WebDriver-Neustart zur Speicherfreigabe...")
+                    await pause_scraping() # Pausiere das Haupt-Scraping
+                    login_ok_after_restart = False
+                    try:
+                        # Alten Driver sicher schließen
+                        if driver:
+                            print("Schließe alten WebDriver...")
+                            try:
+                                driver.quit()
+                            except Exception as quit_err:
+                                print(f"WARNUNG: Fehler beim Schließen des alten Drivers (möglicherweise schon geschlossen): {quit_err}")
+                        driver = None # Explizit auf None setzen
+
+                        # Neuen Driver erstellen
+                        print("Erstelle neuen WebDriver...")
+                        driver = create_driver() # Deine Funktion zum Erstellen des Drivers
+
+                        # Erneut einloggen
+                        print("Versuche erneuten Login mit aktuellem Account...")
+                        if await login(): # login() verwendet global current_account
+                            print("Login nach WebDriver-Neustart erfolgreich.")
+                            await switch_to_following_tab() # Wichtig: Zum Following-Tab wechseln
+                            await send_telegram_message("✅ WebDriver-Neustart und Login erfolgreich.")
+                            last_driver_restart_time = time.time() # Zeitstempel NUR bei Erfolg aktualisieren
+                            login_ok_after_restart = True
+                        else:
+                            print("FEHLER: Login nach WebDriver-Neustart fehlgeschlagen!")
+                            await send_telegram_message("❌ FEHLER: Login nach WebDriver-Neustart fehlgeschlagen! Versuche beim nächsten Intervall erneut.")
+                            # Zeitstempel NICHT aktualisieren, damit es bald wieder versucht wird
+                    except Exception as restart_err:
+                        print(f"FEHLER während des WebDriver-Neustarts/Logins: {restart_err}")
+                        logger.error("Exception during WebDriver restart/login", exc_info=True)
+                        await send_telegram_message(f"❌ Kritischer Fehler während WebDriver-Neustart: {str(restart_err)[:200]}")
+                        # Driver ggf. auf None setzen, falls Erstellung fehlschlug
+                        if 'driver' in locals() and driver is None:
+                             pass # Ist schon None
+                        elif 'driver' not in locals():
+                             pass # Wurde nie zugewiesen
+                        else: # Driver existiert, aber Login schlug fehl o.ä.
+                             try:
+                                 driver.quit()
+                             except: pass
+                             driver = None
+
+
+                    await resume_scraping() # Scraping fortsetzen
+
+                    # Wichtig: Nach einem Neustart-Versuch (egal ob erfolgreich)
+                    # direkt zum nächsten Loop-Durchlauf springen, um den Zustand neu zu bewerten.
+                    print("Setze Hauptschleife nach Neustart-Versuch fort...")
+                    await asyncio.sleep(5) # Kurze Pause nach dem ganzen Prozess
+                    continue # Springe zum Anfang der while-Schleife
+
+                # --- ENDE WebDriver-Neustart ---
 
                 # --- Periodischer Follow Check (wie zuvor) ---
                 follow_interval = random.uniform(900, 1800) # 15-30 Minuten
