@@ -2869,7 +2869,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                  return # sync_followers_command managed resume/task
 
             # --- Direkte Command-Aufrufe (managen ihr eigenes pause/resume) ---
-            elif payload in ["pause", "resume", "mode_full", "mode_ca", "stats", "ping", "keywords", "account", "schedule_on", "schedule_off", "schedule", "mode", "help", "show_rates", "build_global", "global_info"]:
+            elif payload in ["pause", "resume", "mode_full", "mode_ca", "stats", "ping", "keywords", "account", "schedule_on", "schedule_off", "schedule", "mode", "help", "show_rates", "build_global", "global_info", "status"]: 
                  logger.debug(f"Calling command handler for help payload: {payload}")
                  if payload == "pause": await pause_command(emulated_update, None)
                  elif payload == "resume": await resume_command(emulated_update, None)
@@ -2887,7 +2887,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                  elif payload == "help": await help_command(emulated_update, None)
                  elif payload == "show_rates": await show_ratings_command(emulated_update, None)
                  elif payload == "build_global": await build_global_from_backups_command(emulated_update, None) # Aufruf für Button
-                 elif payload == "global_info": await global_list_info_command(emulated_update, None) # Aufruf für Button
+                 elif payload == "status": await status_command(emulated_update, None) 
                  return # Die aufgerufenen Commands machen resume
 
             # --- "Prepare" Payloads (senden nur Text) ---
@@ -3722,55 +3722,100 @@ async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await resume_scraping()
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Zeigt den aktuellen Betriebsstatus des Bots an."""
+    """Zeigt einen umfassenden Betriebsstatus des Bots an."""
     await pause_scraping() # Pause für die Dauer des Befehls
 
-    # Sammle alle Statusinformationen
+    # --- Globale Variablen sammeln ---
     global is_scraping_paused, is_schedule_pause, search_mode, schedule_enabled, \
            schedule_pause_start, schedule_pause_end, is_periodic_follow_active, \
-           current_account, ACCOUNTS
+           current_account, ACCOUNTS, global_followed_users_set, \
+           current_account_usernames_to_follow, GLOBAL_FOLLOWED_FILE
+
+    # --- Informationen sammeln ---
 
     # 1. Laufstatus
     if is_scraping_paused:
-        if is_schedule_pause:
-            running_status = "⏸️ PAUSED (Schedule)"
-        else:
-            running_status = "⏸️ PAUSED (Manual)"
+        running_status = "⏸️ PAUSED (Schedule)" if is_schedule_pause else "⏸️ PAUSED (Manual)"
     else:
         running_status = "▶️ RUNNING"
 
-    # 2. Suchmodus
-    mode_text = "Full (CA + Keywords)" if search_mode == "full" else "CA ONLY"
-
-    # 3. Zeitplan
-    schedule_status = "ON" if schedule_enabled else "OFF"
-    schedule_details = f"{schedule_status} ({schedule_pause_start} - {schedule_pause_end})"
-
-    # 4. Auto-Follow
-    autofollow_stat = "ACTIVE" if is_periodic_follow_active else "PAUSED"
-
-    # 5. Aktueller Account
+    # 2. Aktueller Account
     current_username = get_current_account_username() or "N/A"
     account_info = f"Acc {current_account+1} (@{current_username})"
 
-    # Baue die Nachricht
+    # 3. Suchmodus
+    mode_text = "Full (CA + Keywords)" if search_mode == "full" else "CA ONLY"
+
+    # 4. Zeitplan
+    schedule_status = "ON" if schedule_enabled else "OFF"
+    schedule_details = f"{schedule_status} ({schedule_pause_start} - {schedule_pause_end})"
+
+    # 5. Globale Follow-Liste Info
+    global_list_count = len(global_followed_users_set) # In-Memory ist meist aktuell genug für Status
+    global_list_mod_time_str = "N/A"
+    try:
+        if os.path.exists(GLOBAL_FOLLOWED_FILE):
+            mod_timestamp = os.path.getmtime(GLOBAL_FOLLOWED_FILE)
+            try:
+                local_tz = ZoneInfo("Europe/Berlin")
+            except Exception:
+                local_tz = timezone(timedelta(hours=2)) # Fallback
+            mod_datetime_local = datetime.fromtimestamp(mod_timestamp, tz=local_tz)
+            # Nur Datum und Uhrzeit für Kompaktheit
+            global_list_mod_time_str = mod_datetime_local.strftime('%Y-%m-%d %H:%M')
+        else:
+             global_list_count = 0 # Wenn Datei nicht existiert
+    except Exception as e:
+        logger.error(f"Fehler beim Abrufen der Global-List-Infos für Status: {e}")
+        global_list_mod_time_str = "Fehler"
+    global_list_info = f"{global_list_count} User (Stand: {global_list_mod_time_str})"
+
+    # 6. Auto-Follow Status (für aktuellen Account)
+    autofollow_stat = "ACTIVE" if is_periodic_follow_active else "PAUSED"
+
+    # 7. Aktuelle Account Follow-Liste Info + Vorschau
+    current_list_path = get_current_follow_list_path()
+    current_list_filename = os.path.basename(current_list_path) if current_list_path else "N/A"
+    current_list_count = len(current_account_usernames_to_follow)
+    current_list_preview = ""
+    if current_list_count > 0:
+        max_preview = 30
+        # Nimm die ersten User aus der Liste für die Vorschau
+        preview_list = current_account_usernames_to_follow[:max_preview]
+        # Formatiere jeden User als Code
+        current_list_preview = "\n".join([f"    - `{user}`" for user in preview_list])
+        if current_list_count > max_preview:
+            current_list_preview += f"\n    ... und {current_list_count - max_preview} weitere."
+    else:
+        current_list_preview = "    (Liste ist leer)"
+    # Info-Zeile für die Liste
+    current_list_info = f"{current_list_count} User in `{current_list_filename}`"
+
+    # --- Nachricht zusammenbauen ---
     status_message = (
-        f"📊 **Bot Status** 📊\n\n"
-        f"▪️ **Betrieb:** {running_status}\n"
-        f"▪️ **Account:** {account_info}\n"
-        f"▪️ **Suchmodus:** {mode_text}\n"
-        f"▪️ **Zeitplan:** {schedule_details}\n"
-        f"▪️ **Auto-Follow:** {autofollow_stat}\n"
+        f"📊 **Bot Gesamtstatus** 📊\n\n"
+        # Betrieb: Play/Pause-Symbole, evtl. mit Farbkreis oder Uhr für Schedule
+        f"{'▶️🟢' if not is_scraping_paused else ('⏸️⏰' if is_schedule_pause else '⏸️🟡')} **Betrieb:** {running_status}\n"
+        # Account: Ninja oder Personensymbol
+        f"🥷 **Aktiver Account:** {account_info}\n"
+        # Suchmodus: Lupe
+        f"🔍 **Suchmodus:** {mode_text}\n"
+        # Zeitplan: Uhr oder Kalender
+        f"⏰ **Zeitplan:** {schedule_details}\n"
+        # Globale Liste: Globus oder Datenbank/Buch
+        f"🌍 **Globale Follow-Liste:** {global_list_info}\n"
+        # Auto-Follow: Roboter oder laufende Person mit Pfeil
+        f"🤖 **Auto-Follow (Akt. Acc):** {autofollow_stat}\n"
+        # Follow-Liste: Klemmbrett, Notizblock oder Zielliste
+        f"📝 **Follow-Liste (Akt. Acc):** {current_list_info}\n"
+        # Die Vorschau selbst braucht kein extra Emoji davor
+        f"{current_list_preview}"
     )
 
-    # === NEU: Button zum Anzeigen der Follow-Liste hinzufügen ===
-    keyboard = [[
-        InlineKeyboardButton("📝 Show Current Follow List", callback_data="status:show_follow_list")
-    ]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    # === Ende Button ===
+    # --- Nachricht senden ---
+    # Wir entfernen den alten Button, da die Liste jetzt direkt angezeigt wird.
+    await update.message.reply_text(status_message, parse_mode=ParseMode.MARKDOWN)
 
-    await update.message.reply_text(status_message, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup) # Markdown für Fett
     await resume_scraping() # Fortsetzen nach dem Befehl
 
 # --- Mode ---
@@ -4170,7 +4215,9 @@ async def show_help_message(update: Update):
             InlineKeyboardButton("⏸️ Pause", callback_data="help:pause"),
             InlineKeyboardButton("▶️ Resume", callback_data="help:resume")
         ],
-        [separator_button],
+        [
+            InlineKeyboardButton("📊 Status", callback_data="help:status")
+        ],
         [
             InlineKeyboardButton("🔍 Show Mode", callback_data="help:mode"),
             InlineKeyboardButton("🔍 Mode FULL", callback_data="help:mode_full"),
