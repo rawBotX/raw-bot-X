@@ -15,6 +15,7 @@ import html
 import base64
 import logging
 import traceback
+from telegram.constants import ParseMode
 from urllib.parse import urlparse
 from collections import deque
 from datetime import datetime, timezone, timedelta
@@ -87,7 +88,26 @@ r"                   /////          \\\   \\\                ",
 r"                 /////              \\\   \\\              ",
 r"               /////                  \\\\\\\\\            ",
 r"                                                           ",
-r"                                                           ", 
+r"                                                           ",
+r"                                                           ",
+r"                                                           ",
+r"                                                           ",
+r"             \\\\\\\\\                    ////             ",
+r"               \\\   \\\                ////               ",
+r"                 \\\   \\\         _  ////                 ",
+r"                   \\\   \\\      | | //         _         ",
+r"          ____   ____\\\_ _\\\__  | | _    ___  | |_       ",
+r"         / ___) / _  || | | |(___)| || \  / _ \ |  _)      ",
+r"        | |    ( ( | || | | |  \\\| |_) )| |_| || |__      ",
+r"        |_|     \_||_| \____|\   \|____/  \___/  \___)     ",
+r"                             \\\   \\\                     ",
+r"                       ////    \\\   \\\                   ",
+r"                     ////        \\\   \\\                 ",
+r"                   ////            \\\   \\\               ",
+r"                 ////                \\\   \\\             ",
+r"               ////                    \\\\\\\\\           ",
+r"                                                           ",
+r"                                                           ",
 r"                                                           "
 ]
 
@@ -259,6 +279,13 @@ first_run = True
 # Suchmodus: "full" für CA + Keywords, "ca_only" für nur CA
 search_mode = "full"
 
+# ===> Following Database <===
+FOLLOWING_DB_FILE = "following_database.json"
+following_database = {} # Wird beim Start geladen
+is_db_scrape_running = False # Flag für Nebenläufigkeit
+cancel_db_scrape_flag = False # Flag zum Abbrechen
+# ===> END Following Database <===
+
 # Post counting variables
 POSTS_COUNT_FILE = "posts_count.json"
 # Schedule variables
@@ -328,10 +355,13 @@ def load_settings():
                 search_mode = settings.get("search_mode", "full") # Lade search_mode, default "full"
                 print(f"Einstellungen geladen. DND-Modus: {'AN' if dnd_mode_enabled else 'AUS'}, Suchmodus: {search_mode}")
         else:
-            print("Keine Einstellungsdatei gefunden, verwende Standardwerte.")
+            print("Keine Einstellungsdatei gefunden, setze Standardwerte und erstelle Datei...")
             # Setze Standardwerte, wenn Datei nicht existiert
             dnd_mode_enabled = False
             search_mode = "full"
+            # Speichere die Standardwerte sofort, um die Datei zu erstellen
+            save_settings()
+            print(f"Standard-Einstellungsdatei '{SETTINGS_FILE}' wurde erstellt.")
     except (json.JSONDecodeError, Exception) as e: # Auch JSONDecodeError abfangen
         print(f"Fehler beim Laden der Einstellungen ({type(e).__name__}): {e}. Verwende Standardwerte.")
         # Fallback zu Standardwerten bei Fehlern
@@ -460,6 +490,34 @@ def save_ratings():
         # print("Rating-Daten gespeichert.") # Optional
     except Exception as e:
         print(f"Fehler beim Speichern der Rating-Daten: {e}")
+
+def load_following_database():
+    """Lädt die Following-Datenbank aus der Datei."""
+    global following_database
+    try:
+        if os.path.exists(FOLLOWING_DB_FILE):
+            with open(FOLLOWING_DB_FILE, 'r', encoding='utf-8') as f:
+                following_database = json.load(f)
+                print(f"Following-Datenbank geladen ({len(following_database)} Einträge).")
+        else:
+            following_database = {}
+            print("Keine Following-Datenbank-Datei gefunden, starte mit leerer Datenbank.")
+    except json.JSONDecodeError:
+        print(f"FEHLER: {FOLLOWING_DB_FILE} ist korrupt. Starte mit leerer Datenbank.")
+        following_database = {}
+    except Exception as e:
+        print(f"Fehler beim Laden der Following-Datenbank: {e}")
+        following_database = {}
+
+def save_following_database():
+    """Speichert die aktuelle Following-Datenbank in die Datei."""
+    global following_database
+    try:
+        with open(FOLLOWING_DB_FILE, 'w', encoding='utf-8') as f:
+            json.dump(following_database, f, indent=2) # indent=2 für etwas Lesbarkeit
+        # print("Following-Datenbank gespeichert.") # Optional
+    except Exception as e:
+        print(f"Fehler beim Speichern der Following-Datenbank: {e}")
 
 def load_set_from_file(filepath):
     """Lädt Zeilen aus einer Datei in ein Set."""
@@ -895,12 +953,18 @@ async def handle_2fa():
 async def wait_for_auth_code():
     """Wait for the user to send an auth code via Telegram"""
     global AUTH_CODE, WAITING_FOR_AUTH
-    for _ in range(300):  # 5 minutes timeout
+    logger.info("[Auth Wait] Starting to wait for auth code...") # Log start
+    for i in range(300):  # 5 minutes timeout
+        # Logge den Check in jedem Durchlauf
+        logger.debug(f"[Auth Wait] Loop {i+1}/300: Checking AUTH_CODE (current value: {'Set' if AUTH_CODE else 'None'})...")
         if AUTH_CODE:
             code = AUTH_CODE
             AUTH_CODE = None  # Reset code
+            logger.info(f"[Auth Wait] Auth code '{code}' received!") # Log success mit Code
             return code
-        await asyncio.sleep(1)
+        await asyncio.sleep(1) # Wichtig: await hier lassen!
+    # Wird nur erreicht, wenn die Schleife ohne Fund durchläuft
+    logger.warning("[Auth Wait] Timeout after 300 seconds while waiting for authentication code.") # Log timeout
     await send_telegram_message("⏰ Timeout while waiting for authentication code")
     return None
 
@@ -1061,6 +1125,53 @@ async def logout():
     except Exception as e:
         print(f"Error clearing cookies and storage: {e}")
         return False
+
+def parse_follower_count(count_str: str) -> int:
+    """
+    Konvertiert Follower-Zahl-Strings (z.B. "9.6M", "862K", "12345", "2,4m", "23.83k") in Integer.
+    Gibt 0 zurück bei Fehlern oder ungültigem Format.
+    """
+    if not isinstance(count_str, str):
+        return 0
+
+    # 1. Preprocessing: Lowercase, remove ALL commas, strip whitespace
+    # Kommas werden IMMER als Tausendertrennzeichen behandelt und entfernt.
+    # Der Punkt wird als Dezimaltrennzeichen interpretiert.
+    processed_str = count_str.lower().strip().replace(',', '')
+    if not processed_str:
+        return 0
+
+    # 2. Suffix Handling
+    multiplier = 1
+    num_part = processed_str
+    if processed_str.endswith('m'):
+        multiplier = 1_000_000
+        num_part = processed_str[:-1].strip() # Entferne 'm' und evtl. Leerzeichen davor
+    elif processed_str.endswith('k'):
+        multiplier = 1_000
+        num_part = processed_str[:-1].strip() # Entferne 'k' und evtl. Leerzeichen davor
+
+    # 3. Number Parsing
+    try:
+        # Prüfe, ob mehr als ein Punkt vorhanden ist (ungültig)
+        if num_part.count('.') > 1:
+            # print(f"Debug parse_follower_count: Ungültiges Format (mehrere Punkte): '{num_part}'")
+            return 0
+
+        # Konvertiere zu float, um Dezimalstellen (z.B. "2.4", "23.83") zu behandeln
+        num_float = float(num_part)
+
+        # Berechne den Endwert und konvertiere zu int
+        final_value = int(num_float * multiplier)
+        return final_value
+    except ValueError:
+        # Fehler bei der Konvertierung zu float (z.B. "abc", leere Zeichenkette nach Suffix-Entfernung)
+        # print(f"Debug parse_follower_count: Konnte '{num_part}' nicht in Zahl umwandeln.")
+        return 0
+    except Exception as e:
+        # Andere unerwartete Fehler
+        print(f"Debug parse_follower_count: Unerwarteter Fehler bei '{count_str}': {e}")
+        return 0
 
 async def follow_user(username):
     """Follow a user on X based on their username"""
@@ -1337,7 +1448,7 @@ async def backup_followers_logic(update: Update):
         print("[Backup] Erste UserCell-Buttons gefunden.")
 
         scroll_attempts_without_new_followers = 0
-        max_scroll_attempts_without_new_followers = 8
+        max_scroll_attempts_without_new_followers = 3
 
         while scroll_attempts_without_new_followers < max_scroll_attempts_without_new_followers:
             # ===== Abbruchprüfung =====
@@ -1470,6 +1581,338 @@ async def backup_followers_logic(update: Update):
         print("[Backup] Status-Flags zurückgesetzt.")
         # =============================
 
+
+async def scrape_target_following(update: Update, target_username: str):
+    """
+    Scrapt die 'Following'-Liste eines *beliebigen* X-Users, extrahiert Follower-Zahlen
+    und aktualisiert die `following_database`. (Mit Abbruchmöglichkeit)
+    """
+    global driver, is_scraping_paused, pause_event, following_database
+    global is_db_scrape_running, cancel_db_scrape_flag # Flags importieren
+
+    # Bereinige den Ziel-Usernamen
+    target_username = target_username.strip().lstrip('@')
+    if not re.match(r'^[A-Za-z0-9_]{1,15}$', target_username):
+        await update.message.reply_text(f"❌ Ungültiger Ziel-Username: {target_username}")
+        return # Beende frühzeitig
+
+    if is_db_scrape_running:
+        await update.message.reply_text("⚠️ Ein Datenbank-Scrape-Prozess läuft bereits.")
+        return
+
+    # ===== Task Start Markierung =====
+    is_db_scrape_running = True
+    cancel_db_scrape_flag = False
+    # ================================
+
+    print(f"[DB Scrape] Starte Scrape der Following-Liste von @{target_username}...")
+    await update.message.reply_text(f"⏳ Starte Scrape für @{target_username}...\n"
+                                     f"   Zum Abbrechen: `/canceldbscrape`")
+
+    await pause_scraping() # Pausiere Haupt-Scraping
+
+    processed_in_this_scrape = set()
+    users_added_or_updated = 0
+    last_found_count = -1
+    cancelled_early = False
+    navigation_successful = False
+    db_changed = False # Flag, um zu wissen, ob gespeichert werden muss
+
+    try: # Haupt-Try-Block für die gesamte Funktion
+        following_url = f"https://x.com/{target_username}/following"
+        print(f"[DB Scrape] Navigiere zu: {following_url}")
+        driver.get(following_url)
+        await asyncio.sleep(random.uniform(5, 8)) # Längere Wartezeit für externe Profile
+
+        # --- Check für private/nicht existierende Profile ---
+        try:
+            error_indicators = [
+                '//span[contains(text(), "These posts are protected")]',
+                '//span[contains(text(), "This account doesn’t exist")]',
+                '//span[contains(text(), "Hmm...this page doesn’t exist.")]'
+            ]
+            error_found = False
+            for indicator in error_indicators:
+                try:
+                    WebDriverWait(driver, 2).until(EC.presence_of_element_located((By.XPATH, indicator)))
+                    error_text = driver.find_element(By.XPATH, indicator).text
+                    await update.message.reply_text(f"❌ Fehler beim Zugriff auf @{target_username}/following: {error_text}")
+                    print(f"[DB Scrape] Fehler: {error_text}")
+                    error_found = True
+                    break
+                except (TimeoutException, NoSuchElementException):
+                    continue
+            if error_found:
+                raise Exception("Profile inaccessible")
+
+        except Exception as profile_check_err:
+            if "Profile inaccessible" not in str(profile_check_err):
+                 print(f"[DB Scrape] Unerwarteter Fehler bei Profilprüfung: {profile_check_err}")
+            raise # Gibt den Fehler weiter, um den try-Block zu verlassen
+
+        # --- Ende Check ---
+
+        user_cell_button_xpath = '//button[@data-testid="UserCell"]'
+        # Warte auf das erste Erscheinen der UserCells
+        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.XPATH, user_cell_button_xpath)))
+        print("[DB Scrape] Erste UserCell-Buttons gefunden.")
+
+        scroll_attempts_without_new = 0
+        max_scroll_attempts_without_new = 5
+
+        # --- Beginn der Haupt-Scroll-Schleife ---
+        while scroll_attempts_without_new < max_scroll_attempts_without_new:
+            if cancel_db_scrape_flag:
+                print("[DB Scrape] Abbruchsignal empfangen.")
+                cancelled_early = True
+                await update.message.reply_text("🟡 Datenbank-Scrape wird abgebrochen...")
+                break
+
+            initial_processed_count = len(processed_in_this_scrape)
+
+            # --- User-Extraktion und Verarbeitung pro Scroll-Ansicht ---
+            try: # Try-Block für das Finden der Zellen in dieser Ansicht
+                user_cells = driver.find_elements(By.XPATH, user_cell_button_xpath)
+                print(f"[DB Scrape] {len(user_cells)} UserCells in dieser Ansicht gefunden.")
+
+                # --- Iteriere sicher über die gefundenen Zellen ---
+                for cell_index, cell_button in enumerate(user_cells):
+                    # --- Definiere Variablen mit Standardwerten zu Beginn JEDER Iteration ---
+                    scraped_username = None
+                    follower_count = 0
+                    bio_text = "" # Wichtig: Hier initialisieren
+
+                    try: # --- Umfassender Try-Block für die Verarbeitung einer einzelnen Zelle ---
+                        if cancel_db_scrape_flag: break # Früher Abbruchcheck
+
+                        # 1. Username extrahieren
+                        try:
+                            relative_link_xpath = ".//a[contains(@href, '/') and not(contains(@href, '/photo'))]"
+                            link_element = WebDriverWait(cell_button, 2).until( # Kurzer Wait pro Zelle
+                                EC.presence_of_element_located((By.XPATH, relative_link_xpath))
+                            )
+                            href = link_element.get_attribute('href')
+                            if href:
+                                parts = href.split('/')
+                                potential_username = parts[-1].strip()
+                                if potential_username and re.match(r'^[A-Za-z0-9_]{1,15}$', potential_username):
+                                    scraped_username = potential_username
+                                else:
+                                    # print(f"  [DB Scrape] Warnung (Zelle {cell_index}): Ungültiger Username aus href '{href}'.")
+                                    continue # Nächste Zelle
+                            else:
+                                # print(f"  [DB Scrape] Warnung (Zelle {cell_index}): Leerer href für Username-Link.")
+                                continue # Nächste Zelle
+                        except (TimeoutException, NoSuchElementException, StaleElementReferenceException):
+                            # print(f"  [DB Scrape] Warnung (Zelle {cell_index}): Link für Username nicht gefunden.")
+                            continue # Nächste Zelle
+                        except Exception as user_err:
+                            print(f"  [DB Scrape] Fehler (Zelle {cell_index}) bei Username-Extraktion: {user_err}")
+                            continue # Nächste Zelle
+
+                        # Prüfung: Überspringen, wenn kein Username oder schon verarbeitet
+                        if not scraped_username or scraped_username in processed_in_this_scrape:
+                            continue
+
+                        # 2. Bio-Text aus UserCell extrahieren (KORREKTE POSITION)
+                        try:
+                            bio_div_xpath = './div/div[2]/div[2]'
+                            # Kurzer Wait, Bio ist nicht immer da
+                            bio_div = WebDriverWait(cell_button, 0.5).until(
+                                EC.presence_of_element_located((By.XPATH, bio_div_xpath))
+                            )
+                            bio_text = bio_div.get_attribute('textContent').strip()
+                        except (TimeoutException, NoSuchElementException):
+                            pass # Keine Bio ist ok
+                        except Exception as bio_err:
+                            print(f"  [DB Scrape] Fehler (Zelle {cell_index}) beim Extrahieren der Bio für @{scraped_username}: {bio_err}")
+                        # --- ENDE Bio-Extraktion ---
+
+                        # 3. Follower-Zahl extrahieren (Hover)
+                        hover_target_element = None
+                        hover_card = None
+                        try:
+                            hover_target_xpath = './div/div[2]/div[1]/div[1]/div/div[1]/a'
+                            try:
+                                hover_target_element = cell_button.find_element(By.XPATH, hover_target_xpath)
+                            except NoSuchElementException:
+                                # print(f"  [DB Scrape] FEHLER (Zelle {cell_index}): Konnte Hover-Ziel-Link für @{scraped_username} nicht finden.")
+                                pass # Mache weiter ohne Follower-Zahl
+
+                            if hover_target_element:
+                                driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});", hover_target_element)
+                                await asyncio.sleep(random.uniform(0.4, 0.8))
+                                driver.execute_script("arguments[0].dispatchEvent(new MouseEvent('mouseover', {bubbles: true}));", hover_target_element)
+                                wait_for_card_render = random.uniform(1.8, 2.8)
+                                await asyncio.sleep(wait_for_card_render)
+                                hover_card_xpath = '//div[@data-testid="HoverCard"]'
+                                hover_card = WebDriverWait(driver, 6).until(EC.visibility_of_element_located((By.XPATH, hover_card_xpath)))
+
+                                # --- Innerer Try für HoverCard-Interaktion ---
+                                try:
+                                    follower_link_xpath = './/a[contains(@href, "/followers") or contains(@href, "/verified_followers")]'
+                                    follower_link = WebDriverWait(hover_card, 4).until(EC.presence_of_element_located((By.XPATH, follower_link_xpath)))
+                                    possible_text_xpaths = ['./span[1]/span', './span[1]', './/span[contains(text(),"Followers")]/preceding-sibling::span/span', './/span/span', '.']
+                                    follower_text = ""
+                                    found_text = False
+                                    for i, text_xpath in enumerate(possible_text_xpaths):
+                                        try:
+                                            await asyncio.sleep(0.1)
+                                            follower_text_element = follower_link.find_element(By.XPATH, text_xpath)
+                                            extracted_text = follower_text_element.get_attribute('textContent')
+                                            if extracted_text:
+                                                 follower_text = extracted_text.strip()
+                                                 if follower_text:
+                                                     # print(f"  [DB Scrape] Follower-Text Versuch {i+1} ('{text_xpath}') ERFOLG: '{follower_text}'") # Debug
+                                                     found_text = True
+                                                     break
+                                        except (NoSuchElementException, StaleElementReferenceException): continue
+                                        except Exception as e_xpath: print(f"  [DB Scrape] Follower-Text Versuch {i+1} ('{text_xpath}') - Unerwarteter Fehler: {e_xpath}")
+                                    if found_text:
+                                        # print(f"  [DB Scrape] Versuche Parsing für Text: '{follower_text}'") # Debug
+                                        follower_count = parse_follower_count(follower_text)
+                                        print(f"  [DB Scrape] @{scraped_username} - Follower geparsed: {follower_count} (Raw: '{follower_text}')") # Debug
+                                    # else: # Kein else nötig, follower_count bleibt 0
+                                    #    print(f"  [DB Scrape] Warnung (Zelle {cell_index}): Konnte Follower-Text für @{scraped_username} nicht extrahieren.")
+                                except TimeoutException as te_inner: print(f"  [DB Scrape] Warnung (Zelle {cell_index}): Timeout *innerhalb* HoverCard @{scraped_username}. {te_inner}")
+                                except (NoSuchElementException, StaleElementReferenceException) as e_inner: print(f"  [DB Scrape] Warnung (Zelle {cell_index}): Element nicht gefunden *innerhalb* HoverCard @{scraped_username}. {e_inner}")
+                                except Exception as inner_err: print(f"  [DB Scrape] Unerwarteter Fehler *innerhalb* HoverCard @{scraped_username}: {inner_err}"); logger.warning(f"Unexpected error inside HoverCard processing for {scraped_username}", exc_info=True)
+                                finally:
+                                    # --- HoverCard durch Scrollen schließen ---
+                                    try:
+                                        driver.execute_script("window.scrollBy(0, 1);")
+                                        await asyncio.sleep(random.uniform(0.2, 0.4))
+                                    except Exception as close_err: print(f"  [DB Scrape] Warnung (Zelle {cell_index}): Fehler beim Schließen der HoverCard für @{scraped_username}: {close_err}")
+                        except TimeoutException as te_outer: print(f"  [DB Scrape] Warnung (Zelle {cell_index}): Timeout beim Warten auf HoverCard für @{scraped_username}. {te_outer}")
+                        except (NoSuchElementException, StaleElementReferenceException) as e_outer: print(f"  [DB Scrape] Warnung (Zelle {cell_index}): Element nicht gefunden beim Hover-Setup für @{scraped_username}. {e_outer}")
+                        except Exception as hover_err: print(f"  [DB Scrape] Unerwarteter Fehler beim Hover-Setup für @{scraped_username}: {hover_err}"); logger.warning(f"Unexpected JS hover setup/trigger error for {scraped_username}", exc_info=True)
+                        # --- Ende Follower-Zahl Extraktion ---
+
+                        # 4. Datenbank aktualisieren (mit Bio)
+                        now_iso = datetime.now(timezone.utc).isoformat()
+                        if scraped_username in following_database:
+                            following_database[scraped_username]["seen_count"] += 1
+                            if follower_count > 0 or "follower_count" not in following_database[scraped_username]:
+                                following_database[scraped_username]["follower_count"] = follower_count
+                            following_database[scraped_username]["bio"] = bio_text
+                            following_database[scraped_username]["last_updated"] = now_iso
+                            db_changed = True
+                            users_added_or_updated += 1
+                        else:
+                            following_database[scraped_username] = {
+                                "follower_count": follower_count,
+                                "seen_count": 1,
+                                "bio": bio_text,
+                                "last_updated": now_iso
+                            }
+                            db_changed = True
+                            users_added_or_updated += 1
+                        # --- Ende Datenbank Update ---
+
+                        # Als verarbeitet markieren
+                        processed_in_this_scrape.add(scraped_username)
+
+                    except StaleElementReferenceException:
+                        print(f"  [DB Scrape] Fehler (Zelle {cell_index}): Stale Element Reference. Überspringe diese Zelle.")
+                        continue # Gehe zur nächsten Zelle
+                    except Exception as cell_processing_error:
+                        print(f"  [DB Scrape] Unerwarteter Fehler bei der Verarbeitung von Zelle {cell_index} (User: {'@'+scraped_username if scraped_username else 'Unbekannt'}): {cell_processing_error}")
+                        logger.warning(f"Unexpected error processing cell {cell_index}", exc_info=True)
+                        continue # Gehe zur nächsten Zelle
+                    # --- ENDE des umfassenden Try-Blocks für eine Zelle ---
+
+                # --- Ende der for-Schleife über user_cells ---
+                if cancel_db_scrape_flag: break # Äußere Schleife verlassen, wenn abgebrochen
+
+            except Exception as find_err:
+                 # Fehler beim ursprünglichen Finden von user_cells
+                 print(f"[DB Scrape] Kritischer Fehler beim Finden von UserCells: {find_err}")
+                 break # Breche die äußere while-Schleife ab
+
+            # --- Nach Verarbeitung der Zellen in dieser Ansicht ---
+            current_processed_count = len(processed_in_this_scrape)
+            newly_processed_in_loop = current_processed_count - initial_processed_count
+
+            current_scroll_pos = driver.execute_script("return window.pageYOffset;")
+            total_scroll_height = driver.execute_script("return document.body.scrollHeight;")
+            print(f"[DB Scrape] Scroll-Pos: {int(current_scroll_pos)}/{int(total_scroll_height)}, Verarbeitet={current_processed_count} (+{newly_processed_in_loop} Iteration), DB Updates={users_added_or_updated}, Fehlversuche={scroll_attempts_without_new}")
+
+            if current_processed_count == last_found_count:
+                scroll_attempts_without_new += 1
+            else:
+                scroll_attempts_without_new = 0
+
+            last_found_count = current_processed_count
+
+            if scroll_attempts_without_new >= max_scroll_attempts_without_new:
+                print(f"[DB Scrape] Stoppe Scrollen: {max_scroll_attempts_without_new} Versuche ohne neue User.")
+                break
+
+            if cancel_db_scrape_flag: break
+
+            # Scrollen für nächste Runde
+            driver.execute_script("window.scrollBy(0, window.innerHeight * 0.9);")
+            wait_time = random.uniform(2.0, 4.0)
+            await asyncio.sleep(wait_time)
+            # --- Ende der while-Schleife ---
+
+        # --- Nach der Scroll-Schleife (normal oder abgebrochen) ---
+        if cancelled_early:
+            print(f"[DB Scrape] Prozess abgebrochen. {len(processed_in_this_scrape)} User bis dahin verarbeitet.")
+            if db_changed:
+                print("[DB Scrape] Speichere bisherige Datenbankänderungen...")
+                save_following_database()
+                await update.message.reply_text(f"🟡 Scrape abgebrochen. {users_added_or_updated} Datenbank-Updates wurden gespeichert.")
+            else:
+                await update.message.reply_text(f"🛑 Scrape abgebrochen. Keine Datenbankänderungen vorgenommen.")
+        else:
+            print(f"[DB Scrape] Scrollen abgeschlossen. Insgesamt {len(processed_in_this_scrape)} einzigartige User verarbeitet.")
+            if db_changed:
+                print("[DB Scrape] Speichere finale Datenbankänderungen...")
+                save_following_database()
+                await update.message.reply_text(f"✅ Scrape für @{target_username} abgeschlossen. {users_added_or_updated} Datenbank-Updates durchgeführt ({len(following_database)} gesamt).")
+            else:
+                await update.message.reply_text(f"✅ Scrape für @{target_username} abgeschlossen. Keine neuen Updates für die Datenbank.")
+
+    except Exception as e:
+        # Fehlerbehandlung für den äußeren Try-Block
+        if "Profile inaccessible" in str(e):
+             pass # Nachricht wurde bereits gesendet
+        else:
+            error_message = f"💥 Schwerwiegender Fehler während des DB-Scrapes für @{target_username}: {e}"
+            await update.message.reply_text(error_message)
+            print(error_message)
+            logger.error(f"Critical error during DB scrape for @{target_username}: {e}", exc_info=True)
+            # Speichere DB trotzdem, falls Änderungen gemacht wurden
+            if db_changed:
+                print("[DB Scrape] Speichere Datenbank trotz Fehler...")
+                save_following_database()
+
+    finally: # ===== WICHTIGER FINALLY BLOCK =====
+        print("[DB Scrape] Finally Block erreicht.")
+        # Rückkehr zur Haupt-Timeline
+        print("[DB Scrape] Versuche zur Haupt-Timeline (/home) zurückzukehren...")
+        try:
+            driver.get("https://x.com/home")
+            await asyncio.sleep(random.uniform(4, 6))
+            await switch_to_following_tab()
+            print("[DB Scrape] Zurück auf /home 'Following'-Tab.")
+            navigation_successful = True
+        except Exception as nav_err:
+            error_msg = f"⚠️ Fehler bei Rückkehr zur Haupt-Timeline nach DB-Scrape: {nav_err}."
+            print(error_msg)
+            try: await update.message.reply_text(error_msg)
+            except: pass
+
+        # Haupt-Scraping fortsetzen
+        print("[DB Scrape] Setze Haupt-Scraping fort.")
+        await resume_scraping()
+
+        # ===== Task Ende Markierung =====
+        is_db_scrape_running = False
+        cancel_db_scrape_flag = False
+        print("[DB Scrape] Status-Flags zurückgesetzt.")
+        # =============================
 
 async def recover_followers_logic(update: Update):
     """Liest das account-spezifische Backup und fügt User zur
@@ -2003,6 +2446,236 @@ async def resume_scraping():
     pause_event.set()
     print("Scraping fortgesetzt")
 
+async def scrape_following_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handler für /scrapefollowing <username>. Startet den Scrape-Prozess für
+    die Following-Liste des Ziel-Users als Hintergrund-Task.
+    """
+    global is_db_scrape_running # Prüfen, ob bereits ein Scrape läuft
+
+    # Argumentprüfung
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text("❌ Bitte gib genau EINEN X-Usernamen nach dem Befehl an.\nFormat: `/scrapefollowing <username>`")
+        # Kein resume nötig, da der Admin-Wrapper das macht
+        return
+
+    target_username = context.args[0].strip().lstrip('@')
+    if not re.match(r'^[A-Za-z0-9_]{1,15}$', target_username):
+        await update.message.reply_text(f"❌ Ungültiger Ziel-Username: {target_username}")
+        return
+
+    # Prüfen, ob bereits ein Scrape läuft
+    if is_db_scrape_running:
+        await update.message.reply_text("⚠️ Ein Datenbank-Scrape-Prozess läuft bereits. Bitte warte oder verwende `/canceldbscrape`.")
+        return
+
+    # Nachricht senden, dass der Task gestartet wird
+    await update.message.reply_text(f"✅ Datenbank-Scrape für @{target_username} wird im Hintergrund gestartet...")
+
+    # Starte die eigentliche Logik als Hintergrund-Task
+    asyncio.create_task(scrape_target_following(update, target_username))
+
+    # Kein resume_scraping hier, der Task läuft unabhängig und managed das selbst.
+
+async def add_from_db_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handler für /addfromdb mit flexiblen Filtern. Fügt User aus der
+    following_database zur Follow-Liste des *aktuellen* Accounts hinzu.
+
+    Syntax: /addfromdb [followers:NUM] [seen:NUM] [keywords:WORT1 WORT2...]
+    Mindestens ein Kriterium muss angegeben werden.
+    """
+    global following_database, current_account_usernames_to_follow, global_followed_users_set
+    # is_scraping_paused wird vom Admin-Wrapper gehandhabt
+
+    # --- Filter-Variablen initialisieren ---
+    min_followers = -1 # -1 bedeutet: nicht angegeben/aktiv
+    min_seen = 0      # 0 bedeutet: nicht angegeben/aktiv (Standard war 1, ändern wir hier)
+    keywords = []
+    criteria_count = 0 # Zählt, wie viele Kriterien angegeben wurden
+
+    # --- Argumente parsen ---
+    current_keyword = None
+    keyword_args = []
+    if context.args:
+        for arg in context.args:
+            arg_lower = arg.lower()
+            if arg_lower.startswith("followers:"):
+                try:
+                    # --- KORRIGIERT: Verwende die neue Parsing-Funktion ---
+                    follower_str = arg.split(":", 1)[1]
+                    if not follower_str: # Prüfen, ob nach ":" etwas kommt
+                        raise IndexError("Leerer Wert nach followers:")
+
+                    min_followers = parse_follower_count(follower_str)
+                    # parse_follower_count gibt 0 bei Fehler zurück, was als gültiger Mindestwert behandelt wird.
+                    # Eine explizite Prüfung auf < 0 ist nicht mehr nötig.
+
+                    criteria_count += 1
+                    current_keyword = None # Beende Keyword-Sammlung
+                except IndexError:
+                    await update.message.reply_text(f"❌ Fehlender Wert für 'followers:'.")
+                    return
+                # ValueError wird jetzt von parse_follower_count intern behandelt.
+            elif arg_lower.startswith("seen:"):
+                try:
+                    min_seen = int(arg.split(":", 1)[1])
+                    if min_seen < 1: raise ValueError("Seen muss >= 1 sein")
+                    criteria_count += 1
+                    current_keyword = None # Beende Keyword-Sammlung
+                except (ValueError, IndexError):
+                    await update.message.reply_text(f"❌ Ungültiger Wert für 'seen:'. Bitte eine Zahl >= 1 angeben.")
+                    return
+            elif arg_lower.startswith("keywords:"):
+                criteria_count += 1
+                current_keyword = "keywords" # Markiere, dass wir Keywords erwarten
+                # --- KORRIGIERT: Verarbeite Keywords direkt ---
+                value_part = arg.split(":", 1)[1] # Hole alles nach 'keywords:'
+                # Teile nach Komma ODER Leerzeichen, entferne leere Einträge
+                found_kws = [kw.strip() for kw in re.split(r'[,\s]+', value_part) if kw.strip()]
+                if found_kws:
+                    keywords.extend(found_kws) # Füge die gefundenen Keywords direkt hinzu
+                else:
+                    # Wenn nach 'keywords:' nichts oder nur Leerzeichen/Kommas kommen
+                    pass # Warte auf nachfolgende Argumente
+            elif current_keyword == "keywords":
+                # --- KORRIGIERT: Behandle nachfolgende Argumente als einzelne Keywords ---
+                # Teile auch hier nach Komma/Leerzeichen, falls mehrere in einem Arg stehen
+                found_kws = [kw.strip() for kw in re.split(r'[,\s]+', arg) if kw.strip()]
+                keywords.extend(found_kws)
+                # Bleibe im Keyword-Modus, falls weitere Argumente kommen
+            else:
+                # Argument gehört zu keinem bekannten Schlüssel
+                await update.message.reply_text(f"❓ Unbekanntes Argument oder fehlender Schlüssel: '{arg}'.\nVerwende `followers:`, `seen:` oder `keywords:`.")
+                return
+
+    # --- KORRIGIERT: Finale Bereinigung der Keywords ---
+    # Stelle sicher, dass alle Keywords klein geschrieben und einzigartig sind
+    if keywords:
+        keywords = sorted(list(set(kw.lower() for kw in keywords if kw))) # Eindeutig, Kleinschreibung, sortiert
+
+    # Entferne die alte Verarbeitung von keyword_args am Ende:
+    # if keyword_args:
+    #    keywords = " ".join(keyword_args).lower().split() # Diese Zeile wird entfernt/ersetzt
+
+    # --- Prüfen, ob mindestens ein Kriterium angegeben wurde ---
+    if criteria_count == 0:
+        await update.message.reply_text(
+            "❌ Bitte mindestens ein Filterkriterium angeben.\n"
+            "Syntax: `/addfromdb [followers:NUM] [seen:NUM] [keywords:WORT1 WORT2...]`\n"
+            "Beispiele:\n"
+            "`/addfromdb followers:100000`\n"
+            "`/addfromdb keywords:crypto nft`\n"
+            "`/addfromdb seen:3 keywords:developer`\n"
+            "`/addfromdb followers:5000 seen:2 keywords:web3`",
+            parse_mode=ParseMode.MARKDOWN 
+        )
+        return
+
+    # --- Account-Infos holen ---
+    account_username = get_current_account_username()
+    current_follow_list_path = get_current_follow_list_path()
+
+    if not account_username or not current_follow_list_path:
+        await update.message.reply_text("❌ Fehler: Aktiver Account-Username/Listenpfad nicht gefunden.")
+        return
+
+    if not following_database:
+        await update.message.reply_text("ℹ️ Die Following-Datenbank ist leer. Führe zuerst `/scrapefollowing` aus.")
+        return
+
+    # --- User aus DB filtern basierend auf den *aktiven* Kriterien ---
+    qualified_users = set()
+    print(f"[AddFromDB] Filter: followers>={min_followers}, seen>={min_seen}, keywords={keywords}") # Debug
+    for username, data in following_database.items():
+        # Standardmäßig qualifiziert, wird bei Nichterfüllung auf False gesetzt
+        is_qualified = True
+
+        # 1. Follower-Check (nur wenn Kriterium aktiv)
+        if min_followers != -1:
+            f_count = data.get("follower_count", -1) # -1 wenn nicht vorhanden
+            if not isinstance(f_count, int) or f_count < min_followers:
+                is_qualified = False
+                # print(f"  - @{username} disqualifiziert (Follower: {f_count} < {min_followers})") # Debug
+
+        # 2. Seen-Check (nur wenn Kriterium aktiv und noch qualifiziert)
+        if is_qualified and min_seen != 0:
+            s_count = data.get("seen_count", 0)
+            if not isinstance(s_count, int) or s_count < min_seen:
+                is_qualified = False
+                # print(f"  - @{username} disqualifiziert (Seen: {s_count} < {min_seen})") # Debug
+
+        # 3. Keyword-Check (nur wenn Kriterium aktiv und noch qualifiziert)
+        if is_qualified and keywords:
+            bio_lower = data.get("bio", "").lower()
+            # Prüfe, ob *alle* angegebenen Keywords in der Bio vorkommen
+            if not all(kw in bio_lower for kw in keywords):
+                is_qualified = False
+                # print(f"  - @{username} disqualifiziert (Keywords nicht alle in Bio gefunden)") # Debug
+
+        # Wenn nach allen aktiven Checks immer noch qualifiziert, hinzufügen
+        if is_qualified:
+            qualified_users.add(username)
+            # print(f"  + @{username} qualifiziert!") # Debug
+
+    if not qualified_users:
+        criteria_str = []
+        if min_followers != -1: criteria_str.append(f"F>={min_followers}")
+        if min_seen != 0: criteria_str.append(f"S>={min_seen}")
+        if keywords: criteria_str.append(f"KW='{' '.join(keywords)}'")
+        await update.message.reply_text(f"ℹ️ Keine User in der Datenbank erfüllen die Kriterien ({', '.join(criteria_str)}).")
+        return
+
+    # --- Filtern gegen globale und aktuelle Liste (wie vorher) ---
+    added_to_current_account = set()
+    already_followed_globally = set()
+    already_in_current_list = set()
+
+    current_list_set = set(current_account_usernames_to_follow)
+
+    for username in qualified_users:
+        if username in global_followed_users_set:
+            already_followed_globally.add(username)
+        elif username in current_list_set:
+            already_in_current_list.add(username)
+        else:
+            added_to_current_account.add(username)
+
+    # --- Ergebnisnachricht bauen ---
+    criteria_summary = []
+    if min_followers != -1: criteria_summary.append(f"Followers ≥ {min_followers}")
+    if min_seen != 0: criteria_summary.append(f"Seen ≥ {min_seen}")
+    if keywords: criteria_summary.append(f"Keywords: '{' '.join(keywords)}'")
+    response = f"📊 Filter-Ergebnis ({', '.join(criteria_summary)}):\n"
+    response += f"- {len(qualified_users)} User qualifiziert.\n"
+
+    if added_to_current_account:
+        current_account_usernames_to_follow.extend(list(added_to_current_account))
+        save_current_account_follow_list()
+        response += f"✅ {len(added_to_current_account)} User zur Liste von @{account_username} hinzugefügt.\n"
+
+    if already_in_current_list:
+         response += f"ℹ️ {len(already_in_current_list)} davon waren bereits in der Liste von @{account_username}.\n"
+    if already_followed_globally:
+        response += f"🚫 {len(already_followed_globally)} davon werden bereits global gefolgt.\n"
+
+    if not added_to_current_account and not already_in_current_list and not already_followed_globally and qualified_users:
+         response += "ℹ️ Alle qualifizierten User sind bereits global gefolgt oder in der Liste.\n"
+
+    await update.message.reply_text(response.strip())
+    # resume_scraping wird vom Admin-Wrapper gemacht
+
+async def cancel_db_scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fordert den Abbruch des laufenden Datenbank-Scrape-Prozesses an."""
+    global is_db_scrape_running, cancel_db_scrape_flag
+    if is_db_scrape_running:
+        cancel_db_scrape_flag = True
+        await update.message.reply_text("🟡 Abbruch des Datenbank-Scrapes angefordert. Es kann einen Moment dauern...")
+        print("[Cancel] DB Scrape cancellation requested.")
+    else:
+        await update.message.reply_text("ℹ️ Aktuell läuft kein Datenbank-Scrape-Prozess.")
+    # Kein resume/pause hier, dieser Befehl beeinflusst nur das Flag
+
 async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle callback queries with improved logging and robustness."""
     global current_account_usernames_to_follow
@@ -2033,36 +2706,77 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                  logger.warning("Invalid sync callback format received.")
                  await query.edit_message_text("❌ Ungültiges Sync-Callback-Format.")
                  return
+
+            # Teile Aktion und optionalen Username
             action_parts = parts[1].split(":", 1)
             action = action_parts[0]
-            target_username = action_parts[1] if len(action_parts) > 1 else None
+            # Extrahiere den Username *immer*, wenn vorhanden (für Konsistenzprüfung)
+            target_username_from_callback = action_parts[1] if len(action_parts) > 1 else None
+
             current_active_username = get_current_account_username()
-            if target_username and target_username != current_active_username:
-                logger.warning(f"Sync target mismatch: Button for {target_username}, active is {current_active_username}")
-                await query.edit_message_text(f"❌ Fehler: Button war für @{target_username}, aber @{current_active_username} ist jetzt aktiv.")
+
+            # --- Konsistenzprüfung: Ist der Account noch derselbe? ---
+            # Mache diese Prüfung für alle Aktionen, die einen target_username haben
+            if target_username_from_callback and target_username_from_callback != current_active_username:
+                logger.warning(f"Sync target mismatch: Button was for @{target_username_from_callback}, but @{current_active_username} is now active.")
+                await query.edit_message_text(f"❌ Fehler: Button war für @{target_username_from_callback}, aber @{current_active_username} ist jetzt aktiv. Bitte /syncfollows erneut ausführen.")
                 return
-            if action == "create_backup":
+
+            # --- Aktionen verarbeiten ---
+            if action == "create_backup": # Wird nur im Fall "Kein Backup" angeboten
+                # Admin Check nicht nötig für Backup-Erstellung selbst
                 await query.edit_message_text("✅ Backup für den aktuellen Account wird im Hintergrund gestartet...")
-                asyncio.create_task(backup_followers_logic(emulated_update))
-                logger.info("Follower backup task started via sync callback.")
-            elif action == "proceed":
+                # Erstelle eine emulierte Update-Instanz für backup_followers_logic
+                emulated_update_for_backup = type('obj', (object,), {'message': query.message})
+                asyncio.create_task(backup_followers_logic(emulated_update_for_backup))
+                logger.info("Follower backup task started via sync callback (create_backup option).")
+
+            elif action == "proceed": # Dies ist der Fall "Backup fehlt/leer, User will hinzufügen"
                 # +++ Admin Check HIER +++
                 if not is_user_admin(query.from_user.id):
-                    logger.warning(f"User {query.from_user.id} tried to proceed sync without admin rights.")
+                    logger.warning(f"User {query.from_user.id} tried to proceed sync (no backup) without admin rights.")
                     await query.answer("❌ Zugriff verweigert (Admin benötigt).", show_alert=True)
+                    try: await query.edit_message_text("❌ Aktion abgebrochen (Keine Admin-Rechte).")
+                    except: pass
+                    return # Abbrechen
+                # --- Ende Admin Check ---
+                await query.edit_message_text(f"✅ Sync (nur Hinzufügen) für @{current_active_username} wird im Hintergrund gestartet...")
+                backup_filepath = get_current_backup_file_path()
+                # Lade die globale Liste frisch, bevor der Task startet
+                global_set_for_task = load_set_from_file(GLOBAL_FOLLOWED_FILE)
+                # Erstelle eine emulierte Update-Instanz für sync_followers_logic
+                emulated_update_for_sync = type('obj', (object,), {'message': query.message})
+                asyncio.create_task(sync_followers_logic(emulated_update_for_sync, current_active_username, backup_filepath, global_set_for_task))
+                logger.info("Follower sync task started via sync callback (proceed - no backup case).")
+
+            elif action == "proceed_sync": # Dies ist der Fall "Backup existiert, User bestätigt Sync"
+                # +++ Admin Check HIER +++
+                if not is_user_admin(query.from_user.id):
+                    logger.warning(f"User {query.from_user.id} tried to proceed sync (normal) without admin rights.")
+                    await query.answer("❌ Zugriff verweigert (Admin benötigt).", show_alert=True)
+                    try: await query.edit_message_text("❌ Aktion abgebrochen (Keine Admin-Rechte).")
+                    except: pass
                     return # Abbrechen
                 # --- Ende Admin Check ---
                 await query.edit_message_text(f"✅ Sync für @{current_active_username} wird im Hintergrund gestartet...")
                 backup_filepath = get_current_backup_file_path()
-                asyncio.create_task(sync_followers_logic(emulated_update, current_active_username, backup_filepath))
-                logger.info("Follower sync task started via sync callback.")
+                # Lade die globale Liste frisch, bevor der Task startet
+                global_set_for_task = load_set_from_file(GLOBAL_FOLLOWED_FILE)
+                # Erstelle eine emulierte Update-Instanz für sync_followers_logic
+                emulated_update_for_sync = type('obj', (object,), {'message': query.message})
+                asyncio.create_task(sync_followers_logic(emulated_update_for_sync, current_active_username, backup_filepath, global_set_for_task))
+                logger.info("Follower sync task started via sync callback (proceed_sync - normal case).")
 
-            elif action == "cancel":
-                await query.edit_message_text("❌ Synchronisation abgebrochen.")
-                logger.info("Sync cancelled by user.")
+            elif action == "cancel_sync": # Dies ist der Cancel-Handler (wird für beide Fälle verwendet)
+                username_display = f" für @{target_username_from_callback}" if target_username_from_callback else ""
+                await query.edit_message_text(f"❌ Synchronisation{username_display} abgebrochen.")
+                logger.info(f"Sync cancelled by user (cancel_sync callback for {target_username_from_callback or 'N/A'}).")
+                await resume_scraping()
             else:
                 logger.warning(f"Unknown sync action received: {action}")
                 await query.edit_message_text(f"❌ Unbekannte Sync-Aktion: {action}")
+                await resume_scraping()
+
             return # Sync Callbacks brauchen kein resume hier
 
         # ===== CLEAR FOLLOW LIST CALLBACKS =====
@@ -2090,14 +2804,17 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                  filename = os.path.basename(filepath) if filepath else "N/A"
                  await query.edit_message_text(f"🗑️ Follow-Liste für @{current_active_username} (`{filename}`) wurde geleert.")
                  logger.info(f"Follow list for @{current_active_username} cleared via button.")
+                 await resume_scraping()
              else:
                   logger.warning(f"Clear list target mismatch: Button for {target_username}, active is {current_active_username}")
                   await query.edit_message_text(f"❌ Fehler: Button war für Account @{target_username}, aber @{current_active_username} ist aktiv.")
+                  await resume_scraping()
              return # Schnelle Aktion, kein resume
 
         elif action_type == "cancel_clear_follow_list":
             logger.info("Processing cancel_clear_follow_list callback.")
             await query.edit_message_text("❌ Löschen der Follow-Liste abgebrochen.")
+            await resume_scraping()
             return # Schnelle Aktion, kein resume
 
         # ===== BUILD GLOBAL FROM BACKUPS CALLBACKS =====
@@ -2204,7 +2921,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                  await resume_scraping(); return
             elif payload == "prepare_switchaccount":
                  logger.info("Processing prepare_switchaccount help payload.")
-                 await query.message.reply_text("Kopiere und füge optional die Account-Nummer hinzu:\n\n`/switchaccount `", parse_mode=ParseMode.MARKDOWN)
+                 await query.message.reply_text("Kopiere und füge die Account-Nummer hinzu:\n\n`/switchaccount `", parse_mode=ParseMode.MARKDOWN)
                  await resume_scraping(); return
             elif payload == "prepare_scheduletime":
                  logger.info("Processing prepare_scheduletime help payload.")
@@ -2778,7 +3495,7 @@ async def follow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = await follow_user(username) # Führe den Follow-Versuch durch
 
     if result is True:
-        await update.message.reply_text(f"✅ Erfolgreich @{username} gefolgt!")
+        # Erfolgsmeldung wird jetzt von follow_user() gesendet
         print(f"Manueller Follow erfolgreich: @{username}")
         if username not in global_followed_users_set:
             global_followed_users_set.add(username)
@@ -2793,8 +3510,8 @@ async def follow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             global_followed_users_set.add(username)
             add_to_set_file({username}, GLOBAL_FOLLOWED_FILE)
         add_to_set_file({username}, backup_filepath)
-    else:
-        await update.message.reply_text(f"❌ Konnte @{username} nicht folgen.")
+    else: # Fehlerfall (result is False)
+        # Fehlermeldung wird jetzt von follow_user() gesendet
         print(f"Manueller Follow fehlgeschlagen: @{username}")
     # --- Ende Logik ---
     await resume_scraping()
@@ -3181,38 +3898,42 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
     global AUTH_CODE, WAITING_FOR_AUTH, is_scraping_paused, pause_event
 
     if update.message is None or not update.message.text:
+        logger.debug("[Telegram Handler] Received update without message text. Ignoring.")
         return
 
     message_text = update.message.text.strip()
+    user_id = update.message.from_user.id # Get user ID for logging
+    logger.info(f"[Telegram Handler] Received message from {user_id}: '{message_text[:50]}...'") # Log reception
+    logger.info(f"[Telegram Handler] Current WAITING_FOR_AUTH state: {WAITING_FOR_AUTH}") # Log flag state
 
     # Auth-Code Handling bleibt die Hauptaufgabe hier
-    if WAITING_FOR_AUTH and 6 <= len(message_text) <= 10 and message_text.isalnum():
-        # WICHTIG: Hier NICHT pausieren/resumen, da der Login-Prozess läuft
-        AUTH_CODE = message_text
-        await update.message.reply_text("✅ Auth-Code empfangen! Wird verarbeitet...")
-        # Der Login-Prozess wartet auf AUTH_CODE und macht weiter
-        return
+    if WAITING_FOR_AUTH:
+        logger.debug(f"[Telegram Handler] Checking if message '{message_text}' matches 2FA format (Length: {len(message_text)}, Alnum: {message_text.isalnum()})...")
+        if 6 <= len(message_text) <= 10 and message_text.isalnum():
+            logger.info(f"[Telegram Handler] Message matches 2FA format. Setting AUTH_CODE.") # Log match
+            AUTH_CODE = message_text
+            # WICHTIG: Hier NICHT pausieren/resumen, da der Login-Prozess läuft
+            await update.message.reply_text("✅ Auth-Code empfangen! Wird verarbeitet...")
+            logger.info(f"[Telegram Handler] AUTH_CODE set for user {user_id}.") # Log success
+            return # Wichtig: Beende die Funktion hier
+        else:
+            # Log why it didn't match if waiting
+            logger.warning(f"[Telegram Handler] Message from {user_id} ('{message_text}') received while waiting, but did NOT match 2FA format. Ignoring for auth.")
+            # Sende eine Hilfestellung an den User
+            await update.message.reply_text("⚠️ Ungültiges Format für 2FA-Code. Bitte sende *nur* den 6-10 stelligen Code (Zahlen/Buchstaben).")
+            # Nicht returnen, damit ggf. andere Logik (falls vorhanden) noch greift, aber AUTH_CODE wird nicht gesetzt.
 
     # --- Optional: Behandlung von Antworten für schnelles Liken/Reposten ---
-    # Wenn du die "like"/"repost" Antworten behalten willst, füge den Block hier ein.
-    # Ansonsten wird er entfernt, wie ursprünglich angefordert.
-    # is_reply = update.message.reply_to_message is not None
-    # if is_reply:
-    #    msg = message_text.lower().strip()
-    #    # ... (Logik zum Extrahieren der URL aus der beantworteten Nachricht) ...
-    #    tweet_url = extract_url_from_reply(update.message.reply_to_message) # Hypothetische Funktion
-    #    if tweet_url:
-    #        if msg == "like" or msg == "👍":
-    #             await pause_scraping()
-    #             await process_like_request(update, tweet_url) # Alte Funktion wiederverwenden oder Logik hier einfügen
-    #             await resume_scraping()
-    #             return
-    #        if msg == "repost" or msg == "🔄":
-    #             await pause_scraping()
-    #             await process_repost_request(update, tweet_url) # Alte Funktion wiederverwenden oder Logik hier einfügen
-    #             await resume_scraping()
-    #             return
+    # ... (optionaler Code, falls du ihn wieder einfügst) ...
     # --- Ende Optional: Antworten ---
+
+    # Wenn die Nachricht kein Auth-Code war (oder WAITING_FOR_AUTH false war)
+    # und keine andere Logik gegriffen hat:
+    if not WAITING_FOR_AUTH: # Nur loggen, wenn wir *nicht* auf Code warten
+         logger.debug(f"[Telegram Handler] Ignoring non-command message from {user_id} as not waiting for auth.")
+
+    # WICHTIG: Kein pauschales pause/resume hier.
+    pass # Tue nichts weiter für normale Textnachrichten
 
 
     # Wenn die Nachricht kein Auth-Code und kein bekannter Befehl ist,
@@ -3479,7 +4200,7 @@ async def show_help_message(update: Update):
         [ # Follow / Unfollow
              InlineKeyboardButton("🚶‍♂️‍➡️➕ Follow", callback_data="help:prepare_follow"),
              InlineKeyboardButton("🚶‍♂️‍➡️➖ Unfollow", callback_data="help:prepare_unfollow"),
-             InlineKeyboardButton("🚶‍♂️‍➡️➕ Add List", callback_data="help:prepare_addusers")
+             InlineKeyboardButton("🚶‍♂️‍➡️➕ Add2List", callback_data="help:prepare_addusers")
         ],
         [separator_button],
         [ # Like / Repost
@@ -3506,56 +4227,61 @@ async def show_help_message(update: Update):
         "🔺 🆘 `/help` - Show menu 🆘\n"
         " \n"
         "🔸 🚶‍♂️‍➡️    Follow / Unfollow    🚶‍♂️\n"
-        "🔸  /follow <username>  - Folgt einem User\n" # Geändert
-        "🔸  /unfollow <username>  - Entfolgt einem User\n" # Geändert
-        "🔸  /addusers <@user1 user2 ...>  - \n"
-        "         └ Fügt User zur Follow-Liste hinzu\n" # Geändert
-        "🔸  /autofollowpause ,  /autofollowresume  - Steuert Auto-Follow\n"
-        "🔸  /autofollowstatus  - Zeigt Status und Listenlänge\n"
-        "🔸  /clearfollowlist  - Leert die Follow-Liste\n"
+        "   /follow <username>  - Folgt einem User\n" # Geändert
+        "   /unfollow <username>  - Entfolgt einem User\n" # Geändert
+        "   /addusers <@user1 user2 ...>  - \n"
+        "         └ Fügt User zur Follow-Liste hinzu welche nach und nach abgearbeitet wird\n" # Geändert
+        "   /autofollowpause ,  /autofollowresume  - Steuert Auto-Follow\n"
+        "   /autofollowstatus  - Zeigt Status und Listenlänge\n"
+        "   /clearfollowlist  - Leert die Follow-Liste\n"
         "  \n"
         "🔻 👍    Like / Repost    🔄\n"
-        "🔻  /like <tweet_url>  - Liked einen Tweet\n" # Geändert
-        "🔻  /repost <tweet_url>  - Repostet einen Tweet\n" # Geändert
+        "   /like <tweet_url>  - Liked einen Tweet\n" # Geändert
+        "   /repost <tweet_url>  - Repostet einen Tweet\n" # Geändert
         "  \n"
         "▫️ 🔑    Keywords    🔑\n"
-        "▫️  /keywords  - Zeigt die Keyword-Liste\n"
-        "▫️  /addkeyword <wort1,wort2...>  - Fügt Keywords hinzu\n" # Geändert
-        "▫️  /removekeyword <wort1,wort2...>  - Entfernt Keywords\n" # Geändert
+        "   /keywords  - Zeigt die Keyword-Liste\n"
+        "   /addkeyword <wort1,wort2...>  - Fügt Keywords hinzu\n" # Geändert
+        "   /removekeyword <wort1,wort2...>  - Entfernt Keywords\n" # Geändert
         "  \n"
         "🔸 🥷    Accounts    🥷\n"
-        "🔸  /account  - Zeigt den aktiven Account\n"
-        "🔸  /switchaccount [nummer] \n" # Eckige Klammern sind OK
+        "   /account  - Zeigt den aktiven Account\n"
+        "   /switchaccount [nummer] \n" # Eckige Klammern sind OK
         "         └ Wechselt zum Account [nummer]\n" # Geändert
         "  \n"
         "🔺 🔍    Suchmodus    🔍\n"
-        "🔺  /mode  - Zeigt den aktuellen Suchmodus\n"
-        "🔺  /modefull  - Setzt Modus auf CA + Keywords\n"
-        "🔺  /modeca  - Setzt Modus auf Nur CA\n"
+        "   /mode  - Zeigt den aktuellen Suchmodus\n"
+        "   /modefull  - Setzt Modus auf CA + Keywords\n"
+        "   /modeca  - Setzt Modus auf Nur CA\n"
         "  \n"
         "🔹 ⏯️    Steuerung    ⏯️\n"
-        "🔹  /pause  - Pausiert das Tweet-Suchen ⏸️\n"
-        "🔹  /resume  - Setzt das Suchen fort ▶️\n"
+        "   /pause  - Pausiert das Tweet-Suchen ⏸️\n"
+        "   /resume  - Setzt das Suchen fort ▶️\n"
         "  \n"
         "🔸 ⏰    Zeitplan (Schedule)    ⏰\n"
-        "🔸  /schedule  - Zeigt den aktuellen Zeitplan\n"
-        "🔸  /scheduleon  - Aktiviert den Zeitplan\n"
-        "🔸  /scheduleoff  - Deaktiviert den Zeitplan\n"
-        "🔸  /scheduletime <HH:MM-HH:MM>  - Setzt die Pausenzeit\n" # Geändert
+        "   /schedule  - Zeigt den aktuellen Zeitplan\n"
+        "   /scheduleon  - Aktiviert den Zeitplan\n"
+        "   /scheduleoff  - Deaktiviert den Zeitplan\n"
+        "   /scheduletime <HH:MM-HH:MM>  - Setzt die Pausenzeit\n" # Geändert
         "  \n"
         "▫️ 📊    Statistiken & Status    📊\n"
-        "▫️  /status  - Zeigt den aktuellen Betriebsstatus 📊\n\n"        
-        "▫️  /stats  oder  /count  - Zeigt Post-Statistiken 📈\n"
-        "▫️  /rates  - Zeigt die gesammelten Quellen-Ratings ⭐️\n"
-        "▫️  /globallistinfo  - Zeigt Status der globalen Follower-Liste 🌍\n"
-        "▫️  /ping  - Prüft, ob der Bot antwortet 🏓\n"
+        "   /status  - Zeigt den aktuellen Betriebsstatus 📊\n\n"        
+        "   /stats  oder  /count  - Zeigt Post-Statistiken 📈\n"
+        "   /rates  - Zeigt die gesammelten Quellen-Ratings ⭐️\n"
+        "   /globallistinfo  - Zeigt Status der globalen Follower-Liste 🌍\n"
+        "   /ping  - Prüft, ob der Bot antwortet 🏓\n"
         "  \n"
-        "💾 ♻️  Following Backup/Sync/Build    ♻️\n"
-        "💾  /backupfollowers  - Speichert Snapshot des aktiven Accounts\n"
-        "🔄  /syncfollows  - Synchronisiert aktiven Account mit globaler Liste\n"
-        "🏗️  /buildglobalfrombackups \n"
-        "         └ Fügt User aus allen Backups zur globalen Liste hinzu\n" # Geändert
-        "❌  /cancelbackup ,  /cancelsync  - Bricht laufende Prozesse ab\n",
+        "🔸 💾  Following DB & Management  💾\n"
+        "   /scrapefollowing <username>\n"
+        "         └ Scannt Following von <username> & speichert in DB\n"
+        "   /addfromdb [f:NUM] [s:NUM] [k:WORT..]\n"
+        "         └ Fügt User aus DB hinzu (Filter: f=followers, s=seen, k=keywords)\n"
+        "   /backupfollowers  - Speichert Snapshot des aktiven Accounts\n"
+        "   /syncfollows  - Synchronisiert aktiven Account mit globaler Liste\n"
+        "   /buildglobalfrombackups \n"
+        "         └ Fügt User aus allen Backups zur globalen Liste hinzu\n"
+        "❌  /cancelbackup ,  /cancelsync ,  /canceldbscrape \n"
+        "         └ Bricht laufende Prozesse ab\n",
         reply_markup=reply_markup
     )
     # Wichtig: Diese Funktion muss am Ende resume aufrufen, da der aufrufende Handler pausiert hat
@@ -3882,43 +4608,57 @@ async def sync_followers_command(update: Update, context: ContextTypes.DEFAULT_T
 
     # 5. Entscheidung basierend auf Backup-Status und ob Sync nötig ist
     if backup_exists_and_not_empty:
-        # Backup existiert - Normaler Sync (Hinzufügen und/oder Entfernen)
-        message = (f"ℹ️ Sync für @{account_username} wird gestartet.\n"
+        # Fall B: Backup existiert - Normaler Sync -> Bestätigung anfordern
+        message = (f"ℹ️ **Sync-Vorschau für @{account_username}**\n\n"
                    f"   - User im Backup: {len(account_backup_set)}\n"
                    f"   - User global: {len(global_all_followed_users_set)}\n"
-                   f"   - Aktionen: *+{total_to_add} User / -{total_to_remove} User*\n" # Zeige beide Zahlen
-                   f"   - Geschätzte Dauer: *{estimated_time_str}*\n\n"
-                   f"✅ Der Sync läuft im Hintergrund...")
-        await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
-        # Starte den eigentlichen Logik-Task
-        asyncio.create_task(sync_followers_logic(update, account_username, backup_filepath))
-        # Kein resume_scraping hier, der Task läuft im Hintergrund
+                   f"   - ➡️ Aktionen: *+{total_to_add} User / -{total_to_remove} User*\n" # Zeige beide Zahlen
+                   f"   - ⏱️ Geschätzte Dauer: *{estimated_time_str}*\n\n"
+                   f"Möchtest du diesen Sync jetzt starten?")
+
+        # Buttons für Ja/Nein hinzufügen
+        keyboard = [[
+            # Wichtig: Account-Username in Callback-Daten einbetten!
+            InlineKeyboardButton(f"✅ Ja, Sync starten", callback_data=f"sync:proceed_sync:{account_username}"),
+            InlineKeyboardButton("❌ Nein, abbrechen", callback_data=f"sync:cancel_sync:{account_username}")
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+        # Starte den Task HIER NICHT MEHR! Das passiert im Button-Handler.
+        # Kein resume_scraping hier, warten auf Button-Antwort.
 
     else:
-        # Backup fehlt oder ist leer - Bestätigung anfordern (nur wenn Hinzufügen nötig ist)
+        # Fall A: Backup fehlt oder ist leer - Spezielle Bestätigung anfordern
         if total_to_add == 0:
-             # Sollte nicht passieren, wenn sync_needed True war, aber zur Sicherheit
-             await update.message.reply_text(f"ℹ️ Backup für @{account_username} fehlt/leer, aber keine User zum Hinzufügen aus globaler Liste gefunden.")
+             # Wenn kein Backup da ist UND nichts hinzuzufügen wäre
+             await update.message.reply_text(f"ℹ️ Backup für @{account_username} fehlt/leer und keine User zum Hinzufügen aus globaler Liste gefunden. Kein Sync nötig.")
              await resume_scraping()
              return
 
+        # Nachricht für Fall A
         message = (f"⚠️ **Achtung: Sync für @{account_username}**\n\n"
                    f"Die Backup-Datei `{os.path.basename(backup_filepath)}` fehlt oder ist leer.\n\n"
                    f"Ein Sync würde jetzt versuchen, *{total_to_add}* User aus der globalen Liste zu folgen.\n"
                    f"(User zum Entfernen können nicht bestimmt werden).\n"
                    f"Geschätzte Dauer (nur Hinzufügen): *{estimated_time_str}*\n\n"
-                   f"Möchtest du fortfahren?")
+                   f"Wie möchtest du fortfahren?")
+
+        # Buttons für Fall A
         keyboard = [[
+            # Option 1: Backup erstellen
             InlineKeyboardButton("💾 Backup erstellen & Abbrechen", callback_data=f"sync:create_backup:{account_username}"),
         ],[
+            # Option 2: Nur Hinzufügen starten
             InlineKeyboardButton(f"▶️ Ja, {total_to_add} User hinzufügen", callback_data=f"sync:proceed:{account_username}"),
-            InlineKeyboardButton("❌ Nein, Abbrechen", callback_data="sync:cancel")
+            # Option 3: Abbrechen
+            InlineKeyboardButton("❌ Nein, Abbrechen", callback_data=f"sync:cancel_sync:{account_username}") # Verwende cancel_sync
         ]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await send_telegram_message(text=message, reply_markup=reply_markup)
+        # await send_telegram_message(text=message, reply_markup=reply_markup) # send_telegram_message ist für den Kanal, hier direkt antworten
+        await update.message.reply_text(text=message, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
         # Nicht fortsetzen, warten auf Button-Antwort oder Timeout
 
-async def sync_followers_logic(update: Update, account_username: str, backup_filepath: str):
+async def sync_followers_logic(update: Update, account_username: str, backup_filepath: str, global_set_for_sync: set):
     """
     Führt die Synchronisation für den gegebenen Account durch.
     Fügt User hinzu, die global gefolgt, aber nicht im Backup sind.
@@ -3969,15 +4709,17 @@ async def sync_followers_logic(update: Update, account_username: str, backup_fil
 
         # --- Berechne Differenzen ---
         # User, die hinzugefügt werden sollen (global aber nicht im Backup)
-        users_to_add = global_followed_users_set - account_backup_set
+        # Verwende das übergebene Set!
+        users_to_add = global_set_for_sync - account_backup_set
         total_to_add = len(users_to_add)
 
         # User, die entfernt werden sollen (im Backup aber nicht mehr global)
-        users_to_remove = account_backup_set - global_followed_users_set
+        # Verwende das übergebene Set!
+        users_to_remove = account_backup_set - global_set_for_sync
         total_to_remove = len(users_to_remove)
         # --- Ende Differenzen ---
 
-        logger.info(f"[Sync @{account_username}] Global: {len(global_followed_users_set)} | Backup (Start): {initial_backup_size} | To Add: {total_to_add} | To Remove: {total_to_remove}")
+        logger.info(f"[Sync @{account_username}] Global (passed): {len(global_set_for_sync)} | Backup (Start): {initial_backup_size} | To Add: {total_to_add} | To Remove: {total_to_remove}")
 
         if not users_to_add and not users_to_remove:
             await update.message.reply_text(f"✅ Account @{account_username} ist bereits synchron.")
@@ -4105,7 +4847,7 @@ async def sync_followers_logic(update: Update, account_username: str, backup_fil
                 final_backup_size = len(account_backup_set)
                 summary = (f"✅ Sync für @{account_username} abgeschlossen:\n"
                            f"------------------------------------\n"
-                           f" Global gefolgt: {len(global_followed_users_set)}\n"
+                           f" Global gefolgt (Basis): {len(global_set_for_sync)}\n"
                            f" Im Backup (Start): {initial_backup_size}\n"
                            f" Im Backup (Ende): {final_backup_size}\n"
                            f"------------------------------------\n"
@@ -6084,7 +6826,7 @@ async def run():
           # --- Command Handler registrieren (ALLE über den Admin Helper) ---
         # Syntax: add_admin_command_handler(application, "befehlsname", funktionsname)
 
-        # Bestehende / Befehle (jetzt geschützt)
+        # Bestehende / Befehle
         add_admin_command_handler(application, "addusers", add_users_command)
         add_admin_command_handler(application, "autofollowpause", autofollow_pause_command)
         add_admin_command_handler(application, "autofollowresume", autofollow_resume_command)
@@ -6099,7 +6841,12 @@ async def run():
         add_admin_command_handler(application, "rates", show_ratings_command) # Ratings evtl. öffentlich?
         add_admin_command_handler(application, "backupfollowers", backup_followers_command)
 
-        # Umgewandelte Befehle (jetzt geschützt)
+        # Following Database Commands
+        add_admin_command_handler(application, "scrapefollowing", scrape_following_command)
+        add_admin_command_handler(application, "addfromdb", add_from_db_command)
+        add_admin_command_handler(application, "canceldbscrape", cancel_db_scrape_command)
+
+        # Umgewandelte Befehle
         add_admin_command_handler(application, "keywords", keywords_command) # Liste zeigen evtl. öffentlich?
         add_admin_command_handler(application, "addkeyword", add_keyword_command)
         add_admin_command_handler(application, "removekeyword", remove_keyword_command)
@@ -6173,6 +6920,7 @@ async def run():
 
         print("Lade Einstellungen, Zähler und Listen...")
         load_settings(); load_posts_count(); load_schedule(); load_ratings()
+        load_following_database() # Lade Following-DB
         load_admins() # Lade Admin-Liste
         global_followed_users_set = load_set_from_file(GLOBAL_FOLLOWED_FILE)
         print(f"{len(global_followed_users_set)} User global geladen.")
