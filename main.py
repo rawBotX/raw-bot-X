@@ -73,34 +73,15 @@ ascii_art = [
 r"                                                           ",
 r"                                                           ",
 r"                                                           ",
-r"              \\\\\\\\\                   /////            ",
-r"                \\\   \\\               /////              ",
-r"                  \\\   \\\        _  /////                ",
-r"                    \\\   \\\     | | ///        _         ",
+r"             \\\\\\\\\                    ////             ",
+r"               \\\   \\\                ////               ",
+r"                 \\\   \\\         _  ////                 ",
+r"                   \\\   \\\      | | //         _         ",
 r"          ____   ____  _ _ _  ___ | | _    ___  | |_       ",
 r"         / ___) / _  || | | |(___)| || \  / _ \ |  _)      ",
 r"        | |    ( ( | || | | |     | |_) )| |_| || |__      ",
 r"        |_|     \_||_| \____|     |____/  \___/  \___)     ",
 r"                                                           ",
-r"                       /////  \\\   \\\                    ",
-r"                     /////      \\\   \\\                  ",
-r"                   /////          \\\   \\\                ",
-r"                 /////              \\\   \\\              ",
-r"               /////                  \\\\\\\\\            ",
-r"                                                           ",
-r"                                                           ",
-r"                                                           ",
-r"                                                           ",
-r"                                                           ",
-r"             \\\\\\\\\                    ////             ",
-r"               \\\   \\\                ////               ",
-r"                 \\\   \\\         _  ////                 ",
-r"                   \\\   \\\      | | //         _         ",
-r"          ____   ____\\\_ _\\\__  | | _    ___  | |_       ",
-r"         / ___) / _  || | | |(___)| || \  / _ \ |  _)      ",
-r"        | |    ( ( | || | | |  \\\| |_) )| |_| || |__      ",
-r"        |_|     \_||_| \____|\   \|____/  \___/  \___)     ",
-r"                             \\\   \\\                     ",
 r"                       ////    \\\   \\\                   ",
 r"                     ////        \\\   \\\                 ",
 r"                   ////            \\\   \\\               ",
@@ -345,36 +326,60 @@ def display_ascii_animation(art_lines, delay_min=0.05, delay_max=0.1):
         time.sleep(random.uniform(delay_min, delay_max))
 
 def load_settings():
-    """Lädt Einstellungen aus der Datei."""
-    global dnd_mode_enabled, search_mode # search_mode hinzugefügt
+    """Lädt Einstellungen aus der Datei, inklusive Scraping- und Auto-Follow-Status."""
+    global dnd_mode_enabled, search_mode, is_scraping_paused, is_periodic_follow_active, pause_event
+
+    # --- Standardwerte definieren ---
+    default_dnd = False
+    default_search_mode = "full"
+    default_scraping_paused = True  # Standard: PAUSIERT
+    default_autofollow_active = False # Standard: AUS
+
     try:
         if os.path.exists(SETTINGS_FILE):
             with open(SETTINGS_FILE, 'r') as f:
                 settings = json.load(f)
-                dnd_mode_enabled = settings.get("dnd_mode_enabled", False)
-                search_mode = settings.get("search_mode", "full") # Lade search_mode, default "full"
-                print(f"Einstellungen geladen. DND-Modus: {'AN' if dnd_mode_enabled else 'AUS'}, Suchmodus: {search_mode}")
+                dnd_mode_enabled = settings.get("dnd_mode_enabled", default_dnd)
+                search_mode = settings.get("search_mode", default_search_mode)
+                is_scraping_paused = settings.get("is_scraping_paused", default_scraping_paused)
+                is_periodic_follow_active = settings.get("is_periodic_follow_active", default_autofollow_active)
+                print(f"Einstellungen geladen:")
+                print(f"  - DND-Modus: {'AN' if dnd_mode_enabled else 'AUS'}")
+                print(f"  - Suchmodus: {search_mode}")
+                print(f"  - Scraping: {'PAUSIERT' if is_scraping_paused else 'AKTIV'}")
+                print(f"  - Auto-Follow: {'AKTIV' if is_periodic_follow_active else 'AUS'}")
         else:
             print("Keine Einstellungsdatei gefunden, setze Standardwerte und erstelle Datei...")
-            # Setze Standardwerte, wenn Datei nicht existiert
-            dnd_mode_enabled = False
-            search_mode = "full"
+            dnd_mode_enabled = default_dnd
+            search_mode = default_search_mode
+            is_scraping_paused = default_scraping_paused
+            is_periodic_follow_active = default_autofollow_active
             # Speichere die Standardwerte sofort, um die Datei zu erstellen
-            save_settings()
+            save_settings() # save_settings muss die neuen Keys kennen!
             print(f"Standard-Einstellungsdatei '{SETTINGS_FILE}' wurde erstellt.")
-    except (json.JSONDecodeError, Exception) as e: # Auch JSONDecodeError abfangen
+
+    except (json.JSONDecodeError, Exception) as e:
         print(f"Fehler beim Laden der Einstellungen ({type(e).__name__}): {e}. Verwende Standardwerte.")
-        # Fallback zu Standardwerten bei Fehlern
-        dnd_mode_enabled = False
-        search_mode = "full"
+        dnd_mode_enabled = default_dnd
+        search_mode = default_search_mode
+        is_scraping_paused = default_scraping_paused
+        is_periodic_follow_active = default_autofollow_active
+
+    # --- WICHTIG: asyncio.Event basierend auf geladenem Status setzen ---
+    if is_scraping_paused:
+        pause_event.clear() # Pausiert
+    else:
+        pause_event.set()   # Läuft
 
 def save_settings():
-    """Speichert aktuelle Einstellungen in die Datei."""
-    global dnd_mode_enabled, search_mode # search_mode hinzugefügt
+    """Speichert aktuelle Einstellungen in die Datei, inkl. Scraping/Auto-Follow."""
+    global dnd_mode_enabled, search_mode, is_scraping_paused, is_periodic_follow_active
     try:
         settings = {
             "dnd_mode_enabled": dnd_mode_enabled,
-            "search_mode": search_mode # search_mode zum Speichern hinzufügen
+            "search_mode": search_mode,
+            "is_scraping_paused": is_scraping_paused,           # Hinzugefügt
+            "is_periodic_follow_active": is_periodic_follow_active # Hinzugefügt
         }
         with open(SETTINGS_FILE, 'w') as f:
             json.dump(settings, f, indent=4)
@@ -2438,6 +2443,7 @@ async def pause_scraping():
     # Warte kurz, um sicherzustellen, dass laufende Operationen abgeschlossen werden
     await asyncio.sleep(1)
     print("Scraping ist jetzt pausiert")
+    save_settings() # Speichere den neuen Pausenstatus
 
 async def resume_scraping():
     """Setzt das Tweet-Scraping fort"""
@@ -2445,6 +2451,7 @@ async def resume_scraping():
     is_scraping_paused = False
     pause_event.set()
     print("Scraping fortgesetzt")
+    save_settings() # Speichere den neuen Laufstatus
 
 async def scrape_following_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -3723,7 +3730,6 @@ async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Zeigt einen umfassenden Betriebsstatus des Bots an."""
-    await pause_scraping() # Pause für die Dauer des Befehls
 
     # --- Globale Variablen sammeln ---
     global is_scraping_paused, is_schedule_pause, search_mode, schedule_enabled, \
@@ -3735,9 +3741,9 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 1. Laufstatus
     if is_scraping_paused:
-        running_status = "⏸️ PAUSED (Schedule)" if is_schedule_pause else "⏸️ PAUSED (Manual)"
+        running_status = "🟡 PAUSED (Schedule)" if is_schedule_pause else "🟡 PAUSED (Manual)"
     else:
-        running_status = "▶️ RUNNING"
+        running_status = "🟢 RUNNING"
 
     # 2. Aktueller Account
     current_username = get_current_account_username() or "N/A"
@@ -3747,7 +3753,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode_text = "Full (CA + Keywords)" if search_mode == "full" else "CA ONLY"
 
     # 4. Zeitplan
-    schedule_status = "ON" if schedule_enabled else "OFF"
+    schedule_status = "🟢" if schedule_enabled else "🔴"
     schedule_details = f"{schedule_status} ({schedule_pause_start} - {schedule_pause_end})"
 
     # 5. Globale Follow-Liste Info
@@ -3771,7 +3777,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global_list_info = f"{global_list_count} User (Stand: {global_list_mod_time_str})"
 
     # 6. Auto-Follow Status (für aktuellen Account)
-    autofollow_stat = "ACTIVE" if is_periodic_follow_active else "PAUSED"
+    autofollow_stat = "🟢" if is_periodic_follow_active else "🟡"
 
     # 7. Aktuelle Account Follow-Liste Info + Vorschau
     current_list_path = get_current_follow_list_path()
@@ -3794,29 +3800,19 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- Nachricht zusammenbauen ---
     status_message = (
         f"📊 **Bot Gesamtstatus** 📊\n\n"
-        # Betrieb: Play/Pause-Symbole, evtl. mit Farbkreis oder Uhr für Schedule
-        f"{'▶️🟢' if not is_scraping_paused else ('⏸️⏰' if is_schedule_pause else '⏸️🟡')} **Betrieb:** {running_status}\n"
-        # Account: Ninja oder Personensymbol
+        f"{'▶️' if not is_scraping_paused else ('⏸️⏰' if is_schedule_pause else '⏸️🟡')} **Betrieb:** {running_status}\n"
         f"🥷 **Aktiver Account:** {account_info}\n"
-        # Suchmodus: Lupe
         f"🔍 **Suchmodus:** {mode_text}\n"
-        # Zeitplan: Uhr oder Kalender
         f"⏰ **Zeitplan:** {schedule_details}\n"
-        # Globale Liste: Globus oder Datenbank/Buch
         f"🌍 **Globale Follow-Liste:** {global_list_info}\n"
-        # Auto-Follow: Roboter oder laufende Person mit Pfeil
         f"🤖 **Auto-Follow (Akt. Acc):** {autofollow_stat}\n"
-        # Follow-Liste: Klemmbrett, Notizblock oder Zielliste
         f"📝 **Follow-Liste (Akt. Acc):** {current_list_info}\n"
-        # Die Vorschau selbst braucht kein extra Emoji davor
         f"{current_list_preview}"
     )
 
     # --- Nachricht senden ---
     # Wir entfernen den alten Button, da die Liste jetzt direkt angezeigt wird.
     await update.message.reply_text(status_message, parse_mode=ParseMode.MARKDOWN)
-
-    await resume_scraping() # Fortsetzen nach dem Befehl
 
 # --- Mode ---
 async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4547,6 +4543,7 @@ async def autofollow_pause_command(update: Update, context: ContextTypes.DEFAULT
     is_periodic_follow_active = False
     await update.message.reply_text("⏸️ Automatisches Folgen aus der Account-Liste wurde pausiert.")
     print("[Auto-Follow] Pausiert via Telegram-Befehl.")
+    save_settings() 
     # Kein resume_scraping nötig, da die Steuerung nur das Starten des Follow-Prozesses betrifft
 
 async def autofollow_resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4555,6 +4552,7 @@ async def autofollow_resume_command(update: Update, context: ContextTypes.DEFAUL
     is_periodic_follow_active = True
     await update.message.reply_text("▶️ Automatisches Folgen aus der Account-Liste wurde fortgesetzt.")
     print("[Auto-Follow] Fortgesetzt via Telegram-Befehl.")
+    save_settings() 
     # Kein resume_scraping nötig
 
 async def autofollow_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6983,18 +6981,30 @@ async def run():
         print("WebDriver und X Login initialisieren...")
         await initialize()
 
-        # --- Initialen Bot-Status bestimmen und Nachricht senden ---
-        is_scraping_paused = False
-        is_schedule_pause = False
-        pause_event.set()
+        # --- Initialen Bot-Status aus Settings laden und ggf. durch Schedule anpassen ---
+        # is_scraping_paused und is_periodic_follow_active werden bereits in load_settings() gesetzt
+        # pause_event wird ebenfalls in load_settings() gesetzt
 
-        # KORRIGIERTE check_schedule verwenden!
+        is_schedule_pause = False # Schedule-Pause ist ein Laufzeit-Status, nicht persistent
+
+        # Prüfe, ob der Schedule *jetzt* eine Pause erzwingen würde
         initial_schedule_check = check_schedule()
         if initial_schedule_check is True:
-            print("INFO: Startzeit liegt im geplanten Pausenzeitraum. Setze initialen Status auf 'Pausiert'.")
-            is_scraping_paused = True
-            is_schedule_pause = True
-            pause_event.clear()
+            # Wenn der Schedule eine Pause will UND der Bot aktuell läuft (laut Settings)
+            if not is_scraping_paused:
+                print("INFO: Startzeit liegt im geplanten Pausenzeitraum (Schedule aktiv). Überschreibe geladenen Status -> PAUSIERT.")
+                is_scraping_paused = True
+                is_schedule_pause = True
+                pause_event.clear()
+                # Kein save_settings() hier, da dies nur der initiale Zustand ist
+            else:
+                # Bot ist bereits pausiert (manuell oder durch letzten Lauf), Schedule will auch Pause
+                print("INFO: Startzeit liegt im geplanten Pausenzeitraum, Bot ist bereits pausiert (laut Settings).")
+                # Setze is_schedule_pause, falls der Grund jetzt der Schedule ist
+                is_schedule_pause = True # Markieren, dass die *aktuelle* Pause (auch) wegen Schedule ist
+        # Der Fall initial_schedule_check == "resume" wird hier nicht behandelt,
+        # da der Bot standardmäßig pausiert startet oder der gespeicherte Zustand gilt.
+        # Die Hauptschleife wird den Resume-Fall korrekt handhaben.
 
         running_status = "⏸️ PAUSED 🟡 (Schedule)" if is_scraping_paused and is_schedule_pause else ("⏸️ PAUSED 🟡 (Manual)" if is_scraping_paused else "▶️ RUNNING 🟢")
         mode_text = "Full 💯 (CA + Keywords)" if search_mode == "full" else "📝 CA ONLY" 
