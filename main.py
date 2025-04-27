@@ -236,7 +236,7 @@ is_periodic_follow_active = True # Steuerungs-Flag für Auto-Follow
 # ------------------------------------------------------------------------------------
 
 # Global variables
-dnd_mode_enabled = False
+#dnd_mode_enabled = False
 is_backup_running = False
 cancel_backup_flag = False
 is_sync_running = False
@@ -259,6 +259,14 @@ is_schedule_pause = False  # Flag um zu unterscheiden, ob Pause vom Scheduler ko
 first_run = True
 # Suchmodus: "full" für CA + Keywords, "ca_only" für nur CA
 search_mode = "full"
+
+
+# ===> Auto-Follow Modi & settings <===
+auto_follow_mode = "off" # Mögliche Werte: "off", "slow", "fast"
+auto_follow_interval_minutes = [15, 30] # [min, max] für Slow Mode
+is_fast_follow_running = False # Flag für den Fast-Follow-Task
+cancel_fast_follow_flag = False # Flag zum Abbrechen des Fast-Follow-Tasks
+# ===> END Auto-Follow Modi <===
 
 # ===> Following Database <===
 FOLLOWING_DB_FILE = "following_database.json"
@@ -326,44 +334,54 @@ def display_ascii_animation(art_lines, delay_min=0.05, delay_max=0.1):
         time.sleep(random.uniform(delay_min, delay_max))
 
 def load_settings():
-    """Lädt Einstellungen aus der Datei, inklusive Scraping- und Auto-Follow-Status."""
-    global dnd_mode_enabled, search_mode, is_scraping_paused, is_periodic_follow_active, pause_event
+    """Lädt Einstellungen aus der Datei, inklusive Scraping- und Auto-Follow-Modus/Intervall."""
+    global search_mode, is_scraping_paused, pause_event
+    global auto_follow_mode, auto_follow_interval_minutes # NEUE Globals
 
     # --- Standardwerte definieren ---
-    default_dnd = False
     default_search_mode = "full"
     default_scraping_paused = True  # Standard: PAUSIERT
-    default_autofollow_active = False # Standard: AUS
+    default_autofollow_mode = "off" # Standard: AUS
+    default_autofollow_interval = [15, 30] # Standard: 15-30 Minuten
 
     try:
         if os.path.exists(SETTINGS_FILE):
             with open(SETTINGS_FILE, 'r') as f:
                 settings = json.load(f)
-                dnd_mode_enabled = settings.get("dnd_mode_enabled", default_dnd)
                 search_mode = settings.get("search_mode", default_search_mode)
                 is_scraping_paused = settings.get("is_scraping_paused", default_scraping_paused)
-                is_periodic_follow_active = settings.get("is_periodic_follow_active", default_autofollow_active)
+                # Lade den neuen Modus und das Intervall
+                auto_follow_mode = settings.get("auto_follow_mode", default_autofollow_mode)
+                # Stelle sicher, dass das Intervall eine Liste mit 2 Zahlen ist
+                loaded_interval = settings.get("auto_follow_interval_minutes", default_autofollow_interval)
+                if isinstance(loaded_interval, list) and len(loaded_interval) == 2 and all(isinstance(x, int) for x in loaded_interval):
+                    auto_follow_interval_minutes = loaded_interval
+                else:
+                    print(f"WARNUNG: Ungültiges auto_follow_interval_minutes in {SETTINGS_FILE}. Verwende Standard: {default_autofollow_interval}")
+                    auto_follow_interval_minutes = default_autofollow_interval
+
                 print(f"Einstellungen geladen:")
-                print(f"  - DND-Modus: {'AN' if dnd_mode_enabled else 'AUS'}")
                 print(f"  - Suchmodus: {search_mode}")
                 print(f"  - Scraping: {'PAUSIERT' if is_scraping_paused else 'AKTIV'}")
-                print(f"  - Auto-Follow: {'AKTIV' if is_periodic_follow_active else 'AUS'}")
+                print(f"  - Auto-Follow Modus: {auto_follow_mode.upper()}")
+                if auto_follow_mode == "slow":
+                    print(f"  - Auto-Follow Intervall: {auto_follow_interval_minutes[0]}-{auto_follow_interval_minutes[1]} Min")
         else:
             print("Keine Einstellungsdatei gefunden, setze Standardwerte und erstelle Datei...")
-            dnd_mode_enabled = default_dnd
             search_mode = default_search_mode
             is_scraping_paused = default_scraping_paused
-            is_periodic_follow_active = default_autofollow_active
+            auto_follow_mode = default_autofollow_mode
+            auto_follow_interval_minutes = default_autofollow_interval
             # Speichere die Standardwerte sofort, um die Datei zu erstellen
             save_settings() # save_settings muss die neuen Keys kennen!
             print(f"Standard-Einstellungsdatei '{SETTINGS_FILE}' wurde erstellt.")
 
     except (json.JSONDecodeError, Exception) as e:
         print(f"Fehler beim Laden der Einstellungen ({type(e).__name__}): {e}. Verwende Standardwerte.")
-        dnd_mode_enabled = default_dnd
         search_mode = default_search_mode
         is_scraping_paused = default_scraping_paused
-        is_periodic_follow_active = default_autofollow_active
+        auto_follow_mode = default_autofollow_mode
+        auto_follow_interval_minutes = default_autofollow_interval
 
     # --- WICHTIG: asyncio.Event basierend auf geladenem Status setzen ---
     if is_scraping_paused:
@@ -372,14 +390,16 @@ def load_settings():
         pause_event.set()   # Läuft
 
 def save_settings():
-    """Speichert aktuelle Einstellungen in die Datei, inkl. Scraping/Auto-Follow."""
-    global dnd_mode_enabled, search_mode, is_scraping_paused, is_periodic_follow_active
+    """Speichert aktuelle Einstellungen in die Datei, inkl. Scraping, Auto-Follow-Modus/Intervall."""
+    global search_mode, is_scraping_paused
+    global auto_follow_mode, auto_follow_interval_minutes # NEUE Globals
     try:
         settings = {
-            "dnd_mode_enabled": dnd_mode_enabled,
             "search_mode": search_mode,
-            "is_scraping_paused": is_scraping_paused,           # Hinzugefügt
-            "is_periodic_follow_active": is_periodic_follow_active # Hinzugefügt
+            "is_scraping_paused": is_scraping_paused,
+            "auto_follow_mode": auto_follow_mode,                 # Hinzugefügt
+            "auto_follow_interval_minutes": auto_follow_interval_minutes # Hinzugefügt
+            # "is_periodic_follow_active" wird nicht mehr direkt gespeichert
         }
         with open(SETTINGS_FILE, 'w') as f:
             json.dump(settings, f, indent=4)
@@ -1048,14 +1068,15 @@ async def check_rate_limit():
     try:
         for pattern in rate_limit_patterns:
             try:
-                element = WebDriverWait(driver, 3).until(
+                # DEUTLICH kürzerer Timeout
+                element = WebDriverWait(driver, 0.5).until(
                     EC.presence_of_element_located((By.XPATH, pattern))
                 )
                 if element:
                     await handle_rate_limit()
                     return True
             except (NoSuchElementException, TimeoutException):
-                continue
+                continue # Element nicht schnell genug gefunden -> weiter
         return False
     except Exception as e:
         print(f"Error checking rate limit: {e}")
@@ -1183,7 +1204,7 @@ async def follow_user(username):
     try:
         # Navigate to user's profile
         driver.get(f"https://x.com/{username}")
-        await asyncio.sleep(random.uniform(3, 5))
+        await asyncio.sleep(random.uniform(1.5, 3))
         
         # Check if already following
         unfollow_button_xpaths = [
@@ -1222,7 +1243,7 @@ async def follow_user(username):
         follow_button = None
         for xpath in follow_button_xpaths:
             try:
-                follow_button = WebDriverWait(driver, 5).until(
+                follow_button = WebDriverWait(driver, 3).until(
                     EC.element_to_be_clickable((By.XPATH, xpath))
                 )
                 break
@@ -1237,13 +1258,13 @@ async def follow_user(username):
             
             # Navigate back to the following timeline
             driver.get("https://x.com/home")
-            await asyncio.sleep(random.uniform(2, 3))
+            await asyncio.sleep(random.uniform(1, 2))
             await switch_to_following_tab()
             return True
         else:
             await send_telegram_message(f"❌ Could not find follow button for @{username}")
             driver.get("https://x.com/home")
-            await asyncio.sleep(random.uniform(2, 3))
+            await asyncio.sleep(random.uniform(1, 2))
             await switch_to_following_tab()
             return False
             
@@ -2876,7 +2897,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                  return # sync_followers_command managed resume/task
 
             # --- Direkte Command-Aufrufe (managen ihr eigenes pause/resume) ---
-            elif payload in ["pause", "resume", "mode_full", "mode_ca", "stats", "ping", "keywords", "account", "schedule_on", "schedule_off", "schedule", "mode", "help", "show_rates", "build_global", "global_info", "status"]: 
+            elif payload in ["pause", "resume", "mode_full", "mode_ca", "stats", "ping", "keywords", "account", "schedule_on", "schedule_off", "schedule", "mode", "help", "show_rates", "build_global", "global_info", "status", "autofollow_status", "cancel_fast_follow", "autofollow_mode_off", "autofollow_mode_slow", "autofollow_mode_fast"]:                 
                  logger.debug(f"Calling command handler for help payload: {payload}")
                  if payload == "pause": await pause_command(emulated_update, None)
                  elif payload == "resume": await resume_command(emulated_update, None)
@@ -2895,6 +2916,18 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                  elif payload == "show_rates": await show_ratings_command(emulated_update, None)
                  elif payload == "build_global": await build_global_from_backups_command(emulated_update, None) # Aufruf für Button
                  elif payload == "status": await status_command(emulated_update, None) 
+                 elif payload == "autofollow_status": await autofollow_status_command(emulated_update, None)
+                 elif payload == "cancel_fast_follow": await cancel_fast_follow_command(emulated_update, None)
+                 elif payload == "autofollow_mode_off":
+                     # Erstelle ein einfaches Objekt, das 'context.args' simuliert
+                     mock_context = type('obj', (object,), {'args': ["off"]})
+                     await autofollow_mode_command(emulated_update, mock_context)
+                 elif payload == "autofollow_mode_slow":
+                     mock_context = type('obj', (object,), {'args': ["slow"]})
+                     await autofollow_mode_command(emulated_update, mock_context)
+                 elif payload == "autofollow_mode_fast":
+                     mock_context = type('obj', (object,), {'args': ["fast"]})
+                     await autofollow_mode_command(emulated_update, mock_context)
                  return # Die aufgerufenen Commands machen resume
 
             # --- "Prepare" Payloads (senden nur Text) ---
@@ -2938,6 +2971,13 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                  logger.info("Processing set_schedule help payload (now prepare_scheduletime).")
                  await query.message.reply_text("Kopiere und füge den Zeitbereich hinzu (HH:MM-HH:MM):\n\n`/scheduletime `", parse_mode=ParseMode.MARKDOWN)
                  await resume_scraping(); return
+            elif payload == "prepare_autofollow_interval":
+                 logger.info("Processing prepare_autofollow_interval help payload.")
+                 # Zeige das aktuelle Intervall im vorbereiteten Befehl
+                 current_interval = f"{auto_follow_interval_minutes[0]}-{auto_follow_interval_minutes[1]}"
+                 await query.message.reply_text(f"Kopiere, ändere Min/Max (Minuten):\n\n`/autofollowinterval {current_interval}`", parse_mode=ParseMode.MARKDOWN)
+                 await resume_scraping() 
+                 return       
    
             elif payload == "cancel_action":
                  logger.info("Processing cancel_action.")
@@ -3777,7 +3817,18 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global_list_info = f"{global_list_count} User (Stand: {global_list_mod_time_str})"
 
     # 6. Auto-Follow Status (für aktuellen Account)
-    autofollow_stat = "🟢" if is_periodic_follow_active else "🟡"
+    autofollow_stat = auto_follow_mode.upper() # Start mit Modusnamen
+    if auto_follow_mode == "slow":
+        autofollow_stat = f"SLOW ({auto_follow_interval_minutes[0]}-{auto_follow_interval_minutes[1]} min) ▶️"
+    elif auto_follow_mode == "fast":
+        autofollow_stat = "FAST 🚀"
+        if is_fast_follow_running: # Prüfen ob der Task läuft
+            autofollow_stat += " (Running...)"
+    elif auto_follow_mode == "off":
+        autofollow_stat = "OFF ⏸️"
+    # Fallback, sollte nicht passieren
+    else:
+        autofollow_stat = f"Unknown ({auto_follow_mode}) ❓"
 
     # 7. Aktuelle Account Follow-Liste Info + Vorschau
     current_list_path = get_current_follow_list_path()
@@ -4246,6 +4297,17 @@ async def show_help_message(update: Update):
              InlineKeyboardButton("🚶‍♂️‍➡️➕ Add2List", callback_data="help:prepare_addusers")
         ],
         [separator_button],
+        [ # Auto-Follow Steuerung (NEU)
+            InlineKeyboardButton("AF Mode OFF", callback_data="help:autofollow_mode_off"),
+            InlineKeyboardButton("AF Mode SLOW", callback_data="help:autofollow_mode_slow"),
+            InlineKeyboardButton("AF Mode FAST", callback_data="help:autofollow_mode_fast")
+        ],
+        [
+            InlineKeyboardButton("AF Set Interval", callback_data="help:prepare_autofollow_interval"),
+            InlineKeyboardButton("AF Status", callback_data="help:autofollow_status"),
+            InlineKeyboardButton("AF Cancel FAST", callback_data="help:cancel_fast_follow")
+        ],
+        [separator_button],
         [ # Like / Repost
              InlineKeyboardButton("👍 Like", callback_data="help:prepare_like"),
              InlineKeyboardButton("🔄 Repost", callback_data="help:prepare_repost")
@@ -4270,22 +4332,25 @@ async def show_help_message(update: Update):
         "🔺 🆘 `/help` - Show menu 🆘\n"
         " \n"
         "🔸 🚶‍♂️‍➡️    Follow / Unfollow    🚶‍♂️\n"
-        "   /follow <username>  - Folgt einem User\n" # Geändert
-        "   /unfollow <username>  - Entfolgt einem User\n" # Geändert
+        "   /follow <username>  - Folgt einem User\n" 
+        "   /unfollow <username>  - Entfolgt einem User\n" 
         "   /addusers <@user1 user2 ...>  - \n"
-        "         └ Fügt User zur Follow-Liste hinzu welche nach und nach abgearbeitet wird\n" # Geändert
-        "   /autofollowpause ,  /autofollowresume  - Steuert Auto-Follow\n"
+        "         └ Fügt User zur Follow-Liste hinzu.\n" 
+        "   /autofollowmode <off|slow|fast> - Setzt Auto-Follow Modus\n"
+        "   /autofollowinterval <min>-<max> - Setzt Intervall (Slow Mode)\n"
+        "   /autofollowstatus  - Zeigt Auto-Follow Status\n"
+        "   /cancelfastfollow - Bricht laufenden Fast-Follow ab\n"
         "   /autofollowstatus  - Zeigt Status und Listenlänge\n"
         "   /clearfollowlist  - Leert die Follow-Liste\n"
         "  \n"
         "🔻 👍    Like / Repost    🔄\n"
-        "   /like <tweet_url>  - Liked einen Tweet\n" # Geändert
-        "   /repost <tweet_url>  - Repostet einen Tweet\n" # Geändert
+        "   /like <tweet_url>  - Liked einen Tweet\n" 
+        "   /repost <tweet_url>  - Repostet einen Tweet\n" 
         "  \n"
         "▫️ 🔑    Keywords    🔑\n"
         "   /keywords  - Zeigt die Keyword-Liste\n"
-        "   /addkeyword <wort1,wort2...>  - Fügt Keywords hinzu\n" # Geändert
-        "   /removekeyword <wort1,wort2...>  - Entfernt Keywords\n" # Geändert
+        "   /addkeyword <wort1,wort2...>  - Fügt Keywords hinzu\n" 
+        "   /removekeyword <wort1,wort2...>  - Entfernt Keywords\n" 
         "  \n"
         "🔸 🥷    Accounts    🥷\n"
         "   /account  - Zeigt den aktiven Account\n"
@@ -4537,34 +4602,27 @@ async def backup_followers_command(update: Update, context: ContextTypes.DEFAULT
 
     # Kein resume_scraping hier, der Task läuft unabhängig und managed das selbst.
 
-async def autofollow_pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Pausiert die automatische Abarbeitung der Follow-Liste."""
-    global is_periodic_follow_active
-    is_periodic_follow_active = False
-    await update.message.reply_text("⏸️ Automatisches Folgen aus der Account-Liste wurde pausiert.")
-    print("[Auto-Follow] Pausiert via Telegram-Befehl.")
-    save_settings() 
-    # Kein resume_scraping nötig, da die Steuerung nur das Starten des Follow-Prozesses betrifft
-
-async def autofollow_resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Setzt die automatische Abarbeitung der Follow-Liste fort."""
-    global is_periodic_follow_active
-    is_periodic_follow_active = True
-    await update.message.reply_text("▶️ Automatisches Folgen aus der Account-Liste wurde fortgesetzt.")
-    print("[Auto-Follow] Fortgesetzt via Telegram-Befehl.")
-    save_settings() 
-    # Kein resume_scraping nötig
-
 async def autofollow_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Zeigt den Status der automatischen Follow-Funktion für den aktuellen Account an."""
-    global is_periodic_follow_active, current_account_usernames_to_follow
-    status = "AKTIV ▶️" if is_periodic_follow_active else "PAUSIERT ⏸️"
+    global auto_follow_mode, auto_follow_interval_minutes, current_account_usernames_to_follow
+    global is_fast_follow_running # Prüfen, ob Fast-Task läuft
+
+    mode_display = auto_follow_mode.upper()
+    if auto_follow_mode == "fast" and is_fast_follow_running:
+        mode_display += " (Running...)"
+    elif auto_follow_mode == "off":
+        mode_display = "OFF ⏸️"
+    elif auto_follow_mode == "slow":
+        mode_display = f"SLOW ({auto_follow_interval_minutes[0]}-{auto_follow_interval_minutes[1]} min) ▶️"
+
     account_username = get_current_account_username() or "Unbekannt"
     filepath = get_current_follow_list_path()
     filename = os.path.basename(filepath) if filepath else "N/A"
     count = len(current_account_usernames_to_follow)
-    await update.message.reply_text(f"🤖 Status Auto-Follow für @{account_username}: {status}\n"
-                                     f"📝 User in `{filename}`: {count}")
+
+    await update.message.reply_text(f"🤖 Status Auto-Follow für @{account_username}:\n"
+                                     f"   Mode: {mode_display}\n"
+                                     f"   User in `{filename}`: {count}")
     # WICHTIG: Haupt-Handler hat pausiert, hier fortsetzen
     await resume_scraping()
 
@@ -4948,6 +5006,190 @@ async def sync_followers_logic(update: Update, account_username: str, backup_fil
         cancel_sync_flag = False # Sicherstellen, dass Flag für nächsten Lauf false ist
         logger.info("[Sync] Status flags reset.")
         # =============================
+
+async def fast_follow_logic(update: Update):
+    """
+    Führt den "Fast Follow"-Modus aus: Folgt allen Usern aus der
+    aktuellen Account-Liste nacheinander mit kurzer Verzögerung.
+    (Mit Abbruchmöglichkeit)
+    """
+    global driver, is_scraping_paused, pause_event
+    global current_account_usernames_to_follow, global_followed_users_set
+    global is_fast_follow_running, cancel_fast_follow_flag # Flags für diesen Task
+
+    account_username = get_current_account_username()
+    if not account_username:
+        logger.error("[Fast Follow] Kann Account-Username nicht ermitteln. Breche ab.")
+        # Kein Update-Objekt hier standardmäßig, daher kein reply_text
+        return
+
+    if is_fast_follow_running:
+        logger.warning(f"[Fast Follow @{account_username}] Task läuft bereits.")
+        if update: await update.message.reply_text("⚠️ Ein Fast-Follow-Prozess läuft bereits.")
+        return
+
+    # ===== Task Start Markierung =====
+    is_fast_follow_running = True
+    cancel_fast_follow_flag = False
+    # ================================
+
+    logger.info(f"[Fast Follow @{account_username}] Starting fast follow process...")
+    start_message = (f"🚀 Starte Fast-Follow für @{account_username}...\n"
+                     f"   User in Liste: {len(current_account_usernames_to_follow)}\n"
+                     f"   Zum Abbrechen: `/cancelfastfollow`")
+    # Sende Nachricht nur, wenn ein Update-Objekt übergeben wurde (z.B. von manuellem Start)
+    if update: await update.message.reply_text(start_message)
+    else: await send_telegram_message(start_message) # Sende an Kanal, wenn automatisch gestartet
+
+    await pause_scraping() # Pausiere Haupt-Scraping
+
+    # --- Initialisiere Zähler ---
+    users_followed_in_task = 0
+    users_already_followed_checked = 0
+    users_failed_to_follow = 0
+    users_processed_count = 0
+    # --- Ende Zähler ---
+
+    navigation_successful = False
+    cancelled_early = False
+    list_modified = False # Flag, um zu wissen, ob die Liste gespeichert werden muss
+
+    # Kopiere die Liste, um sie sicher zu bearbeiten
+    list_to_process = current_account_usernames_to_follow[:]
+    total_to_process = len(list_to_process)
+
+    try: # Haupt-Try-Block
+        if not list_to_process:
+            logger.info(f"[Fast Follow @{account_username}] Liste ist leer. Nichts zu tun.")
+            if update: await update.message.reply_text(f"ℹ️ Follow-Liste für @{account_username} ist leer.")
+            # Springe direkt zu finally
+        else:
+            logger.info(f"[Fast Follow @{account_username}] Processing {total_to_process} users...")
+
+            for i, username in enumerate(list_to_process):
+                users_processed_count = i + 1
+                if cancel_fast_follow_flag: cancelled_early = True; break # Abbruchprüfung
+
+                logger.debug(f"[Fast Follow @{account_username}] Attempt {i+1}/{total_to_process}: Following @{username}...")
+                wait_follow = random.uniform(4, 7) # Behalte eine kleine Pause
+                logger.debug(f"    -> Waiting {wait_follow:.1f}s before next attempt")
+                await asyncio.sleep(wait_follow)
+
+                if cancel_fast_follow_flag: cancelled_early = True; break # Abbruchprüfung nach Wartezeit
+
+                follow_result = await follow_user(username)
+
+                if follow_result is True:
+                    logger.debug(f"  -> Success!")
+                    users_followed_in_task += 1
+                    # Entferne aus der *globalen* Liste und markiere für Speicherung
+                    if username in current_account_usernames_to_follow:
+                        current_account_usernames_to_follow.remove(username)
+                        list_modified = True
+                    # Füge zur globalen Liste und Backup hinzu
+                    if username not in global_followed_users_set:
+                        global_followed_users_set.add(username)
+                        add_to_set_file({username}, GLOBAL_FOLLOWED_FILE)
+                    backup_filepath = get_current_backup_file_path()
+                    if backup_filepath: add_to_set_file({username}, backup_filepath)
+
+                elif follow_result == "already_following":
+                    logger.debug(f"  -> Already following.")
+                    users_already_followed_checked += 1
+                    # Entferne aus der *globalen* Liste und markiere für Speicherung
+                    if username in current_account_usernames_to_follow:
+                        current_account_usernames_to_follow.remove(username)
+                        list_modified = True
+                    # Stelle Konsistenz sicher (global/backup)
+                    if username not in global_followed_users_set:
+                        global_followed_users_set.add(username)
+                        add_to_set_file({username}, GLOBAL_FOLLOWED_FILE)
+                    backup_filepath = get_current_backup_file_path()
+                    if backup_filepath: add_to_set_file({username}, backup_filepath)
+
+                else: # Fehler
+                    logger.warning(f"  -> Failed to follow @{username}! Remains in list.")
+                    users_failed_to_follow += 1
+
+                # Fortschritt melden (optional, z.B. alle 10 User)
+                if not cancelled_early and ((i + 1) % 10 == 0 or (i + 1) == total_to_process):
+                     progress_msg = f"[Fast Follow @{account_username}] Progress: {i+1}/{total_to_process} attempted..."
+                     await send_telegram_message(progress_msg) # Sende an Kanal
+
+            # === Nach der Schleife (oder Abbruch) ===
+            if list_modified:
+                logger.info(f"[Fast Follow @{account_username}] Saving updated follow list...")
+                save_current_account_follow_list() # Speichere die geänderte Liste
+
+            if cancelled_early:
+                 logger.info(f"[Fast Follow @{account_username}] Process cancelled after {users_processed_count}/{total_to_process} attempts.")
+                 summary = (f"🛑 Fast-Follow für @{account_username} abgebrochen!\n"
+                            f"------------------------------------\n"
+                            f" Versuchte Follows: {users_processed_count}/{total_to_process}\n"
+                            f"   - Erfolgreich: {users_followed_in_task}\n"
+                            f"   - Bereits gefolgt: {users_already_followed_checked}\n"
+                            f"   - Fehler: {users_failed_to_follow}\n"
+                            f"------------------------------------\n"
+                            f" Änderungen an der Liste wurden bis zum Abbruch gespeichert.")
+                 if update: await update.message.reply_text(summary)
+                 else: await send_telegram_message(summary)
+            else:
+                # Normales Ende - Endergebnis melden
+                final_list_size = len(current_account_usernames_to_follow)
+                summary = (f"✅ Fast-Follow für @{account_username} abgeschlossen:\n"
+                           f"------------------------------------\n"
+                           f" Verarbeitet: {total_to_process}\n"
+                           f"   - Erfolgreich gefolgt: {users_followed_in_task}\n"
+                           f"   - Bereits gefolgt (Check): {users_already_followed_checked}\n"
+                           f"   - Fehler beim Folgen: {users_failed_to_follow}\n"
+                           f"------------------------------------\n"
+                           f" Verbleibende User in Liste: {final_list_size}")
+                if update: await update.message.reply_text(summary)
+                else: await send_telegram_message(summary)
+                logger.info(f"[Fast Follow @{account_username}] Process completed.")
+
+    except Exception as e:
+        error_message = f"💥 Schwerwiegender Fehler während Fast-Follow für @{account_username}: {e}"
+        if update: await update.message.reply_text(error_message)
+        else: await send_telegram_message(error_message)
+        logger.error(f"Critical error during fast follow for @{account_username}: {e}", exc_info=True)
+        # Speichere Liste trotzdem, falls Änderungen gemacht wurden
+        if list_modified:
+            logger.info(f"[Fast Follow @{account_username}] Saving list state despite error...")
+            save_current_account_follow_list()
+
+    finally: # ===== WICHTIGER FINALLY BLOCK =====
+        logger.debug(f"[Fast Follow @{account_username}] Entering finally block.")
+        # Rückkehr zur Haupt-Timeline
+        logger.debug(f"[Fast Follow @{account_username}] Attempting to navigate back to home timeline...")
+        try:
+            if driver and "x.com" in driver.current_url and driver.current_url != "https://x.com/home":
+                 logger.debug("Navigating to x.com/home")
+                 driver.get("https://x.com/home")
+                 await asyncio.sleep(random.uniform(3, 5))
+            await switch_to_following_tab()
+            logger.debug("[Fast Follow] Successfully navigated back to home 'Following' tab.")
+            navigation_successful = True
+        except Exception as nav_err:
+            logger.error(f"[Fast Follow] Error navigating back to home timeline: {nav_err}", exc_info=True)
+
+        # Haupt-Scraping fortsetzen
+        logger.info(f"[Fast Follow @{account_username}] Resuming main scraping process.")
+        await resume_scraping()
+
+        # ===== Task Ende Markierung =====
+        is_fast_follow_running = False
+        cancel_fast_follow_flag = False
+        logger.info("[Fast Follow] Status flags reset.")
+        # =============================
+
+        # Wenn der Task fertig ist und der Modus immer noch "fast" ist, setze ihn auf "off"
+        global auto_follow_mode
+        if auto_follow_mode == "fast":
+            logger.info("[Fast Follow] Task finished, setting auto_follow_mode to 'off'.")
+            auto_follow_mode = "off"
+            save_settings()
+            await send_telegram_message(f"ℹ️ Fast-Follow für @{account_username} abgeschlossen. Modus auf 'OFF' gesetzt.")
 
 async def cancel_backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Fordert den Abbruch des laufenden Backup-Prozesses an."""
@@ -5914,15 +6156,20 @@ async def process_tweets():
             return
 
         print("Suche und verarbeite neue Tweets (mit Scrollen)...")
+        target_new_button_tweets = button_tweet_count
         processed_in_this_round = set()
+        # newly_processed_count bleibt für allgemeines Logging, steuert aber nicht mehr den Loop primär
         newly_processed_count = 0
-        max_scroll_attempts = 10
+        # NEU: Zähler für Tweets, die seit dem Button-Klick verarbeitet wurden
+        processed_since_button_click = 0
+        max_scroll_attempts = 10 # Sicherheitslimit beibehalten
         scroll_attempt = 0
-        target_to_find_or_process = button_tweet_count if button_tweet_count > 0 else (5 if first_run else 0)
         consecutive_scrolls_without_new = 0
-        max_consecutive_scrolls_without_new = 3
+        max_consecutive_scrolls_without_new = 3 # Fallback-Limit beibehalten
 
-        while scroll_attempt < max_scroll_attempts and newly_processed_count < target_to_find_or_process:
+        # Die Schleife läuft, bis das Ziel erreicht ist ODER die Fallbacks greifen
+        while scroll_attempt < max_scroll_attempts:
+            # Die primäre Abbruchbedingung wird *innerhalb* der Schleife geprüft
             scroll_attempt += 1
             found_in_this_scroll = 0
             current_containers = []
@@ -5965,14 +6212,19 @@ async def process_tweets():
                 # === 3. Tweet SOFORT verarbeiten ===
                 print(f"  -> Verarbeite neuen Tweet: {tweet_id}")
                 increment_scanned_count()
-                process_success = False
+                # NEU: Zähle *jeden* neu verarbeiteten Tweet für das Button-Ziel
+                processed_since_button_click += 1
+                process_success = False # Wird später auf True gesetzt, wenn Verarbeitung klappt
                 try:
                     # --- Ad Check ---
                     is_ad = False
                     try:
-                        WebDriverWait(container, 0.2).until(EC.presence_of_element_located((By.XPATH, './/span[text()="Ad" or text()="Anzeige"]')))
-                        is_ad = True
-                    except (TimeoutException, NoSuchElementException, StaleElementReferenceException): pass
+                        # Direkt suchen, ohne zu warten
+                        ad_indicators = container.find_elements(By.XPATH, './/span[text()="Ad" or text()="Anzeige"]')
+                        # Wenn die Liste nicht leer ist, wurde ein Indikator gefunden
+                        if ad_indicators:
+                            is_ad = True
+                    except (NoSuchElementException, StaleElementReferenceException): pass # Fehler beim Suchen selbst abfangen
 
                     if is_ad:
                         print(f"    Tweet {tweet_id} ist Werbung -> überspringe")
@@ -5985,15 +6237,19 @@ async def process_tweets():
                     # --- Repost Check ---
                     is_repost = False; repost_text = ""
                     try:
-                        sc = WebDriverWait(container, 0.2).until(EC.presence_of_element_located((By.XPATH, './/span[@data-testid="socialContext"]')))
-                        repost_text = sc.text.strip(); is_repost = bool(repost_text)
-                        if is_repost: print(f"    Repost gefunden: {repost_text}")
-                    except (TimeoutException, NoSuchElementException, StaleElementReferenceException): pass
+                        # Direkt suchen, ohne zu warten
+                        sc_elements = container.find_elements(By.XPATH, './/span[@data-testid="socialContext"]')
+                        # Wenn die Liste nicht leer ist, wurde das Element gefunden
+                        if sc_elements:
+                            repost_text = sc_elements[0].text.strip() # Nimm den Text des ersten gefundenen Elements
+                            is_repost = bool(repost_text) # Prüfe, ob Text vorhanden ist
+                            if is_repost: print(f"    Repost gefunden: {repost_text}")
+                    except (NoSuchElementException, StaleElementReferenceException): pass # Fehler beim Suchen selbst abfangen
 
                     # --- Zeit ---
                     datetime_str = ""; time_str = "📅 Zeit Unbekannt"; tweet_is_recent = False
                     try:
-                        te = WebDriverWait(container, 0.5).until(EC.presence_of_element_located((By.XPATH, './/time[@datetime]')))
+                        te = WebDriverWait(container, 0.3).until(EC.presence_of_element_located((By.XPATH, './/time[@datetime]'))) # <-- Timeout reduziert
                         datetime_str = te.get_attribute('datetime')
                         if datetime_str: time_str, tweet_is_recent = format_time(datetime_str)
                     except (TimeoutException, NoSuchElementException, StaleElementReferenceException): pass
@@ -6199,12 +6455,19 @@ async def process_tweets():
 
                         # --- Check for "Show more" ---
                         show_more_present = False
-                        if not is_repost:
+                        if not is_repost: # Nur prüfen, wenn es kein Repost ist
                             try:
-                                WebDriverWait(container, 0.3).until(EC.presence_of_element_located((By.XPATH, './/button[@data-testid="tweet-text-show-more-link"]')))
-                                show_more_present = True
-                            except (TimeoutException, NoSuchElementException, StaleElementReferenceException): pass
-                            except Exception as e_button: print(f"    WARNUNG: Fehler beim Prüfen auf 'Show more' Button: {e_button}")
+                                # Direkt suchen, ohne zu warten
+                                show_more_buttons = container.find_elements(By.XPATH, './/button[@data-testid="tweet-text-show-more-link"]')
+                                # Wenn die Liste nicht leer ist, wurde der Button gefunden
+                                if show_more_buttons:
+                                    show_more_present = True
+                                    # Optional: Loggen, dass er gefunden wurde
+                                    # print(f"    'Show more' Button gefunden für Tweet {tweet_id}")
+                            except (NoSuchElementException, StaleElementReferenceException):
+                                pass # Fehler beim Suchen selbst abfangen
+                            except Exception as e_button:
+                                print(f"    WARNUNG: Fehler beim Prüfen auf 'Show more' Button: {e_button}")
 
                         if show_more_present or (is_repost and tweet_content and len(tweet_content) > 140):  # Check in both normal and repost cases
                             print(f"    'Show more' button found for tweet {tweet_id}, will add 'Show Full Text' button")
@@ -6365,26 +6628,32 @@ async def process_tweets():
 
             # --- Ende der Schleife über aktuelle Container ---
 
+            # --- Prüfe primäre Abbruchbedingung (Button-Ziel erreicht) ---
+            # Nur prüfen, wenn der Button überhaupt geklickt wurde (target > 0)
+            if target_new_button_tweets > 0 and processed_since_button_click >= target_new_button_tweets:
+                print(f"Ziel von {target_new_button_tweets} neuen Tweets (laut Button) erreicht oder überschritten ({processed_since_button_click} verarbeitet). Stoppe Scrollen.")
+                break # Schleife verlassen
+
+            # --- Prüfe Fallback-Abbruchbedingung (keine neuen Tweets im Viewport) ---
             if found_in_this_scroll == 0:
                 consecutive_scrolls_without_new += 1
                 print(f"Scroll-Versuch {scroll_attempt}: Keine *neuen* Tweets in dieser Runde gefunden (Serie: {consecutive_scrolls_without_new}/{max_consecutive_scrolls_without_new}).")
                 if consecutive_scrolls_without_new >= max_consecutive_scrolls_without_new:
-                    print("Stoppe Scrollen frühzeitig, da keine neuen Tweets mehr gefunden wurden.")
-                    break
+                    print("Stoppe Scrollen (Fallback), da keine neuen Tweets mehr im sichtbaren Bereich gefunden wurden.")
+                    break # Schleife verlassen
             else:
-                consecutive_scrolls_without_new = 0
+                consecutive_scrolls_without_new = 0 # Reset, wenn neue gefunden wurden
 
-            if newly_processed_count >= target_to_find_or_process:
-                print(f"Ziel von {target_to_find_or_process} verarbeiteten Tweets erreicht.")
-                break
+            # --- Prüfe Fallback-Abbruchbedingung (maximale Scroll-Versuche) ---
             if scroll_attempt >= max_scroll_attempts:
-                print(f"Maximale Anzahl von {max_scroll_attempts} Scroll-Versuchen erreicht.")
-                break
+                print(f"Maximale Anzahl von {max_scroll_attempts} Scroll-Versuchen erreicht. Stoppe Scrollen.")
+                break # Schleife verlassen
 
+            # --- Nur scrollen, wenn noch nicht abgebrochen wurde ---
             print(f"Scrolle nach unten für Versuch {scroll_attempt + 1}...")
             try:
                 driver.execute_script("window.scrollBy(0, window.innerHeight * 0.8);")
-                await asyncio.sleep(random.uniform(1.0, 2.0))
+                await asyncio.sleep(random.uniform(0.2, 0.5)) # Behalte die Pause nach dem Scrollen bei
             except Exception as scroll_err:
                 print(f"Fehler beim Scrollen: {scroll_err}. Breche Scroll-Loop ab.")
                 break
@@ -6394,7 +6663,7 @@ async def process_tweets():
             first_run = False
             print("Erste Scan-Runde abgeschlossen, wechsle zu optimiertem Modus")
 
-        print(f"Verarbeitungsrunde abgeschlossen. {newly_processed_count} Tweets neu verarbeitet.")
+        print(f"Verarbeitungsrunde abgeschlossen. {processed_since_button_click} Tweets seit Button-Klick verarbeitet (Ziel war {target_new_button_tweets}). {newly_processed_count} Tweets insgesamt erfolgreich prozessiert/übersprungen.")
 
     except Exception as e_outer:
         print(f"!!!!!!!! SCHWERER FEHLER in process_tweets !!!!!!!! : {e_outer}")
@@ -6609,38 +6878,109 @@ async def check_new_tweets_button():
         print(f"Fehler beim Prüfen/Klicken des 'Neue Tweets'-Buttons: {e}")
         return 0 # Gib 0 im Fehlerfall zurück
 
-# async def check_new_tweets_button():
-#     try:
-#         # Kürzerer Timeout für schnelleres Finden des Buttons
-#         button = WebDriverWait(driver, 1).until(
-#             EC.presence_of_element_located((By.XPATH, 
-#             "/html/body/div[1]/div/div/div[2]/main/div/div/div/div/div/div[5]/section/div/div/div[1]/div[1]/button"))
-#         )
-        
-#         # Sofort klicken wenn Button gefunden
-#         button.click()
-#         print("Neue Tweets-Button sofort geklickt")
-        
-#         # Minimal warten nach dem Klick - nur 1 Sekunde
-#         time.sleep(1)
-        
-#         # Versuche Anzahl für Logging zu extrahieren
-#         try:
-#             span_element = button.find_element(By.XPATH, "./div/div/span")
-#             button_text = span_element.text.strip()
-#             match = re.search(r'Show (\d+)', button_text)
-#             if match:
-#                 num_new_tweets = int(match.group(1))
-#                 print(f"Ca. {num_new_tweets} neue Tweets geladen")
-#                 return num_new_tweets
-#         except:
-#             pass
-        
-#         return 1  # Nur einen neuen Tweet annehmen
-        
-#     except Exception as e:
-#         # Kein neuer Tweets Button gefunden, das ist normal
-#         return 0
+async def autofollow_mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Setzt den Auto-Follow Modus (off, slow, fast)."""
+    global auto_follow_mode, cancel_fast_follow_flag, is_fast_follow_running
+
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text("❌ Bitte Modus angeben: `/autofollowmode <off|slow|fast>`", parse_mode=ParseMode.MARKDOWN)
+        await resume_scraping()
+        return
+
+    new_mode = context.args[0].lower()
+
+    if new_mode not in ["off", "slow", "fast"]:
+        await update.message.reply_text("❌ Ungültiger Modus. Wähle: `off`, `slow` oder `fast`.", parse_mode=ParseMode.MARKDOWN)
+        await resume_scraping()
+        return
+
+    current_mode = auto_follow_mode
+    if new_mode == current_mode:
+        await update.message.reply_text(f"ℹ️ Auto-Follow Modus ist bereits '{current_mode.upper()}'.")
+        await resume_scraping()
+        return
+
+    # Wenn von/zu Fast gewechselt wird, laufenden Task ggf. abbrechen
+    if (current_mode == "fast" and new_mode != "fast") or \
+       (current_mode != "fast" and new_mode == "fast"):
+        if is_fast_follow_running:
+            print("[Mode Change] Cancelling running Fast-Follow task due to mode change.")
+            cancel_fast_follow_flag = True
+            await update.message.reply_text("⚠️ Laufender Fast-Follow Task wird abgebrochen...")
+            # Kurze Pause geben, damit der Task reagieren kann
+            await asyncio.sleep(2)
+
+    auto_follow_mode = new_mode
+    save_settings()
+    await update.message.reply_text(f"✅ Auto-Follow Modus auf '{new_mode.upper()}' gesetzt.")
+    # NEU: Wenn Modus auf SLOW gesetzt wird, zeige direkt den Intervall-Befehl
+    if new_mode == "slow":
+        # Stelle sicher, dass die globale Variable hier verfügbar ist
+        global auto_follow_interval_minutes
+        current_interval = f"{auto_follow_interval_minutes[0]}-{auto_follow_interval_minutes[1]}"
+        await update.message.reply_text(
+            f"Kopiere, ändere Min/Max (Minuten):\n\n`/autofollowinterval {current_interval}`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    logger.info(f"Auto-Follow mode set to '{new_mode}' by user {update.message.from_user.id}")
+
+    # Wenn auf Fast gesetzt, Nachricht geben (Task startet im nächsten Loop)
+    if new_mode == "fast":
+         account_username = get_current_account_username() or "Unbekannt"
+         list_count = len(current_account_usernames_to_follow)
+         if list_count > 0:
+             await update.message.reply_text(f"🚀 Fast-Follow für @{account_username} wird beim nächsten Durchlauf gestartet ({list_count} User).")
+         else:
+             await update.message.reply_text(f"ℹ️ Fast-Follow aktiviert, aber Liste für @{account_username} ist leer.")
+
+
+    await resume_scraping()
+
+async def autofollow_interval_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Setzt das Intervall für den Slow Mode (min-max Minuten)."""
+    global auto_follow_interval_minutes
+
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text("❌ Bitte Intervall angeben: `/autofollowinterval <min>-<max>` (Minuten)", parse_mode=ParseMode.MARKDOWN)
+        await resume_scraping()
+        return
+
+    interval_str = context.args[0]
+    try:
+        parts = interval_str.split('-')
+        if len(parts) != 2: raise ValueError("Format muss min-max sein")
+
+        min_val = int(parts[0].strip())
+        max_val = int(parts[1].strip())
+
+        if not (1 <= min_val <= 1440 and 1 <= max_val <= 1440): # Max 1 Tag
+            raise ValueError("Werte müssen zwischen 1 und 1440 liegen")
+        if min_val > max_val:
+            raise ValueError("Minimalwert darf nicht größer als Maximalwert sein")
+
+        auto_follow_interval_minutes = [min_val, max_val]
+        save_settings()
+        await update.message.reply_text(f"✅ Slow-Mode Intervall auf {min_val}-{max_val} Minuten gesetzt.")
+        logger.info(f"Auto-Follow slow interval set to {min_val}-{max_val} min by user {update.message.from_user.id}")
+
+    except ValueError as e:
+        await update.message.reply_text(f"❌ Ungültiges Intervall: {e}. Format: `<min>-<max>` (z.B. `5-15`)")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Fehler beim Setzen des Intervalls: {e}")
+        logger.error(f"Error setting interval '{interval_str}': {e}", exc_info=True)
+
+    await resume_scraping()
+
+async def cancel_fast_follow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fordert den Abbruch des laufenden Fast-Follow-Prozesses an."""
+    global is_fast_follow_running, cancel_fast_follow_flag
+    if is_fast_follow_running:
+        cancel_fast_follow_flag = True
+        await update.message.reply_text("🟡 Abbruch des Fast-Follow Tasks angefordert. Es kann einen Moment dauern...")
+        print("[Cancel] Fast-Follow cancellation requested.")
+    else:
+        await update.message.reply_text("ℹ️ Aktuell läuft kein Fast-Follow Task.")
+    # Kein resume/pause hier, dieser Befehl beeinflusst nur das Flag
 
 def increment_ad_total_count():
     """Increment the total count of found ads"""
@@ -6655,66 +6995,6 @@ def increment_ad_total_count():
     # Prüfe sicherheitshalber, ob der Key existiert
     if posts_count.get("ads_total", 0) % 50 == 0:
         save_posts_count()
-
-# async def check_new_tweets_button():
-#     """
-#     Checks for the 'Show new tweets' button, clicks it, logs the count found
-#     on the button, and returns that count.
-#     Returns 0 if the button is not found or no count could be extracted.
-#     """
-#     num_new_tweets_on_button = 0 # Standardwert
-#     try:
-#         # Warte kurz auf den Button
-#         button = WebDriverWait(driver, 2).until( # Leicht erhöhte Wartezeit auf 2s
-#             EC.presence_of_element_located((By.XPATH,
-#             # Robusterer XPath, der auf den Button selbst zielt
-#             '//button[.//span[contains(text(), "Show") and contains(text(), "post")]]'
-#             # Alternativ, wenn der alte zuverlässig war:
-#             # "/html/body/div[1]/div/div/div[2]/main/div/div/div/div/div/div[5]/section/div/div/div[1]/div[1]/button"
-#             ))
-#         )
-
-#         # Versuche, die Anzahl für Logging zu extrahieren *bevor* dem Klick
-#         try:
-#             # Suche nach dem inneren Span, der die Zahl enthält
-#             span_element = button.find_element(By.XPATH, './/span[contains(text(), "Show")]')
-#             button_text = span_element.text.strip()
-#             # Regex, um die Zahl zu finden (robuster gegen Textänderungen)
-#             match = re.search(r'(\d+)', button_text)
-#             if match:
-#                 num_new_tweets_on_button = int(match.group(1))
-#         except Exception as e_extract:
-#              print(f"INFO: Konnte Zahl nicht aus Button-Text extrahieren: {e_extract}")
-#              # Setze auf 1, da der Button da ist, aber die Zahl fehlt (konservative Annahme)
-#              num_new_tweets_on_button = 1
-
-
-#         # Sofort klicken, wenn Button gefunden
-#         button.click()
-#         # Gib die Meldung direkt nach dem Klick aus
-#         print(f"Neue Tweets-Button geklickt (ca. {num_new_tweets_on_button} Tweets)")
-
-#         # Kurze Wartezeit, damit die neuen Tweets laden können
-#         await asyncio.sleep(random.uniform(1.5, 2.5)) # Etwas länger warten
-
-#         return num_new_tweets_on_button
-
-#     except (TimeoutException, NoSuchElementException):
-#         # Kein neuer Tweets Button gefunden, das ist normal
-#         return 0 # Gib 0 zurück, wenn kein Button gefunden wurde
-#     except Exception as e:
-#         print(f"Fehler beim Prüfen/Klicken des 'Neue Tweets'-Buttons: {e}")
-#         return 0 # Gib 0 im Fehlerfall zurück
-
-# async def cleanup():
-#     """Clean up resources when shutting down"""
-#     global driver
-#     if driver:
-#         try:
-#             driver.quit()
-#         except Exception as e:
-#             print(f"Error quitting driver: {e}")
-
 
 
 async def check_and_process_queue(application):
@@ -6873,8 +7153,9 @@ async def run():
 
         # Bestehende / Befehle
         add_admin_command_handler(application, "addusers", add_users_command)
-        add_admin_command_handler(application, "autofollowpause", autofollow_pause_command)
-        add_admin_command_handler(application, "autofollowresume", autofollow_resume_command)
+        add_admin_command_handler(application, "autofollowmode", autofollow_mode_command)
+        add_admin_command_handler(application, "autofollowinterval", autofollow_interval_command)
+        add_admin_command_handler(application, "cancelfastfollow", cancel_fast_follow_command)
         add_admin_command_handler(application, "autofollowstatus", autofollow_status_command) # Status evtl. öffentlich lassen?
         add_admin_command_handler(application, "clearfollowlist", clear_follow_list_command)
         add_admin_command_handler(application, "syncfollows", sync_followers_command)
@@ -7010,7 +7291,11 @@ async def run():
         mode_text = "Full 💯 (CA + Keywords)" if search_mode == "full" else "📝 CA ONLY" 
         schedule_status = "ON ✅" if schedule_enabled else "OFF ❌"
         current_username_welcome = get_current_account_username() or "N/A"
-        autofollow_stat = "ACTIVE" if is_periodic_follow_active else "PAUSED"
+        autofollow_mode_display = auto_follow_mode.upper()
+        if auto_follow_mode == "slow":
+            autofollow_mode_display += f" ({auto_follow_interval_minutes[0]}-{auto_follow_interval_minutes[1]} min)"
+        elif auto_follow_mode == "off":
+             autofollow_mode_display = "OFF ⏸️"
         welcome_message = (
             f"🤖 raw-bot-X 🚀 START\n"
             f"👉 Acc {current_account+1} (@{current_username_welcome})\n\n"
@@ -7018,39 +7303,8 @@ async def run():
             f"{running_status}\n"
             f"🔍 Search mode: {mode_text}\n"
             f"⏰ Schedule: {schedule_status} ({schedule_pause_start} - {schedule_pause_end})\n"
-            f"🏃🏼‍♂️‍➡️ Auto-Follow: {autofollow_stat}\n"
+            f"🏃🏼‍♂️‍➡️ Auto-Follow: {autofollow_mode_display}\n"
         )
-
-
-        #         running_status = "▶️ RUNNING 🟢" # Standardwert
-
-        # # Initialen Status prüfen (check_schedule verwenden)
-        # initial_check_result = check_schedule()
-        # if initial_check_result is True:
-        #     print("INFO: Startzeit liegt im geplanten Pausenzeitraum. Setze initialen Status auf 'Pausiert'.")
-        #     is_scraping_paused = True
-        #     is_schedule_pause = True
-        #     pause_event.clear()
-        #     running_status = "⏸️ PAUSED 💤" # Status überschreiben
-        # mode_text = "CA + Keywords" if search_mode == "full" else "CA only"
-        # schedule_status = "ON ✅" if schedule_enabled else "OFF ❌"
-        # running_status = "⏸️ PAUSED 🟡" if is_scraping_paused else "▶️ RUNNING 🟢"
-        # current_username_welcome = get_current_account_username() or "N/A" # Sicherstellen, dass es einen Wert gibt
-        # autofollow_stat = "ACTIVE ▶️" if is_periodic_follow_active else "PAUSED ⏸️" # NEU
-        # welcome_message = (
-        #     f"🤖 X|B0T S T A R T E D 🚀 👉 account {current_account+1} (@{current_username_welcome})\n\n" # Username hinzugefügt
-        #     f"📊 ▫️STATUS▫️\n"
-        #     f"🔍 Search mode: {mode_text}\n"
-        #     f"⏰ Schedule: {schedule_status}\n"
-        #     f"⏰ ↘️ Time: {schedule_pause_start} - {schedule_pause_end}\n"
-        #     f"🏃🏼‍♂️‍➡️ Auto-Follow: {autofollow_stat}\n"
-        #     f"Status: {running_status}"
-        # )
-
-
-
-
-
 
 
         keyboard = [[InlineKeyboardButton("ℹ️ Hilfe anzeigen", callback_data="help:help")]]
@@ -7177,36 +7431,57 @@ async def run():
 
                 # --- ENDE WebDriver-Neustart ---
 
-                # --- Periodischer Follow Check (wie zuvor) ---
-                follow_interval = random.uniform(900, 1800) # 15-30 Minuten
-                if is_periodic_follow_active and current_account_usernames_to_follow and (time.time() - last_follow_attempt_time > follow_interval):
-                    if current_account_usernames_to_follow: # Nur wenn Liste nicht leer
+                # --- NEU: Periodischer Auto-Follow Check (Modus-basiert) ---
+                if auto_follow_mode == "slow":
+                    # --- Slow Mode Logik ---
+                    min_sec = auto_follow_interval_minutes[0] * 60
+                    max_sec = auto_follow_interval_minutes[1] * 60
+                    # Stelle sicher, dass min <= max
+                    if min_sec > max_sec: min_sec = max_sec
+                    follow_interval = random.uniform(min_sec, max_sec)
+
+                    if current_account_usernames_to_follow and (time.time() - last_follow_attempt_time > follow_interval):
                         username_to_try = random.choice(current_account_usernames_to_follow)
                         current_account_username_log = get_current_account_username() or "Unbekannt"
-                        print(f"[Auto-Follow @{current_account_username_log}] Starte Versuch für: @{username_to_try}")
+                        print(f"[Auto-Follow SLOW @{current_account_username_log}] Starte Versuch für: @{username_to_try} (Intervall: {follow_interval:.0f}s)")
                         await pause_scraping() # Pausiere für den Follow-Versuch
                         follow_result = None
                         try:
                             follow_result = await follow_user(username_to_try)
                             if follow_result is True or follow_result == "already_following":
-                                print(f"[Auto-Follow @{current_account_username_log}] Erfolg/Bereits gefolgt @{username_to_try}. Entferne aus Liste.")
+                                print(f"[Auto-Follow SLOW @{current_account_username_log}] Erfolg/Bereits gefolgt @{username_to_try}. Entferne aus Liste.")
                                 if username_to_try in current_account_usernames_to_follow:
                                      current_account_usernames_to_follow.remove(username_to_try)
                                      save_current_account_follow_list()
                                 else: print(f"Warnung: @{username_to_try} nicht mehr in Liste gefunden."); save_current_account_follow_list()
+                                # Update global/backup
                                 if username_to_try not in global_followed_users_set:
                                      global_followed_users_set.add(username_to_try); add_to_set_file({username_to_try}, GLOBAL_FOLLOWED_FILE); print(f"@{username_to_try} zur globalen Liste hinzugefügt.")
                                 backup_filepath = get_current_backup_file_path();
                                 if backup_filepath: add_to_set_file({username_to_try}, backup_filepath)
-                            else: print(f"[Auto-Follow @{current_account_username_log}] Fehler bei @{username_to_try}. Bleibt in Liste.")
-                        except Exception as follow_err: print(f"[Auto-Follow @{current_account_username_log}] Schwerer Fehler bei @{username_to_try}: {follow_err}")
+                            else: print(f"[Auto-Follow SLOW @{current_account_username_log}] Fehler bei @{username_to_try}. Bleibt in Liste.")
+                        except Exception as follow_err: print(f"[Auto-Follow SLOW @{current_account_username_log}] Schwerer Fehler bei @{username_to_try}: {follow_err}")
                         finally:
                             last_follow_attempt_time = time.time() # Zeitstempel aktualisieren
                             await resume_scraping() # Scraping fortsetzen
                             await asyncio.sleep(random.uniform(3, 5)) # Kurze Pause nach Versuch
+                        # Nach einem Follow-Versuch (erfolgreich oder nicht), direkt zum nächsten Loop-Durchlauf
+                        continue
 
-                    # Nach einem Follow-Versuch (erfolgreich oder nicht), direkt zum nächsten Loop-Durchlauf
-                    continue
+                elif auto_follow_mode == "fast":
+                    # --- Fast Mode Logik ---
+                    # Prüfe, ob der Task gestartet werden soll (nur wenn nicht schon läuft UND Liste nicht leer)
+                    if not is_fast_follow_running and current_account_usernames_to_follow:
+                        current_account_username_log = get_current_account_username() or "Unbekannt"
+                        logger.info(f"[Auto-Follow FAST @{current_account_username_log}] Modus ist 'fast' und Task läuft nicht. Starte Fast-Follow-Task...")
+                        # Starte den Task im Hintergrund. Er managed Pause/Resume selbst.
+                        # Kein 'update'-Objekt nötig, da automatisch gestartet.
+                        asyncio.create_task(fast_follow_logic(None))
+                        # Kein 'continue' hier, die Hauptschleife läuft weiter, während der Task arbeitet.
+                        # Der Task setzt den Modus am Ende auf 'off'.
+                    # Wenn Task schon läuft oder Liste leer ist, passiert hier nichts.
+
+                # --- Ende Auto-Follow Check ---
 
                 # --- Queue Check 1: Vor dem Tweet Processing ---
                 action_was_processed = await check_and_process_queue(application)
@@ -7241,12 +7516,11 @@ async def run():
                 if action_was_processed:
                     continue # Starte nächsten Loop-Durchlauf sofort nach Button-Aktion
 
-                # --- Integrierte Scroll-Logik (ersetzt perform_scroll_cycle) ---
                 # Entscheide, ob in dieser Iteration gescrollt wird (z.B. 80% Wahrscheinlichkeit)
-                if random.random() < 0.8: # Scrollt in 80% der Fälle
+                if random.random() < 1: # Scrollt in 80% der Fälle
                     try:
                         # Zufällige Scroll-Distanz (z.B. 60% bis 110% der Fensterhöhe)
-                        scroll_percentage = random.uniform(0.6, 1.1)
+                        scroll_percentage = random.uniform(0.9, 3.5)
                         scroll_command = f"window.scrollBy(0, window.innerHeight * {scroll_percentage});"
                         # Optional: Debug-Log für die Scroll-Distanz
                         # logger.debug(f"[Run Loop] Scrolling down by {scroll_percentage:.2f} * viewport height...")
@@ -7254,7 +7528,7 @@ async def run():
                         driver.execute_script(scroll_command)
 
                         # Zufällige Wartezeit nach dem Scrollen (größerer Bereich)
-                        wait_after_scroll = random.uniform(0.8, 2.8)
+                        wait_after_scroll = random.uniform(0.2, 0.7)
                         await asyncio.sleep(wait_after_scroll)
                     except Exception as scroll_err:
                         print(f"Fehler beim Scrollen in run loop: {scroll_err}")
@@ -7271,7 +7545,7 @@ async def run():
                     continue # Starte nächsten Loop-Durchlauf sofort nach Button-Aktion
 
                 # --- Kurze Pause am Ende des Loops ---
-                await asyncio.sleep(random.uniform(0.5, 1.5))
+                await asyncio.sleep(random.uniform(0.1, 0.3))
 
             except Exception as e:
                 # ... (Deine Fehlerbehandlung wie vorher) ...
@@ -7293,7 +7567,7 @@ async def run():
                     last_error_time = current_time
                 else:
                     network_error_count = 0 # Reset bei anderen Fehlern
-                    await asyncio.sleep(15) # Standardpause bei anderen Fehlern
+                    await asyncio.sleep(3) # Standardpause bei anderen Fehlern
                 last_error_time = current_time # Zeit des letzten Fehlers merken
 
             except Exception as e:
@@ -7302,7 +7576,7 @@ async def run():
                 import traceback
                 traceback.print_exc()
                 # ... (Netzwerkfehler-Logik etc.) ...
-                await asyncio.sleep(15)
+                await asyncio.sleep(3)
 
     except KeyboardInterrupt:
         print("\nKeyboardInterrupt empfangen. Beende Bot...")
