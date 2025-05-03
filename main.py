@@ -158,7 +158,7 @@ print(f"DEBUG: os.getenv('ADMIN_USER_ID') after load_dotenv: '{check_admin_id}'"
 
 # The original assignments follow AFTERWARDS:
 DEFAULT_BOT_TOKEN = os.getenv("BOT_TOKEN")
-TEST_BOT_TOKEN = os.getenv("BOT_TEST_TOKEN") # NEW: Load test token
+TEST_BOT_TOKEN = os.getenv("BOT_TEST_TOKEN") #  Load test token
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 # --- Admin Configuration --- (These lines remain here)
 ADMINS_FILE = "admins.json"
@@ -168,10 +168,10 @@ admin_user_ids = set() # Will be loaded on startup
 
 
 DEFAULT_BOT_TOKEN = os.getenv("BOT_TOKEN")
-TEST_BOT_TOKEN = os.getenv("BOT_TEST_TOKEN") # NEW: Load test token
+TEST_BOT_TOKEN = os.getenv("BOT_TEST_TOKEN") #  Load test token
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 
-# NEW: Global variable for the *currently* used bot token
+#  Global variable for the *currently* used bot token
 ACTIVE_BOT_TOKEN = None # Will be set in the main block
 
 # === Dynamic Account Creation ===
@@ -252,6 +252,22 @@ is_schedule_pause = False  # Flag to distinguish if pause comes from scheduler
 first_run = True
 # Search mode: "full" for CA + Keywords, "ca_only" for only CA
 search_mode = "full"
+# Ticker search: True to enable searching for $Tickers, False to disable
+search_tickers_enabled = True # Default: Enabled
+
+# Maximum tweet age in minutes to be considered recent
+max_tweet_age_minutes = 15 # Default value
+
+# Headless mode: True to run Chrome without GUI
+is_headless_enabled = False # Default: Disabled
+
+# Cloudflare Check Globals
+WAITING_FOR_CLOUDFLARE_CONFIRMATION = False
+CLOUDFLARE_ACCOUNT_INDEX = None
+cloudflare_solved_event = asyncio.Event()
+
+# Debug Pause Event after Password - REMOVED
+# manual_login_debug_continue_event = asyncio.Event()
 
 
 # ===> Auto-Follow Modes & settings <===
@@ -303,7 +319,7 @@ start_time = datetime.now()  # To track uptime
 
 action_queue = asyncio.Queue()
 
-# ===> NEW: Rating System <===
+# ===>  Rating System <===
 RATINGS_FILE = "ratings.json"
 ratings_data = {} # Loaded on startup
 # ===> END Rating System <===
@@ -327,15 +343,21 @@ def display_ascii_animation(art_lines, delay_min=0.05, delay_max=0.1):
         time.sleep(random.uniform(delay_min, delay_max))
 
 def load_settings():
-    """Loads settings from the file, including scraping and auto-follow mode/interval."""
+    """Loads settings from the file, including scraping, auto-follow, ticker search, headless mode, and max tweet age."""
     global search_mode, is_scraping_paused, pause_event
-    global auto_follow_mode, auto_follow_interval_minutes # NEW Globals
+    global auto_follow_mode, auto_follow_interval_minutes # Auto-Follow Globals
+    global search_tickers_enabled # Ticker Search Global
+    global is_headless_enabled #  Headless Mode Global
+    global max_tweet_age_minutes # Max Tweet Age Global
 
     # --- Define default values ---
     default_search_mode = "full"
     default_scraping_paused = True  # Default: PAUSED
     default_autofollow_mode = "off" # Default: OFF
     default_autofollow_interval = [15, 30] # Default: 15-30 minutes
+    default_search_tickers_enabled = True # Default: Ticker search ON
+    default_headless_enabled = False # Default: Headless OFF
+    default_max_tweet_age = 15 # Default: 15 minutes
 
     try:
         if os.path.exists(SETTINGS_FILE):
@@ -353,18 +375,39 @@ def load_settings():
                     print(f"WARNING: Invalid auto_follow_interval_minutes in {SETTINGS_FILE}. Using default: {default_autofollow_interval}")
                     auto_follow_interval_minutes = default_autofollow_interval
 
+                # Load the new ticker search setting
+                search_tickers_enabled = settings.get("search_tickers_enabled", default_search_tickers_enabled)
+
+                # Load the new headless mode setting
+                is_headless_enabled = settings.get("is_headless_enabled", default_headless_enabled)
+
+                # Load the new max tweet age setting
+                loaded_max_age = settings.get("max_tweet_age_minutes", default_max_tweet_age)
+                if isinstance(loaded_max_age, int) and loaded_max_age >= 1:
+                    max_tweet_age_minutes = loaded_max_age
+                else:
+                    print(f"WARNING: Invalid max_tweet_age_minutes ('{loaded_max_age}') in {SETTINGS_FILE}. Using default: {default_max_tweet_age}")
+                    max_tweet_age_minutes = default_max_tweet_age
+
                 print(f"Settings loaded:")
                 print(f"  - Search mode: {search_mode}")
                 print(f"  - Scraping: {'PAUSED' if is_scraping_paused else 'ACTIVE'}")
                 print(f"  - Auto-Follow Mode: {auto_follow_mode.upper()}")
                 if auto_follow_mode == "slow":
                     print(f"  - Auto-Follow Interval: {auto_follow_interval_minutes[0]}-{auto_follow_interval_minutes[1]} Min")
+                print(f"  - Ticker Search: {'ENABLED' if search_tickers_enabled else 'DISABLED'}")
+                print(f"  - Headless Mode: {'ENABLED' if is_headless_enabled else 'DISABLED'}")
+                print(f"  - Max Tweet Age: {max_tweet_age_minutes} minutes") # Print loaded value
+
         else:
             print("No settings file found, setting default values and creating file...")
             search_mode = default_search_mode
             is_scraping_paused = default_scraping_paused
             auto_follow_mode = default_autofollow_mode
             auto_follow_interval_minutes = default_autofollow_interval
+            search_tickers_enabled = default_search_tickers_enabled
+            is_headless_enabled = default_headless_enabled
+            max_tweet_age_minutes = default_max_tweet_age # Set default
             # Save the default values immediately to create the file
             save_settings() # save_settings needs to know the new keys!
             print(f"Default settings file '{SETTINGS_FILE}' has been created.")
@@ -375,6 +418,9 @@ def load_settings():
         is_scraping_paused = default_scraping_paused
         auto_follow_mode = default_autofollow_mode
         auto_follow_interval_minutes = default_autofollow_interval
+        search_tickers_enabled = default_search_tickers_enabled
+        is_headless_enabled = default_headless_enabled
+        max_tweet_age_minutes = default_max_tweet_age # Set default on error
 
     # --- IMPORTANT: Set asyncio.Event based on loaded status ---
     if is_scraping_paused:
@@ -383,16 +429,21 @@ def load_settings():
         pause_event.set()   # Running
 
 def save_settings():
-    """Saves current settings to the file, incl. scraping, auto-follow mode/interval."""
+    """Saves current settings to the file, incl. scraping, auto-follow, ticker search, headless mode, and max tweet age."""
     global search_mode, is_scraping_paused
-    global auto_follow_mode, auto_follow_interval_minutes # NEW Globals
+    global auto_follow_mode, auto_follow_interval_minutes # Auto-Follow Globals
+    global search_tickers_enabled # Ticker Search Global
+    global is_headless_enabled # Headless Mode Global
+    global max_tweet_age_minutes # Max Tweet Age Global
     try:
         settings = {
             "search_mode": search_mode,
             "is_scraping_paused": is_scraping_paused,
-            "auto_follow_mode": auto_follow_mode,                 # Added
-            "auto_follow_interval_minutes": auto_follow_interval_minutes # Added
-            # "is_periodic_follow_active" is no longer saved directly
+            "auto_follow_mode": auto_follow_mode,
+            "auto_follow_interval_minutes": auto_follow_interval_minutes,
+            "search_tickers_enabled": search_tickers_enabled,
+            "is_headless_enabled": is_headless_enabled,
+            "max_tweet_age_minutes": max_tweet_age_minutes 
         }
         with open(SETTINGS_FILE, 'w') as f:
             json.dump(settings, f, indent=4)
@@ -601,12 +652,14 @@ def get_current_backup_file_path():
 
 def create_driver():
     options = webdriver.ChromeOptions()
+    global is_headless_enabled # Access the global setting
     # Enhanced anti-detection settings
     options.add_argument('--no-sandbox')
     options.add_argument('--disable-dev-shm-usage')
     options.add_argument('--disable-extensions')
     options.add_argument('--disable-blink-features=AutomationControlled')
     options.add_argument('--start-maximized')
+    options.add_argument('--force-device-scale-factor=0.25') # Setzt den Skalierungsfaktor auf 25%
 
     # Additional anti-detection measures
     options.add_experimental_option('excludeSwitches', ['enable-automation'])
@@ -622,7 +675,15 @@ def create_driver():
     is_raspberry_pi = os.path.exists('/usr/bin/chromium-browser')
     if is_raspberry_pi:
         options.add_argument('--disable-gpu')
+        # Headless is now controlled by the global setting, not just RPi detection
+        # options.add_argument('--headless')
+
+    # Add headless argument based on the global setting
+    if is_headless_enabled:
+        print("INFO: Headless mode is ENABLED. Adding --headless argument.")
         options.add_argument('--headless')
+    else:
+        print("INFO: Headless mode is DISABLED.")
 
     # User Agent - use a more recent user agent
     user_agents = [
@@ -650,6 +711,9 @@ def create_driver():
 
         # Mask WebDriver presence
         driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+        # Der JavaScript Zoom wurde entfernt, da er unzuverlässig war.
+        # Der Zoom wird jetzt über '--force-device-scale-factor' gesetzt (siehe oben).
 
         return driver
     except Exception as e:
@@ -689,7 +753,7 @@ async def initialize():
 async def switch_to_following_tab():
     """Checks for ad relevance popup and ensures we're on the Following tab."""
     try:
-        # --- NEW: Popup Check ---
+        # ---  Popup Check ---
         # XPath looking for a button containing a span with the specific text
         popup_button_xpath = "//button[.//span[contains(text(), 'Keep less relevant ads')]]"
         try:
@@ -900,12 +964,88 @@ async def manual_login():
             await asyncio.sleep(random.uniform(4, 6))
             print("Entered password")
 
-        # Handle 2FA if needed
-        if check_element_exists(By.CSS_SELECTOR, '[data-testid="ocfEnterTextTextInput"]'):
+        # === DEBUG PAUSE REMOVED ===
+
+        # === Cloudflare Check ===
+        cloudflare_check_needed = False
+        print("Performing Cloudflare checks...") # Log start of check
+        try:
+            # --- Check indicators in order of reliability ---
+            # 1. Hidden Inputs (Very Reliable)
+            if check_element_exists(By.CSS_SELECTOR, 'input[name="cf-turnstile-response"]', timeout=1):
+                print("Cloudflare indicator: Found cf-turnstile-response input.")
+                cloudflare_check_needed = True
+            elif check_element_exists(By.CSS_SELECTOR, 'input[name="cf_challenge_response"]', timeout=1):
+                print("Cloudflare indicator: Found cf_challenge_response input.")
+                cloudflare_check_needed = True
+            # 2. Ray ID (Very Reliable)
+            elif check_element_exists(By.CSS_SELECTOR, 'div.ray-id', timeout=1):
+                print("Cloudflare indicator: Found div.ray-id.")
+                cloudflare_check_needed = True
+            # 3. Specific ID 'verifying' (Good, but might be hidden)
+            elif check_element_exists(By.ID, 'verifying', timeout=1):
+                print("Cloudflare indicator: Found div#verifying.")
+                cloudflare_check_needed = True
+            # 4. Footer Link (Medium Reliability)
+            elif check_element_exists(By.XPATH, '//div[@id="footer-text"]//a[contains(@href, "cloudflare.com")]', timeout=1):
+                print("Cloudflare indicator: Found footer link to cloudflare.com.")
+                cloudflare_check_needed = True
+            # 5. Text Indicators (Medium Reliability - Keep as fallback)
+            elif check_element_exists(By.XPATH, '//span[contains(text(), "Verify you are human")]', timeout=1):
+                 print("Cloudflare indicator: Found text 'Verify you are human'.")
+                 cloudflare_check_needed = True
+            # 6. IFrame (Medium Reliability - Keep as fallback)
+            elif check_element_exists(By.XPATH, '//iframe[contains(@title, "Cloudflare") or contains(@title, "challenge")]', timeout=1):
+                 print("Cloudflare indicator: Found challenge iframe.")
+                 cloudflare_check_needed = True
+
+        except Exception as cf_check_err:
+            # Log errors during the check itself, but don't necessarily stop the login
+            print(f"Warning: Error during Cloudflare check execution: {cf_check_err}")
+
+        # --- If Cloudflare was detected, wait for user confirmation ---
+        if cloudflare_check_needed:
+            global WAITING_FOR_CLOUDFLARE_CONFIRMATION, CLOUDFLARE_ACCOUNT_INDEX, cloudflare_solved_event
+            WAITING_FOR_CLOUDFLARE_CONFIRMATION = True
+            CLOUDFLARE_ACCOUNT_INDEX = current_account
+            cloudflare_solved_event.clear()
+
+            # Send message to Telegram - ** CHANGED INSTRUCTIONS **
+            account_display = ACCOUNTS[current_account].get("username", f"Account {current_account+1}")
+            message_text = (f"🚨 **Manual Login Required (Cloudflare)** for {account_display}!\n\n"
+                            f"Cloudflare detected. Please **log in manually**.\n\n"
+                            f"Click the button below **ONLY AFTER** you are successfully logged into X or restart the bot.")
+            # ** CHANGED BUTTON TEXT **
+            keyboard = [[InlineKeyboardButton("✅ I have logged in manually", callback_data=f"cloudflare_solved:{current_account}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            # Use the global send_telegram_message function
+            await send_telegram_message(message_text, reply_markup=reply_markup)
+            print(f"Cloudflare detected for Account {current_account+1}. Waiting for user to log in manually and confirm via Telegram button...")
+
+            # Wait for the user to click the button
+            await cloudflare_solved_event.wait()
+
+            # Reset flags after confirmation
+            WAITING_FOR_CLOUDFLARE_CONFIRMATION = False
+            CLOUDFLARE_ACCOUNT_INDEX = None
+            print(f"Manual login confirmation received for Account {current_account+1}. Continuing login verification...")
+            # Refresh page after user confirms manual login
+            try:
+                driver.refresh()
+                print("Page refreshed after manual login confirmation.")
+                await asyncio.sleep(random.uniform(3, 5)) # Wait longer after refresh
+            except Exception as refresh_err:
+                print(f"Warning: Error refreshing page after manual login confirmation: {refresh_err}")
+        # === End Cloudflare Check ===
+
+        # Handle 2FA if needed (Only if Cloudflare wasn't detected or was solved via manual login)
+        # Note: 2FA might appear *after* manual login if triggered by Cloudflare resolution
+        if not cloudflare_check_needed and check_element_exists(By.CSS_SELECTOR, '[data-testid="ocfEnterTextTextInput"]'):
             await handle_2fa()
 
-        # Handle account unlock if needed
-        if check_element_exists(By.XPATH, "//div[contains(text(), 'Your account has been locked')]"):
+        # Handle account unlock if needed (Only if Cloudflare wasn't detected or was solved)
+        if not cloudflare_check_needed and check_element_exists(By.XPATH, "//div[contains(text(), 'Your account has been locked')]"):
             await handle_account_unlock()
 
         # Verify successful login
@@ -1236,16 +1376,55 @@ async def follow_user(username):
                 continue
 
         if follow_button:
-            await asyncio.sleep(random.uniform(1, 2))
-            follow_button.click()
-            await asyncio.sleep(random.uniform(2, 3))
-            await send_telegram_message(f"✅ Successfully followed @{username}")
+            try:
+                # --- Attempt 1: Scroll into view and use JavaScript click ---
+                print(f"    Scrolling follow button for @{username} into view...")
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});", follow_button)
+                await asyncio.sleep(random.uniform(0.5, 1.0)) # Short pause after scroll
 
-            # Navigate back to the following timeline
-            driver.get("https://x.com/home")
-            await asyncio.sleep(random.uniform(1, 2))
-            await switch_to_following_tab()
-            return True
+                print(f"    Attempting JavaScript click on follow button for @{username}...")
+                driver.execute_script("arguments[0].click();", follow_button)
+                print(f"    JavaScript click successful for @{username}.")
+
+                await asyncio.sleep(random.uniform(2, 3)) # Wait for action to register
+                await send_telegram_message(f"✅ Successfully followed @{username}")
+
+                # Navigate back to the following timeline
+                driver.get("https://x.com/home")
+                await asyncio.sleep(random.uniform(1, 2))
+                await switch_to_following_tab()
+                return True
+
+            except Exception as click_err:
+                print(f"    WARNING: JavaScript click failed for @{username}: {click_err}")
+                print(f"    Attempting fallback standard click for @{username}...")
+                # --- Attempt 2: Fallback to standard click (might still fail) ---
+                try:
+                    # Ensure it's clickable again after potential JS errors
+                    follow_button = WebDriverWait(driver, 3).until(
+                        EC.element_to_be_clickable(follow_button) # Re-check clickability
+                    )
+                    follow_button.click()
+                    await asyncio.sleep(random.uniform(1.5, 2))
+                    await send_telegram_message(f"✅ Successfully followed @{username} (Fallback Click)")
+
+                    # Navigate back
+                    driver.get("https://x.com/home")
+                    await asyncio.sleep(random.uniform(1, 2))
+                    await switch_to_following_tab()
+                    return True
+
+                except Exception as fallback_click_err:
+                    # If both clicks fail, report the original error type but mention fallback failure
+                    print(f"    ERROR: Both JavaScript and standard click failed for @{username}. Fallback error: {fallback_click_err}")
+                    # Send the original error type to Telegram for better diagnosis
+                    error_type = type(click_err).__name__ # Get name of the initial error
+                    await send_telegram_message(f"❌ Could not click follow button for @{username} ({error_type}).")
+                    # Navigate back even on failure
+                    driver.get("https://x.com/home")
+                    await asyncio.sleep(random.uniform(1, 2))
+                    await switch_to_following_tab()
+                    return False
         else:
             await send_telegram_message(f"❌ Could not find follow button for @{username}")
             driver.get("https://x.com/home")
@@ -1263,7 +1442,7 @@ async def unfollow_user(username):
         print(f"Starting unfollow process for @{username}")
         # Navigate to user's profile
         driver.get(f"https://x.com/{username}")
-        await asyncio.sleep(random.uniform(3, 5))
+        await asyncio.sleep(random.uniform(2, 4))
 
         # If we're here, check for unfollow button
         unfollow_button_xpath = [
@@ -1277,7 +1456,7 @@ async def unfollow_user(username):
         unfollow_button = None
         for xpath in unfollow_button_xpath:
             try:
-                unfollow_button = WebDriverWait(driver, 5).until(
+                unfollow_button = WebDriverWait(driver, 3).until(
                     EC.element_to_be_clickable((By.XPATH, xpath))
                 )
                 print(f"Found unfollow button using XPath: {xpath}")
@@ -1525,8 +1704,10 @@ async def backup_followers_logic(update: Update):
             # =========================
 
             await asyncio.sleep(0.5)
-            driver.execute_script("window.scrollBy(0, window.innerHeight);")
-            wait_time = random.uniform(6.0, 9.0)
+            # ===> CHANGED: Increased scroll multiplier due to zoom <===
+            driver.execute_script("window.scrollBy(0, window.innerHeight * 1.5);")
+            # ===> END CHANGE <===
+            wait_time = random.uniform(2.0, 3.5) # Keep wait time the same for now
             print(f"[Backup] Waiting {wait_time:.1f} seconds for loading...")
             await asyncio.sleep(wait_time)
             # End of the while loop
@@ -1852,8 +2033,10 @@ async def scrape_target_following(update: Update, target_username: str):
             if cancel_db_scrape_flag: break
 
             # Scroll for the next round
-            driver.execute_script("window.scrollBy(0, window.innerHeight * 0.9);")
-            wait_time = random.uniform(2.0, 4.0)
+            # ===> CHANGED: Increased scroll multiplier due to zoom <===
+            driver.execute_script("window.scrollBy(0, window.innerHeight * 1.5);")
+            # ===> END CHANGE <===
+            wait_time = random.uniform(1.5, 2.5) # Keep wait time the same for now
             await asyncio.sleep(wait_time)
             # --- End of the while loop ---
 
@@ -2953,6 +3136,115 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                  # Resume scraping even if editing the message fails
                  await resume_scraping() # Resume after cancellation
                  return
+
+            elif payload == "toggle_tickers":
+                logger.info("Processing toggle_tickers help payload.")
+                # --- Admin Check HERE ---
+                if not is_user_admin(query.from_user.id):
+                    logger.warning(f"User {query.from_user.id} tried to toggle tickers without admin rights.")
+                    await query.answer("❌ Access denied (Admin required).", show_alert=True)
+                    # No resume needed as help command itself resumes
+                    return # Abort
+                # --- End Admin Check ---
+
+                global search_tickers_enabled
+                search_tickers_enabled = not search_tickers_enabled
+                save_settings()
+                status_text = "ENABLED 🟢" if search_tickers_enabled else "DISABLED 🔴"
+                logger.info(f"Ticker search toggled to {status_text} via help button by user {query.from_user.id}")
+
+                # --- Update the button in the original help message ---
+                try:
+                    original_markup = query.message.reply_markup
+                    if original_markup:
+                        new_keyboard = []
+                        for row in original_markup.inline_keyboard:
+                            new_row = []
+                            for button in row:
+                                if button.callback_data == "help:toggle_tickers":
+                                    # Update the text of this specific button
+                                    new_button_text = f"🔎 Ticker {'🟢' if search_tickers_enabled else '🔴'}"
+                                    new_row.append(InlineKeyboardButton(new_button_text, callback_data="help:toggle_tickers"))
+                                else:
+                                    new_row.append(button) # Keep other buttons
+                            new_keyboard.append(new_row)
+                        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_keyboard))
+                        await query.answer(f"Ticker search: {status_text}") # Give feedback via answer
+                    else:
+                        # Fallback if markup couldn't be read
+                        await query.message.reply_text(f"✅ Ticker search is now {status_text}")
+
+                except telegram.error.BadRequest as e:
+                     if "message is not modified" in str(e).lower():
+                         await query.answer(f"Ticker search: {status_text}") # Still give feedback
+                     else:
+                         logger.error(f"BadRequest editing help message for ticker toggle: {e}", exc_info=True)
+                         await query.message.reply_text(f"✅ Ticker search is now {status_text} (could not update button).")
+                except Exception as e:
+                    logger.error(f"Error updating help message button for ticker toggle: {e}", exc_info=True)
+                    await query.message.reply_text(f"✅ Ticker search is now {status_text} (could not update button).")
+
+                # No resume_scraping here, the help command handler resumes
+                return
+
+
+            elif payload == "toggle_headless":
+                logger.info("Processing toggle_headless help payload.")
+                # --- Admin Check HERE ---
+                if not is_user_admin(query.from_user.id):
+                    logger.warning(f"User {query.from_user.id} tried to toggle headless without admin rights.")
+                    await query.answer("❌ Access denied (Admin required).", show_alert=True)
+                    return # Abort
+                # --- End Admin Check ---
+
+                global is_headless_enabled
+                is_headless_enabled = not is_headless_enabled
+                save_settings()
+                status_text = "ENABLED 🟢" if is_headless_enabled else "DISABLED 🔴"
+                logger.info(f"Headless mode toggled to {status_text} via help button by user {query.from_user.id}")
+
+                # --- Update the button in the original help message ---
+                try:
+                    original_markup = query.message.reply_markup
+                    if original_markup:
+                        new_keyboard = []
+                        for row in original_markup.inline_keyboard:
+                            new_row = []
+                            for button in row:
+                                if button.callback_data == "help:toggle_headless":
+                                    # Update the text of this specific button
+                                    new_button_text = f"👻 Headless {'🟢' if is_headless_enabled else '🔴'}"
+                                    new_row.append(InlineKeyboardButton(new_button_text, callback_data="help:toggle_headless"))
+                                else:
+                                    new_row.append(button) # Keep other buttons
+                            new_keyboard.append(new_row)
+                        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_keyboard))
+                        await query.answer(f"Headless mode: {status_text}") # Give feedback via answer
+                    else:
+                        # Fallback if markup couldn't be read
+                        await query.message.reply_text(f"✅ Headless mode is now {status_text}")
+
+                except telegram.error.BadRequest as e:
+                     if "message is not modified" in str(e).lower():
+                         await query.answer(f"Headless mode: {status_text}") # Still give feedback
+                     else:
+                         logger.error(f"BadRequest editing help message for headless toggle: {e}", exc_info=True)
+                         await query.message.reply_text(f"✅ Headless mode is now {status_text} (could not update button).")
+                except Exception as e:
+                    logger.error(f"Error updating help message button for headless toggle: {e}", exc_info=True)
+                    await query.message.reply_text(f"✅ Headless mode is now {status_text} (could not update button).")
+
+                # Inform user about driver restart
+                await query.message.reply_text(f"✅ Headless mode is now {status_text}. Restarting WebDriver...")
+                logger.info(f"Headless mode toggled to {status_text} by user {query.from_user.id} via button. Triggering driver restart.")
+
+                # Call the restart helper function (pass the query object)
+                await restart_driver_and_login(query)
+
+                # No resume_scraping needed here, the helper function handles it.
+                # The help command handler also resumes, but the helper ensures it happens.
+                return
+
             else:
                  logger.warning(f"Unknown help payload received: {payload}")
                  await query.message.reply_text(f"❌ Unknown help action: {payload}")
@@ -3342,7 +3634,7 @@ async def follow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "`/follow `"
             , parse_mode=ParseMode.MARKDOWN
         )
-        await resume_scraping()
+    # await resume_scraping() # Resume is now handled after the check or at the end
         return
     # --- END CHANGE ---
 
@@ -3351,6 +3643,28 @@ async def follow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid username format.") # Added emoji
         await resume_scraping()
         return
+
+
+    # --- Headless Mode Check ---
+    global is_headless_enabled
+    if is_headless_enabled:
+        logger.warning(f"User {update.message.from_user.id} attempted /follow @{username} while in headless mode.")
+        keyboard = [[
+            InlineKeyboardButton("✅ Yes, disable Headless & Restart", callback_data=f"headless_follow:yes:{username}"),
+            InlineKeyboardButton("❌ No, cancel Follow", callback_data=f"headless_follow:no:{username}")
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            f"⚠️ **Headless Mode Active** ⚠️\n\n"
+            f"Following users might not work reliably in headless mode.\n\n"
+            f"Do you want to disable headless mode now?\n"
+            f"(This requires a **bot restart**. You will need to run `/follow @{username}` again after the restart.)",
+            reply_markup=reply_markup
+        )
+        # Do NOT resume scraping here, wait for button callback or timeout.
+        # Do NOT proceed with the follow logic below.
+        return
+    # --- End Headless Mode Check ---
 
     # --- Logic moved from process_follow_request here ---
     global global_followed_users_set
@@ -3385,7 +3699,7 @@ async def follow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Error message is now sent by follow_user()
         print(f"Manual follow failed: @{username}")
     # --- End Logic ---
-    await resume_scraping()
+    await resume_scraping() # Resume scraping if the headless check didn't trigger
 
 async def unfollow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Unfollows a user, removes them from the global list and current backup."""
@@ -3595,14 +3909,14 @@ async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Displays a comprehensive operational status of the bot."""
 
-    # --- Collect global variables ---
+    # --- Gather information ---
     global is_scraping_paused, is_schedule_pause, search_mode, schedule_enabled, \
            schedule_pause_start, schedule_pause_end, is_periodic_follow_active, \
            current_account, ACCOUNTS, global_followed_users_set, \
            current_account_usernames_to_follow, GLOBAL_FOLLOWED_FILE, \
-           auto_follow_mode, auto_follow_interval_minutes, is_fast_follow_running # Added autofollow vars
+           auto_follow_mode, auto_follow_interval_minutes, is_fast_follow_running, \
+           search_tickers_enabled, is_headless_enabled # Added ticker search global
 
-    # --- Gather information ---
 
     # 1. Running status
     if is_scraping_paused:
@@ -3674,12 +3988,16 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_list_info = f"{current_list_count} Users in `{current_list_filename}`"
 
     # --- Build message ---
+    ticker_status_text = "ENABLED 🟢" if search_tickers_enabled else "DISABLED 🔴"
+    headless_status_text = "ENABLED 🟢" if is_headless_enabled else "DISABLED 🔴"
     status_message = (
         f"📊 **Bot Overall Status** 📊\n\n"
         f"{'▶️' if not is_scraping_paused else ('⏸️⏰' if is_schedule_pause else '⏸️🟡')} **Operation:** {running_status}\n"
         f"🥷 **Active Account:** {account_info}\n"
         f"🔍 **Search Mode:** {mode_text}\n"
+        f"💲 **Ticker Search:** {ticker_status_text}\n" # New line for Ticker status
         f"⏰ **Schedule:** {schedule_details}\n"
+        f"👻 **Headless Mode:** {headless_status_text}\n" 
         f"🌍 **Global Follow List:** {global_list_info}\n"
         f"🤖 **Auto-Follow (Curr. Acc):** {autofollow_stat}\n"
         f"📝 **Follow List (Curr. Acc):** {current_list_info}\n"
@@ -4085,6 +4403,7 @@ async def show_help_message(update: Update):
     """Displays the help message (adapted for /commands)."""
     # Create keyboard markup with buttons for common commands (Buttons remain the same)
     separator_button = InlineKeyboardButton(" ", callback_data="noop_separator")
+    global search_tickers_enabled, is_headless_enabled # Need both for button text
     keyboard = [
         # ... (Keyboard definition remains unchanged) ...
          [
@@ -4095,9 +4414,10 @@ async def show_help_message(update: Update):
             InlineKeyboardButton("📊 Status", callback_data="help:status")
         ],
         [
-            InlineKeyboardButton("🔍 Show Mode", callback_data="help:mode"),
-            InlineKeyboardButton("🔍 Mode FULL", callback_data="help:mode_full"),
-            InlineKeyboardButton("🔍 Mode CA", callback_data="help:mode_ca")
+            #InlineKeyboardButton("🔍 Show Mode", callback_data="help:mode"),
+            InlineKeyboardButton("🔍 FULL", callback_data="help:mode_full"),
+            InlineKeyboardButton("🔍 CA", callback_data="help:mode_ca"),
+            InlineKeyboardButton(f"🔍 Ticker {'🟢' if search_tickers_enabled else '🔴'}", callback_data="help:toggle_tickers")
         ],
         [separator_button],
         [
@@ -4153,7 +4473,11 @@ async def show_help_message(update: Update):
             InlineKeyboardButton("⭐️ Rates", callback_data="help:show_rates"),
             InlineKeyboardButton("🌍 Global Info", callback_data="help:global_info"), # New command also needs button
             InlineKeyboardButton("🏓 Ping", callback_data="help:ping")
-        ]
+        ],
+        [separator_button],
+        [
+            InlineKeyboardButton(f"👻 Headless {'🟢' if is_headless_enabled else '🔴'}", callback_data="help:toggle_headless")
+        ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -4184,22 +4508,26 @@ async def show_help_message(update: Update):
         "🔸 🥷    Accounts    🥷\n"
         "   /account  - Shows the active account\n"
         "   /switchaccount [number] \n" # Square brackets are OK
-        "         └ Switches to account [number]\n" # Changed
+        "         └ Switches to account [number]\n" 
         "  \n"
         "🔺 🔍    Search Mode    🔍\n"
         "   /mode  - Shows the current search mode\n"
         "   /modefull  - Sets mode to CA + Keywords\n"
         "   /modeca  - Sets mode to CA Only\n"
+        "   /searchtickers\n"
+        "         └ Toggles searching for $Tickers ON/OFF\n" 
+        "   /setmaxage <minutes>\n"
+        "         └ Sets max post age (default: 15)\n"
         "  \n"
         "🔹 ⏯️    Control    ⏯️\n"
-        "   /pause  - Pauses tweet searching ⏸️\n"
+        "   /pause  - Pauses post searching ⏸️\n"
         "   /resume  - Resumes searching ▶️\n"
         "  \n"
         "🔸 ⏰    Schedule    ⏰\n"
         "   /schedule  - Shows the current schedule\n"
         "   /scheduleon  - Activates the schedule\n"
         "   /scheduleoff  - Deactivates the schedule\n"
-        "   /scheduletime <HH:MM-HH:MM>  - Sets the pause time\n" # Changed
+        "   /scheduletime <HH:MM-HH:MM>  - Sets the pause time\n" 
         "  \n"
         "▫️ 📊    Statistics & Status    📊\n"
         "   /status  - Shows the current operational status 📊\n\n"
@@ -4217,8 +4545,11 @@ async def show_help_message(update: Update):
         "   /syncfollows  - Synchronizes active account with global list\n"
         "   /buildglobalfrombackups \n"
         "         └ Adds users from all backups to the global list\n"
-        "❌  /cancelbackup ,  /cancelsync ,  /canceldbscrape \n"
-        "         └ Cancels running processes\n",
+        "   /cancelbackup ,  /cancelsync ,  /canceldbscrape \n"
+        "         └ Cancels running processes\n"
+        "  \n"
+        "   /toggleheadless \n"
+        "         └ Toggles Headless mode ON/OFF (Restart required!)\n",
         reply_markup=reply_markup
     )
     # Important: This function must call resume at the end, as the calling handler paused
@@ -4357,7 +4688,7 @@ async def process_unfollow_request(update: Update, username: str):
 async def process_like_request(update: Update, tweet_url: str):
     """Process like requests as text command"""
     await pause_scraping()
-    await update.message.reply_text(f"🔍 Trying to like tweet: {tweet_url}")
+    await update.message.reply_text(f"🔍 Trying to like post: {tweet_url}")
 
     # Check URL format
     if not (tweet_url.startswith("http://") or tweet_url.startswith("https://")):
@@ -4365,16 +4696,16 @@ async def process_like_request(update: Update, tweet_url: str):
 
     # Ensure it's an X/Twitter URL
     if not ("x.com" in tweet_url or "twitter.com" in tweet_url):
-        await update.message.reply_text("❌ Invalid tweet URL. Please provide an X.com or Twitter.com URL.")
+        await update.message.reply_text("❌ Invalid post URL. Please provide an X.com URL.")
         await resume_scraping()
         return
 
     try:
         result = await like_tweet(tweet_url)
         if result:
-            await update.message.reply_text(f"✅ Tweet successfully liked!")
+            await update.message.reply_text(f"✅ post successfully liked!")
         else:
-            await update.message.reply_text(f"❌ Could not like tweet")
+            await update.message.reply_text(f"❌ Could not like post")
     except Exception as e:
         await update.message.reply_text(f"❌ Error liking: {str(e)[:100]}")
 
@@ -4383,7 +4714,7 @@ async def process_like_request(update: Update, tweet_url: str):
 async def process_repost_request(update: Update, tweet_url: str):
     """Process repost requests as text command"""
     await pause_scraping()
-    await update.message.reply_text(f"🔍 Trying to repost tweet: {tweet_url}")
+    await update.message.reply_text(f"🔍 Trying to repost post: {tweet_url}")
 
     # Check URL format
     if not (tweet_url.startswith("http://") or tweet_url.startswith("https://")):
@@ -4391,16 +4722,16 @@ async def process_repost_request(update: Update, tweet_url: str):
 
     # Ensure it's an X/Twitter URL
     if not ("x.com" in tweet_url or "twitter.com" in tweet_url):
-        await update.message.reply_text("❌ Invalid tweet URL. Please provide an X.com or Twitter.com URL.")
+        await update.message.reply_text("❌ Invalid post URL. Please provide an X.com or Twitter.com URL.")
         await resume_scraping()
         return
 
     try:
         result = await repost_tweet(tweet_url)
         if result:
-            await update.message.reply_text(f"✅ Tweet successfully reposted!")
+            await update.message.reply_text(f"✅ post successfully reposted!")
         else:
-            await update.message.reply_text(f"❌ Could not repost tweet")
+            await update.message.reply_text(f"❌ Could not repost post")
     except Exception as e:
         await update.message.reply_text(f"❌ Error reposting: {str(e)[:100]}")
 
@@ -5500,7 +5831,7 @@ async def switch_account_request(update: Update, account_num=None):
          await resume_scraping() # Resume
          return
 
-    # ===> NEW: Pause auto-follow <===
+    # ===>  Pause auto-follow <===
     is_periodic_follow_active = False
     print("[Auto-Follow] Paused due to account switch.")
 
@@ -5526,10 +5857,10 @@ async def switch_account_request(update: Update, account_num=None):
 
         # Login with the new account (login() now uses the updated global `current_account`)
         result = await login()
-        
+
         if result:
             await update.message.reply_text(f"✅ Successfully switched to account @{new_account_username}!")
-            # ===> NEW: Load the follow list for the NEW account <===
+            # ===>  Load the follow list for the NEW account <===
             load_current_account_follow_list() # Loads the list for the now active account
             # Navigate to timeline after successful login
             try:
@@ -5673,7 +6004,7 @@ async def _send_long_message(application, chat_id, text, reply_markup, tweet_url
                 )
                 await asyncio.sleep(0.5) # Avoid rate limits
 
-            # Store tweet URL if buttons were on the last message
+            # Store post URL if buttons were on the last message
             if reply_markup and tweet_url:
                  last_tweet_urls[chat_id] = tweet_url
 
@@ -5686,7 +6017,7 @@ async def _send_long_message(application, chat_id, text, reply_markup, tweet_url
                 disable_web_page_preview=True,
                 reply_markup=reply_markup
             )
-             # Store tweet URL if buttons were present
+             # Store post URL if buttons were present
             if reply_markup and tweet_url:
                 last_tweet_urls[chat_id] = tweet_url
 
@@ -5703,7 +6034,7 @@ async def _send_long_message(application, chat_id, text, reply_markup, tweet_url
                 reply_markup=reply_markup # Keep buttons if possible
             )
             print("Message sent successfully without HTML parsing.")
-            # Store tweet URL here too if buttons were present
+            # Store post URL here too if buttons were present
             if reply_markup and tweet_url:
                  last_tweet_urls[chat_id] = tweet_url
         except Exception as plain_error:
@@ -5735,7 +6066,7 @@ async def send_telegram_message(text, images=None, tweet_url=None, reply_markup=
         text_length = len(full_text)
 
         # --- Button Logic ---
-        # The reply markup is now passed directly from process_tweets
+        # The reply markup is now passed directly from process_posts
         # if rating or like/repost buttons are needed.
         # We simply use the `reply_markup` we receive.
         final_reply_markup = reply_markup
@@ -5759,7 +6090,7 @@ async def send_telegram_message(text, images=None, tweet_url=None, reply_markup=
                         parse_mode=ParseMode.HTML,
                         reply_markup=final_reply_markup
                     )
-                    # Store tweet URL since image was sent and buttons might be present
+                    # Store post URL since image was sent and buttons might be present
                     if tweet_url:
                         last_tweet_urls[CHANNEL_ID] = tweet_url
                 except Exception as send_photo_error:
@@ -5814,36 +6145,55 @@ def get_contract_links(contract, chain):
     return ''.join(links)
 
 def format_time(datetime_str):
-    is_recent = False
-    formatted_string = "📅 Time invalid" # Translated
+    global max_tweet_age_minutes # Access the global setting
+    is_recent = False # Default: Not recent
+    formatted_string = "📅 Time invalid"
     try:
+        # Attempt to use the configured timezone
         local_tz = ZoneInfo("Europe/Berlin")
     except Exception:
-        local_tz = timezone(timedelta(hours=2)) # Fallback UTC+2
+        # Fallback to a fixed offset if timezone info is unavailable
+        print("WARNING: Could not load 'Europe/Berlin' timezone. Using UTC+2 fallback.")
+        local_tz = timezone(timedelta(hours=2), "UTC+02:00_Fallback")
 
     try:
+        # Parse the UTC time from the post
         tweet_time_utc = datetime.fromisoformat(datetime_str.replace('Z', '+00:00')).replace(tzinfo=timezone.utc)
+        # Convert to the local timezone
         tweet_time_local = tweet_time_utc.astimezone(local_tz)
+        # Get the current time in the same local timezone
         current_time_local = datetime.now(local_tz)
+        # Calculate the difference
         time_diff = current_time_local - tweet_time_local
+        seconds_ago = time_diff.total_seconds()
 
-        minutes_ago = int(time_diff.total_seconds() // 60)
-        hours_ago = int(time_diff.total_seconds() // 3600)
-
-        if time_diff.total_seconds() < 0:
-             formatted_string = f"📅 {tweet_time_local.strftime('%H:%M %d.%m.%y')}"
-             is_recent = False
-        elif time_diff.total_seconds() < 3600: # Under 1h
-            formatted_string = f"📅 {tweet_time_local.strftime('%H:%M %d.%m.%y')} ({minutes_ago} min)"
+        # --- Determine if the post is recent (using configured max age) ---
+        max_age_seconds = max_tweet_age_minutes * 60 # Calculate max age in seconds
+        if 0 <= seconds_ago < max_age_seconds: # Use the calculated value
             is_recent = True
-        elif time_diff.total_seconds() < 86400: # Under 1 day
-             formatted_string = f"📅 {tweet_time_local.strftime('%H:%M %d.%m.%y')} ({hours_ago} hrs)" # Translated
-             is_recent = True
-        else: # Older
+        # --- End recent check ---
+
+        # --- Format the display string based on age ---
+        if seconds_ago < 0:
+            # post is from the future (clock skew?)
+            formatted_string = f"📅 {tweet_time_local.strftime('%H:%M %d.%m.%y')} (Future?)"
+        elif seconds_ago < 3600: # Under 1 hour
+            minutes_ago = int(seconds_ago // 60)
+            formatted_string = f"📅 {tweet_time_local.strftime('%H:%M %d.%m.%y')} ({minutes_ago} min)"
+        elif seconds_ago < 86400: # Under 1 day
+            hours_ago = int(seconds_ago // 3600)
+            formatted_string = f"📅 {tweet_time_local.strftime('%H:%M %d.%m.%y')} ({hours_ago} hrs)"
+        else: # Older than 1 day
             formatted_string = f"📅 {tweet_time_local.strftime('%d.%m.%y %H:%M')}"
-            is_recent = False
+        # --- End string formatting ---
+
     except ValueError:
-        pass # Error parsing, default values remain
+        # Error parsing the datetime string, keep default "invalid" message
+        pass
+    except Exception as e:
+        # Log other unexpected errors during time formatting
+        print(f"ERROR in format_time: {e}")
+        # Keep default "invalid" message
 
     return formatted_string, is_recent
 
@@ -5851,52 +6201,37 @@ def format_time(datetime_str):
 def format_token_info(tweet_text):
     """
     Extracts and formats Tickers ($) and Contract Addresses (CA)
-    from a tweet text. Filters out pure currency amounts and amounts
-    with K/M/B/T suffixes from tickers.
+    from a post text. Filters out pure currency amounts and amounts
+    with K/M/B/T suffixes from tickers. Ticker extraction is conditional.
     """
+    global search_tickers_enabled # Access the global setting
 
-    # --- Ticker ($) Extraction and Cleanup ---
-    all_potential_tickers = [word for word in tweet_text.split() if word.startswith("$")]
-    tickers = []
-    punctuation_to_strip = '.,;:!?()&"\'+-/' # Remove punctuation at the end
+    # --- Ticker ($) Extraction and Cleanup (Conditional) ---
+    ticker_section = "" # Initialize ticker_section to empty string
 
-    # Regex to recognize pure numeric amounts (optional with .,) and those with K/M/B/T
-    # ^ = Start of the string (after '$')
-    # [0-9] = Must start with a digit
-    # [0-9,.]* = Can contain more digits, commas, or periods
-    # ([KkMmBbTt])? = Can optionally end with K, M, B, or T (case-insensitive)
-    # $ = End of the string
-    currency_pattern = r"^[0-9][0-9,.]*([KkMmBbTt])?$"
+    # Check if ticker search should be performed
+    if search_tickers_enabled:
+        all_potential_tickers = [word for word in tweet_text.split() if word.startswith("$")]
+        tickers = []
+        punctuation_to_strip = '.,;:!?()&"\'+-/' # Remove punctuation at the end
 
-    for potential_ticker in all_potential_tickers:
-        # Step 1: Remove general punctuation at the end
-        cleaned = potential_ticker.rstrip(punctuation_to_strip)
+        # Regex to recognize pure numeric amounts (optional with .,) and those with K/M/B/T
+        currency_pattern = r"^[0-9][0-9,.]*([KkMmBbTt])?$"
 
-        # Step 2: Check if it's a valid ticker (not just '$')
-        if len(cleaned) <= 1:
-            continue # Just '$' or empty after stripping -> skip
+        # Loop for processing potential tickers
+        for potential_ticker in all_potential_tickers:
+            cleaned = potential_ticker.rstrip(punctuation_to_strip)
+            if len(cleaned) <= 1: continue
+            value_part = cleaned[1:]
+            if re.fullmatch(currency_pattern, value_part, re.IGNORECASE): continue
+            tickers.append(cleaned)
 
-        # Step 3: Extract the part after '$'
-        value_part = cleaned[1:]
-
-        # Step 4: Check if the value_part corresponds to a pure currency/numeric amount
-        # (e.g., "100", "123", "1,000", "123.45", "110T", "300B", "1.5k", "5M")
-        if re.fullmatch(currency_pattern, value_part, re.IGNORECASE):
-            continue # This is a pure amount -> skip
-
-        # Step 5: If none of the above filter conditions apply, it's a valid ticker
-        tickers.append(cleaned)
-
-    ticker_section = ""
-    if tickers:
-        # Remove duplicates and sort alphabetically
-        unique_tickers = sorted(list(set(tickers)))
-        ticker_section = "\n💲 " + "".join(f"<code>{html.escape(ticker)}</code> " for ticker in unique_tickers).strip()
+        # Assign to ticker_section only if tickers were found
+        if tickers:
+            unique_tickers = sorted(list(set(tickers)))
+            ticker_section = "\n💲 " + "".join(f"<code>{html.escape(ticker)}</code> " for ticker in unique_tickers).strip()
 
     # --- Contract Address (CA) Extraction and Formatting ---
-    # (This part remains unchanged, as requested in the original)
-
-    # Find all potential CA matches based on the global pattern
     try:
         ca_matches = re.findall(TOKEN_PATTERN, tweet_text)
     except NameError:
@@ -5913,9 +6248,10 @@ def format_token_info(tweet_text):
                 filtered_ca_matches.append(match)
                 seen_tokens.add(match)
         except NameError:
-             if match not in seen_tokens:
-                 seen_tokens.add(match)
-             continue
+            # Handle case where detect_chain might be missing during development/error
+            if match not in seen_tokens:
+                seen_tokens.add(match) # Still track to avoid duplicates if pattern matches
+            continue # Skip chain/link processing if detect_chain fails
 
     contract_section = ""
     if filtered_ca_matches:
@@ -5927,27 +6263,84 @@ def format_token_info(tweet_text):
                 chain = "unknown" # Fallback if detect_chain is missing
 
             contract_section += f"<code>{html.escape(contract)}</code>\n"
-
             contract_section += f"🧬 {chain.upper()}\n"
 
             try:
                 links_html = get_contract_links(contract, chain)
                 if links_html:
-                     contract_section += "\n" + links_html
+                    contract_section += "\n" + links_html
             except NameError:
+                # Function get_contract_links might be missing
                 pass
 
             contract_section += "\n" # Additional blank line
 
     contract_section = contract_section.strip()
 
-    # Return both sections
-    return ticker_section, contract_section
+    # Return ticker section, contract section, and a flag indicating if tickers were found (and enabled)
+    ticker_found_flag = bool(ticker_section) # True if ticker_section is not empty
+    return ticker_section, contract_section, ticker_found_flag
+
+# def format_token_info(post_text):
+#     """
+#     Extracts and formats Tickers ($) and Contract Addresses (CA)
+#     from a tweet text. Filters out pure currency amounts and amounts
+#     with K/M/B/T suffixes from tickers.
+#     """
+
+#     # --- Ticker ($) Extraction and Cleanup ---
+#     all_potential_tickers = [word for word in post_text.split() if word.startswith("$")]
+#     tickers = []
+#     punctuation_to_strip = '.,;:!?()&"\'+-/' # Remove punctuation at the end
+
+#     # Regex to recognize pure numeric amounts (optional with .,) and those with K/M/B/T
+#     currency_pattern = r"^[0-9][0-9,.]*([KkMmBbTt])?$"
+
+#     for potential_ticker in all_potential_tickers:
+#         cleaned = potential_ticker.rstrip(punctuation_to_strip)
+#         if len(cleaned) <= 1: continue
+#         value_part = cleaned[1:]
+#         if re.fullmatch(currency_pattern, value_part, re.IGNORECASE): continue
+#         tickers.append(cleaned)
+
+#     ticker_section = ""
+#     if tickers:
+#         unique_tickers = sorted(list(set(tickers)))
+#         ticker_section = "\n💲 " + "".join(f"<code>{html.escape(ticker)}</code> " for ticker in unique_tickers).strip()
+#     # --- End Conditional Ticker Logic ---
+
+#     # --- Contract Address (CA) Extraction and Formatting ---
+#     try: ca_matches = re.findall(TOKEN_PATTERN, post_text)
+#     except NameError: print("ERROR: TOKEN_PATTERN is not defined!"); ca_matches = []
+
+#     filtered_ca_matches = []; seen_tokens = set()
+#     for match in ca_matches:
+#         try: chain = detect_chain(match)
+#         except NameError: chain = "unknown"
+#         if chain != 'unknown' and match not in seen_tokens:
+#             filtered_ca_matches.append(match); seen_tokens.add(match)
+#         elif match not in seen_tokens: seen_tokens.add(match) # Add unknown CAs to seen to avoid duplicates
+
+#     contract_section = ""
+#     if filtered_ca_matches:
+#         contract_section += "\n📝 "
+#         for contract in filtered_ca_matches:
+#             try: chain = detect_chain(contract)
+#             except NameError: chain = "unknown"
+#             contract_section += f"<code>{html.escape(contract)}</code>\n"
+#             contract_section += f"🧬 {chain.upper()}\n"
+#             try: links_html = get_contract_links(contract, chain)
+#             except NameError: links_html = ""
+#             if links_html: contract_section += "\n" + links_html
+#             contract_section += "\n"
+#     contract_section = contract_section.strip()
+
+#     return ticker_section, contract_section
 
 async def process_tweets():
     """
-    Process tweets in the timeline. Optimized to only search when necessary,
-    scrolls down, and processes tweets *immediately* upon finding them
+    Process posts in the timeline. Optimized to only search when necessary,
+    scrolls down, and processes posts *immediately* upon finding them
     to avoid StaleElementReferenceExceptions. INCLUDES ENHANCED DEBUG LOGGING FOR AUTHOR EXTRACTION.
     """
     global driver, is_scraping_paused, first_run, processed_tweets, KEYWORDS, TOKEN_PATTERN, search_mode, ratings_data
@@ -5961,16 +6354,17 @@ async def process_tweets():
         if not should_search_and_process:
             return
 
-        print("Searching and processing new tweets (with scrolling)...") # Translated
+        print("Searching and processing new posts (with scrolling)...") # Translated
         target_new_button_tweets = button_tweet_count
         processed_in_this_round = set()
         newly_processed_count = 0
-        # NEW: Counter for tweets processed since the button click
+        #  Counter for posts processed since the button click
         processed_since_button_click = 0
-        max_scroll_attempts = 10 # Keep safety limit
+        max_scroll_attempts = 20 # Keep safety limit
         scroll_attempt = 0
         consecutive_scrolls_without_new = 0
         max_consecutive_scrolls_without_new = 3 # Keep fallback limit
+        target_met_flag = False # Flag to break outer loop when target is met
 
         # The loop runs until the target is reached OR fallbacks trigger
         while scroll_attempt < max_scroll_attempts:
@@ -5981,11 +6375,11 @@ async def process_tweets():
             try:
                 current_containers = driver.find_elements(By.XPATH, '//article[@data-testid="tweet"]')
                 if not current_containers:
-                    print(f"Scroll attempt {scroll_attempt}/{max_scroll_attempts}: No tweet containers found.") # Translated
+                    print(f"Scroll attempt {scroll_attempt}/{max_scroll_attempts}: No post containers found.") # Translated
                     await asyncio.sleep(1)
                     continue
             except Exception as e_find:
-                 print(f"Error finding tweet containers (Scroll loop {scroll_attempt}): {e_find}") # Translated
+                 print(f"Error finding post containers (Scroll loop {scroll_attempt}): {e_find}") # Translated
                  break
 
             print(f"Scroll attempt {scroll_attempt}/{max_scroll_attempts}: {len(current_containers)} containers found. Processing new ones...") # Translated
@@ -6014,11 +6408,33 @@ async def process_tweets():
                 if tweet_id in processed_tweets or tweet_id in processed_in_this_round:
                     continue
 
-                # === 3. Process tweet IMMEDIATELY ===
-                print(f"  -> Processing new tweet: {tweet_id}") # Translated
+
+                # === TARGET COUNTING AND CHECK ===
+                # This is a NEW post for this round. Increment counter if target exists.
+                if target_new_button_tweets > 0:
+                    processed_since_button_click += 1
+                    print(f"    (Target Counter: {processed_since_button_click}/{target_new_button_tweets})") # Optional debug log
+
+                    # Check if target is met *before* processing details
+                    if processed_since_button_click > target_new_button_tweets:
+                         # This handles cases where the button count was slightly off
+                         # or we already processed enough in previous iterations of the *outer* loop.
+                         print(f"Target of {target_new_button_tweets} already met or exceeded. Setting flag and breaking inner loop.")
+                         target_met_flag = True
+                         break # Exit the inner 'for' loop
+
+                    # If exactly the target number is reached now, process this one last post
+                    # and then set the flag to break the outer loop afterwards.
+                    if processed_since_button_click == target_new_button_tweets:
+                        print(f"Target of {target_new_button_tweets} will be met after processing this post.")
+                        # We don't break here yet, process this tweet first.
+                        # The flag will be checked after the inner loop.
+                        target_met_flag = True # Set flag to break outer loop *after* this inner loop finishes
+
+                # === 3. Process post IMMEDIATELY ===
+                print(f"  -> Processing new post: {tweet_id}") # Translated
                 increment_scanned_count()
-                # NEW: Count *every* newly processed tweet for the button target
-                processed_since_button_click += 1
+
                 process_success = False # Will be set to True later if processing succeeds
                 try:
                     # --- Ad Check ---
@@ -6033,7 +6449,7 @@ async def process_tweets():
                     except (NoSuchElementException, StaleElementReferenceException): pass # Catch errors during search itself
 
                     if is_ad:
-                        print(f"    Tweet {tweet_id} is an ad -> skipping") # Translated
+                        print(f"    post {tweet_id} is an ad -> skipping") # Translated
                         increment_ad_total_count()
                         processed_in_this_round.add(tweet_id)
                         processed_tweets.append(tweet_id)
@@ -6060,12 +6476,18 @@ async def process_tweets():
                         if datetime_str: time_str, tweet_is_recent = format_time(datetime_str)
                     except (TimeoutException, NoSuchElementException, StaleElementReferenceException): pass
 
-                    # --- Skip if old & not a repost ---
-                    if not is_repost and not tweet_is_recent:
-                        print(f"    Tweet {tweet_id} too old ({time_str}) & not a repost -> skipping") # Translated
-                        processed_in_this_round.add(tweet_id); processed_tweets.append(tweet_id)
-                        found_in_this_scroll += 1
-                        continue
+                    # --- Skip if older than 15 minutes (strict check) ---
+                    # This check now uses the updated 'is_recent' which is True only if < 15 min
+                    if not tweet_is_recent:
+                        print(f"    post {tweet_id} skipped: Too old ({time_str} > 15 min)")
+                        # Mark as processed so we don't check it again in this round
+                        processed_in_this_round.add(tweet_id)
+                        processed_tweets.append(tweet_id)
+                        # IMPORTANT: Do not increment processed_since_button_click here
+                        # because this post doesn't count towards the button's target.
+                        found_in_this_scroll += 1 # Still counts as found in this scroll view for the scroll logic
+                        continue # Skip to the next container immediately
+
 
                     # --- Variables for both authors (reposter and original) ---
                     author_name = "Unknown"  # Original author
@@ -6138,7 +6560,7 @@ async def process_tweets():
                             print(f"    WARNING: Error extracting repost context: {e_repost_context}") # Translated
                             reposter_name = "Unknown" # Translated
                             reposter_handle = "@unknown" # Translated
-                    # --- Original Author Extraction (for every tweet) ---
+                    # --- Original Author Extraction (for every post) ---
                     try:
                         # Extract original author (User-Name) - always present
                         try:
@@ -6204,10 +6626,12 @@ async def process_tweets():
                     except StaleElementReferenceException: pass
 
                     # --- Relevance Check and Sending ---
-                    ticker_section, contract_section = format_token_info(tweet_content)
+                    ticker_section, contract_section, ticker_found = format_token_info(tweet_content)
                     contains_keyword = any(keyword.lower() in tweet_content.lower() for keyword in KEYWORDS)
                     contains_token = bool(contract_section)
-                    is_relevant = (search_mode == "full" and (contains_keyword or contains_token)) or (search_mode != "full" and contains_token)
+                    # Determine relevance: CA found OR Ticker found (if enabled) OR (Keyword found AND mode is full)
+                    contains_token = bool(contract_section) # Check if CA section has content
+                    is_relevant = contains_token or ticker_found or (search_mode == "full" and contains_keyword)
 
                     if is_relevant:
                         reasons = []
@@ -6215,7 +6639,8 @@ async def process_tweets():
                         if search_mode == "full" and contains_keyword:
                             found_kws = [kw for kw in KEYWORDS if kw.lower() in tweet_content.lower()]
                             if found_kws: reasons.extend(found_kws)
-                        print(f"    Tweet {tweet_id} relevant due to: {', '.join(sorted(list(set(reasons))))}") # Translated
+                        print(f"    post {tweet_id} relevant due to: {', '.join(sorted(list(set(reasons))))}") # Translated
+                        if ticker_found: reasons.append("Ticker") # Add "Ticker" as a reason if found                        
                         increment_found_count()
 
                         # --- Build message (corrected version) ---
@@ -6262,14 +6687,14 @@ async def process_tweets():
                         # --- Check for "Show more" ---
                         show_more_present = False
                         try:
-                            # Search for the "Show more" link/span *within* the tweetText div
+                            # Search for the "Show more" link/span *within* the postText div
                             tweet_text_div = container.find_element(By.XPATH, './/div[@data-testid="tweetText"]')
                             # Check various possible texts/elements for "Show more"
                             WebDriverWait(tweet_text_div, 0.2).until(
                                 EC.presence_of_element_located((By.XPATH, './/span[text()="Show more"] | .//a[contains(@href, "/status/") and contains(text(), "Show more")] | .//button[contains(., "Show more")]'))
                             )
                             show_more_present = True
-                            print(f"    'Show more' indicator found for Tweet {tweet_id}") # Translated
+                            print(f"    'Show more' indicator found for post {tweet_id}") # Translated
                         except (TimeoutException, NoSuchElementException, StaleElementReferenceException):
                             pass # No "Show more" found
                         except Exception as e_show_more:
@@ -6325,12 +6750,12 @@ async def process_tweets():
                         # Correctly indented, one level deeper than 'if is_relevant:',
                         # but at the same level as 'if contains_token:'
                         # +++ DEBUG LOGGING (before sending) +++
-                        logger.debug(f"Tweet {tweet_id}: final_reply_markup before sending: {'Set' if final_reply_markup else 'None'}") # Translated
+                        logger.debug(f"post {tweet_id}: final_reply_markup before sending: {'Set' if final_reply_markup else 'None'}") # Translated
                         if final_reply_markup:
                             # Try to safely output the structure
                             try:
                                 keyboard_repr = repr(final_reply_markup.inline_keyboard)
-                                logger.debug(f"Tweet {tweet_id}: Keyboard structure: {keyboard_repr[:500]}...") # Shortened for readability
+                                logger.debug(f"post {tweet_id}: Keyboard structure: {keyboard_repr[:500]}...") # Shortened for readability
                             except Exception as log_e:
                                 logger.error(f"Error logging keyboard structure: {log_e}") # Translated
                         # +++ END DEBUG LOGGING +++
@@ -6340,15 +6765,15 @@ async def process_tweets():
                         process_success = True # Belongs to sending
 
                     else: # Belongs to 'if is_relevant:'
-                        print(f"    Tweet {tweet_id} skipped (no keywords/token)") # Translated
+                        print(f"    post {tweet_id} skipped (no keywords/token)") # Translated
                         process_success = True # Belongs to skipping
 
                 except StaleElementReferenceException:
                     print(f"    WARNING: Stale Element during detail processing of {tweet_id}. Skipping.") # Translated
                     process_success = False
                 except Exception as e_process:
-                    print(f"    !!!!!!!! ERROR during detail processing of Tweet {tweet_id} !!!!!!!! : {e_process}") # Translated
-                    logger.error(f"Error processing details for tweet {tweet_id}", exc_info=True)
+                    print(f"    !!!!!!!! ERROR during detail processing of post {tweet_id} !!!!!!!! : {e_process}") # Translated
+                    logger.error(f"Error processing details for post {tweet_id}", exc_info=True)
                     process_success = False
 
                 # === 4. Mark as processed ===
@@ -6358,22 +6783,40 @@ async def process_tweets():
                 if process_success:
                     newly_processed_count += 1
 
+                # === TARGET CHECK ===
+                # Increment the counter *only* if the tweet was identified as new in this round
+                # (i.e., not skipped by the initial ID check)
+                # AND check if the target has been reached.
+                # This check happens *after* processing/skipping the current tweet.
+                if target_new_button_tweets > 0: # Only check if a target exists (button was clicked)
+                    # Increment counter for tweets processed towards the target
+                    # Note: We increment 'processed_since_button_click' here, AFTER potentially skipping old/ad tweets
+                    # This ensures we count towards the target only potentially relevant new tweets.
+                    # If you want to count *every* single new tweet encountered, move this increment
+                    # right after the "if tweet_id in processed_tweets..." check.
+                    # Let's stick to counting potentially relevant ones for now:
+                    # processed_since_button_click += 1 # Moved this counter logic earlier
+
+                    if processed_since_button_click >= target_new_button_tweets:
+                        print(f"Target of {target_new_button_tweets} new posts reached after processing {tweet_id}. Stopping inner loop.")
+                        break # Exit the inner 'for container...' loop immediately
+
                 print("    ____________________________________")
 
             # --- End of loop over current containers ---
 
-            # --- Check primary break condition (button target reached) ---
-            # Only check if the button was actually clicked (target > 0)
-            if target_new_button_tweets > 0 and processed_since_button_click >= target_new_button_tweets:
-                print(f"Target of {target_new_button_tweets} new tweets (according to button) reached or exceeded ({processed_since_button_click} processed). Stopping scrolling.") # Translated
-                break # Exit loop
 
-            # --- Check fallback break condition (no new tweets in viewport) ---
+            # --- Check if the target was met inside the inner loop ---
+            if target_met_flag:
+                print("Target met flag is True. Breaking outer scroll loop.")
+                break # Exit the outer 'while' loop
+
+            # --- Check fallback break condition (no new posts in viewport) ---
             if found_in_this_scroll == 0:
                 consecutive_scrolls_without_new += 1
                 print(f"Scroll attempt {scroll_attempt}: No *new* tweets found in this round (Streak: {consecutive_scrolls_without_new}/{max_consecutive_scrolls_without_new}).") # Translated
                 if consecutive_scrolls_without_new >= max_consecutive_scrolls_without_new:
-                    print("Stopping scrolling (Fallback), as no new tweets were found in the visible area.") # Translated
+                    print("Stopping scrolling (Fallback), as no new posts were found in the visible area.") # Translated
                     break # Exit loop
             else:
                 consecutive_scrolls_without_new = 0 # Reset if new ones were found
@@ -6386,7 +6829,9 @@ async def process_tweets():
             # --- Only scroll if not already broken ---
             print(f"Scrolling down for attempt {scroll_attempt + 1}...") # Translated
             try:
-                driver.execute_script("window.scrollBy(0, window.innerHeight * 0.8);")
+                # ===> CHANGED: Increased scroll multiplier due to zoom <===
+                driver.execute_script("window.scrollBy(0, window.innerHeight * 1.5);")
+                # ===> END CHANGE <===
                 await asyncio.sleep(random.uniform(0.2, 0.5)) # Keep the pause after scrolling
             except Exception as scroll_err:
                 print(f"Error during scrolling: {scroll_err}. Breaking scroll loop.") # Translated
@@ -6397,25 +6842,25 @@ async def process_tweets():
             first_run = False
             print("First scan round completed, switching to optimized mode") # Translated
 
-        print(f"Processing round completed. {processed_since_button_click} tweets processed since button click (target was {target_new_button_tweets}). {newly_processed_count} tweets successfully processed/skipped in total.") # Translated
+        print(f"Processing round completed. {processed_since_button_click} posts processed since button click (target was {target_new_button_tweets}). {newly_processed_count} posts successfully processed/skipped in total.") # Translated
 
     except Exception as e_outer:
-        print(f"!!!!!!!! CRITICAL ERROR in process_tweets !!!!!!!! : {e_outer}") # Translated
-        logger.error("Unhandled exception in process_tweets", exc_info=True)
+        print(f"!!!!!!!! CRITICAL ERROR in process_posts !!!!!!!! : {e_outer}") # Translated
+        logger.error("Unhandled exception in process_posts", exc_info=True)
 
 async def process_full_text_request(query, tweet_id):
     try:
         # Notify user that we're processing
         await query.answer("Fetching full text...")
 
-        # Generate the tweet URL from the ID
+        # Generate the post URL from the ID
         tweet_url = f"https://twitter.com/i/status/{tweet_id}"
 
-        # Navigate to the tweet with your existing driver
+        # Navigate to the post with your existing driver
         driver.get(tweet_url)
         await asyncio.sleep(3)  # Wait for page to load
 
-        # Find the tweet text
+        # Find the post text
         tweet_element = WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.XPATH, '//div[@data-testid="tweetText"]'))
         )
@@ -6432,7 +6877,7 @@ async def process_full_text_request(query, tweet_id):
         
         if result:
             await update.message.reply_text(f"✅ Successfully switched to account @{new_account_username}!")
-            # ===> NEW: Load the follow list for the NEW account <===
+            # ===>  Load the follow list for the NEW account <===
             load_current_account_follow_list() # Loads the list for the now active account
             # Navigate to timeline after successful login
             try:
@@ -6556,7 +7001,7 @@ async def _send_long_message(application, chat_id, text, reply_markup, tweet_url
     Sends text messages, splitting them if necessary (> 4096 chars)
     and handles errors. Adds buttons only at the end.
     """
-    global last_tweet_urls # Access global variable for tweet URLs
+    global last_tweet_urls # Access global variable for post URLs
 
     message_limit = 4096
     try:
@@ -6576,7 +7021,7 @@ async def _send_long_message(application, chat_id, text, reply_markup, tweet_url
                 )
                 await asyncio.sleep(0.5) # Avoid rate limits
 
-            # Store tweet URL if buttons were on the last message
+            # Store post URL if buttons were on the last message
             if reply_markup and tweet_url:
                  last_tweet_urls[chat_id] = tweet_url
 
@@ -6606,7 +7051,7 @@ async def _send_long_message(application, chat_id, text, reply_markup, tweet_url
                 reply_markup=reply_markup # Keep buttons if possible
             )
             print("Message sent successfully without HTML parsing.")
-            # Store tweet URL here too if buttons were present
+            # Store post URL here too if buttons were present
             if reply_markup and tweet_url:
                  last_tweet_urls[chat_id] = tweet_url
         except Exception as plain_error:
@@ -6638,7 +7083,7 @@ async def send_telegram_message(text, images=None, tweet_url=None, reply_markup=
         text_length = len(full_text)
 
         # --- Button Logic ---
-        # The reply markup is now passed directly from process_tweets
+        # The reply markup is now passed directly from process_posts
         # if rating or like/repost buttons are needed.
         # We simply use the `reply_markup` we receive.
         final_reply_markup = reply_markup
@@ -6717,94 +7162,57 @@ def get_contract_links(contract, chain):
     return ''.join(links)
 
 def format_time(datetime_str):
-    is_recent = False
+    is_recent = False # Default: Not recent
     formatted_string = "📅 Time invalid"
     try:
+        # Attempt to use the configured timezone
         local_tz = ZoneInfo("Europe/Berlin")
     except Exception:
-        local_tz = timezone(timedelta(hours=2)) # Fallback UTC+2
+        # Fallback to a fixed offset if timezone info is unavailable
+        print("WARNING: Could not load 'Europe/Berlin' timezone. Using UTC+2 fallback.")
+        local_tz = timezone(timedelta(hours=2), "UTC+02:00_Fallback")
 
     try:
+        # Parse the UTC time from the tweet
         tweet_time_utc = datetime.fromisoformat(datetime_str.replace('Z', '+00:00')).replace(tzinfo=timezone.utc)
+        # Convert to the local timezone
         tweet_time_local = tweet_time_utc.astimezone(local_tz)
+        # Get the current time in the same local timezone
         current_time_local = datetime.now(local_tz)
+        # Calculate the difference
         time_diff = current_time_local - tweet_time_local
+        seconds_ago = time_diff.total_seconds()
 
-        minutes_ago = int(time_diff.total_seconds() // 60)
-        hours_ago = int(time_diff.total_seconds() // 3600)
-
-        if time_diff.total_seconds() < 0:
-             formatted_string = f"📅 {tweet_time_local.strftime('%H:%M %d.%m.%y')}"
-             is_recent = False
-        elif time_diff.total_seconds() < 3600: # Under 1h
-            formatted_string = f"📅 {tweet_time_local.strftime('%H:%M %d.%m.%y')} ({minutes_ago} min)"
+        # --- Determine if the tweet is recent (within 15 minutes) ---
+        # 900 seconds = 15 minutes
+        if 0 <= seconds_ago < 900:
             is_recent = True
-        elif time_diff.total_seconds() < 86400: # Under 1 day
-             formatted_string = f"📅 {tweet_time_local.strftime('%H:%M %d.%m.%y')} ({hours_ago} hrs)"
-             is_recent = True
-        else: # Older
+        # --- End recent check ---
+
+        # --- Format the display string based on age ---
+        if seconds_ago < 0:
+            # Tweet is from the future (clock skew?)
+            formatted_string = f"📅 {tweet_time_local.strftime('%H:%M %d.%m.%y')} (Future?)"
+        elif seconds_ago < 3600: # Under 1 hour (includes the <15 min case)
+            minutes_ago = int(seconds_ago // 60)
+            formatted_string = f"📅 {tweet_time_local.strftime('%H:%M %d.%m.%y')} ({minutes_ago} min)"
+        elif seconds_ago < 86400: # Under 1 day (but older than 1 hour)
+            hours_ago = int(seconds_ago // 3600)
+            formatted_string = f"📅 {tweet_time_local.strftime('%H:%M %d.%m.%y')} ({hours_ago} hrs)"
+        else: # Older than 1 day
             formatted_string = f"📅 {tweet_time_local.strftime('%d.%m.%y %H:%M')}"
-            is_recent = False
+        # --- End string formatting ---
+
     except ValueError:
-        pass # Error parsing, default values remain
+        # Error parsing the datetime string, keep default "invalid" message
+        pass
+    except Exception as e:
+        # Log other unexpected errors during time formatting
+        print(f"ERROR in format_time: {e}")
+        # Keep default "invalid" message
 
     return formatted_string, is_recent
 
-
-def format_token_info(tweet_text):
-    """
-    Extracts and formats Tickers ($) and Contract Addresses (CA)
-    from a tweet text. Filters out pure currency amounts and amounts
-    with K/M/B/T suffixes from tickers.
-    """
-
-    # --- Ticker ($) Extraction and Cleanup ---
-    all_potential_tickers = [word for word in tweet_text.split() if word.startswith("$")]
-    tickers = []
-    punctuation_to_strip = '.,;:!?()&"\'+-/' # Remove punctuation at the end
-
-    # Regex to recognize pure numeric amounts (optional with .,) and those with K/M/B/T
-    currency_pattern = r"^[0-9][0-9,.]*([KkMmBbTt])?$"
-
-    for potential_ticker in all_potential_tickers:
-        cleaned = potential_ticker.rstrip(punctuation_to_strip)
-        if len(cleaned) <= 1: continue
-        value_part = cleaned[1:]
-        if re.fullmatch(currency_pattern, value_part, re.IGNORECASE): continue
-        tickers.append(cleaned)
-
-    ticker_section = ""
-    if tickers:
-        unique_tickers = sorted(list(set(tickers)))
-        ticker_section = "\n💲 " + "".join(f"<code>{html.escape(ticker)}</code> " for ticker in unique_tickers).strip()
-
-    # --- Contract Address (CA) Extraction and Formatting ---
-    try: ca_matches = re.findall(TOKEN_PATTERN, tweet_text)
-    except NameError: print("ERROR: TOKEN_PATTERN is not defined!"); ca_matches = []
-
-    filtered_ca_matches = []; seen_tokens = set()
-    for match in ca_matches:
-        try: chain = detect_chain(match)
-        except NameError: chain = "unknown"
-        if chain != 'unknown' and match not in seen_tokens:
-            filtered_ca_matches.append(match); seen_tokens.add(match)
-        elif match not in seen_tokens: seen_tokens.add(match) # Add unknown CAs to seen to avoid duplicates
-
-    contract_section = ""
-    if filtered_ca_matches:
-        contract_section += "\n📝 "
-        for contract in filtered_ca_matches:
-            try: chain = detect_chain(contract)
-            except NameError: chain = "unknown"
-            contract_section += f"<code>{html.escape(contract)}</code>\n"
-            contract_section += f"🧬 {chain.upper()}\n"
-            try: links_html = get_contract_links(contract, chain)
-            except NameError: links_html = ""
-            if links_html: contract_section += "\n" + links_html
-            contract_section += "\n"
-    contract_section = contract_section.strip()
-
-    return ticker_section, contract_section
 
 async def process_full_text_request(query, context, tweet_url): # Added context
     """Processes the request to get full tweet text and update the message."""
@@ -6904,70 +7312,67 @@ async def handle_callback_query(update, context):
 
     logger.info(f"Callback received: {data}")
 
-    if data.startswith("like:"):
-        tweet_id = data.split(":", 1)[1]
-        # Queue the like action
-        await action_queue.put(('like', {'tweet_id': tweet_id, 'chat_id': query.message.chat_id, 'message_id': query.message.message_id, 'original_callback_data': data, 'original_keyboard_data': query.message.reply_markup.to_dict().get('inline_keyboard') if query.message.reply_markup else None}))
-        # Update button text immediately (optional, but good UX)
-        # ... (code to edit button text to "Like (⏳)") ...
+    # Split data safely
+    parts = data.split(":", 1)
+    action_type = parts[0] if parts else None
 
-    elif data.startswith("repost:"):
-        tweet_id = data.split(":", 1)[1]
-        # Queue the repost action
-        await action_queue.put(('repost', {'tweet_id': tweet_id, 'chat_id': query.message.chat_id, 'message_id': query.message.message_id, 'original_callback_data': data, 'original_keyboard_data': query.message.reply_markup.to_dict().get('inline_keyboard') if query.message.reply_markup else None}))
-        # ... (code to edit button text to "Repost (⏳)") ...
+    if action_type == "like":
+        if len(parts) > 1:
+            tweet_id = parts[1]
+            # Queue the like action
+            await action_queue.put(('like', {'tweet_id': tweet_id, 'chat_id': query.message.chat_id, 'message_id': query.message.message_id, 'original_callback_data': data, 'original_keyboard_data': query.message.reply_markup.to_dict().get('inline_keyboard') if query.message.reply_markup else None}))
+            # ... (code to edit button text to "Like (⏳)") ...
+        else: logger.warning(f"Invalid like callback format: {data}")
 
-    elif data.startswith("full:"):
-        tweet_id = data.split(":", 1)[1]
-        tweet_url = f"https://x.com/i/status/{tweet_id}"
-        # Queue the full text action
-        await action_queue.put(('full', {'tweet_id': tweet_id, 'chat_id': query.message.chat_id, 'message_id': query.message.message_id, 'original_callback_data': data, 'original_keyboard_data': query.message.reply_markup.to_dict().get('inline_keyboard') if query.message.reply_markup else None}))
-        # ... (code to edit button text to "Full Text (⏳)") ...
+    elif action_type == "repost":
+        if len(parts) > 1:
+            tweet_id = parts[1]
+            # Queue the repost action
+            await action_queue.put(('repost', {'tweet_id': tweet_id, 'chat_id': query.message.chat_id, 'message_id': query.message.message_id, 'original_callback_data': data, 'original_keyboard_data': query.message.reply_markup.to_dict().get('inline_keyboard') if query.message.reply_markup else None}))
+            # ... (code to edit button text to "Repost (⏳)") ...
+        else: logger.warning(f"Invalid repost callback format: {data}")
 
+    elif action_type == "full":
+        if len(parts) > 1:
+            tweet_id = parts[1]
+            # Queue the full text action
+            await action_queue.put(('full', {'tweet_id': tweet_id, 'chat_id': query.message.chat_id, 'message_id': query.message.message_id, 'original_callback_data': data, 'original_keyboard_data': query.message.reply_markup.to_dict().get('inline_keyboard') if query.message.reply_markup else None}))
+            # ... (code to edit button text to "Full Text (⏳)") ...
+        else: logger.warning(f"Invalid full callback format: {data}")
 
-    elif data.startswith("rate:"):
+    elif action_type == "rate":
         # Extract the rating data
-        parts = data.split(":", 3)
-        if len(parts) != 4:
+        rate_parts = data.split(":", 3) # Expect rate:value:key:name
+        if len(rate_parts) != 4:
             logger.warning(f"Invalid rating format: {data}")
-            # await query.answer("Invalid rating format") # Already answered
             return
 
-        rating_value = parts[1]
-        source_key = parts[2]
-        encoded_name = parts[3]
+        rating_value = rate_parts[1]
+        source_key = rate_parts[2]
+        encoded_name = rate_parts[3]
 
         try:
-            # Convert rating to integer
             rating_int = int(rating_value)
             if not 1 <= rating_int <= 5:
                 logger.warning(f"Invalid rating value: {rating_int}")
-                # await query.answer("Invalid rating value")
                 return
 
-            # Decode the name
             try:
                 author_name = base64.urlsafe_b64decode(encoded_name.encode()).decode()
             except:
                 author_name = source_key
 
-            # Update the ratings in your ratings_data dictionary
             global ratings_data # Ensure access
             if source_key not in ratings_data:
                  ratings_data[source_key] = {"name": author_name, "ratings": {str(i): 0 for i in range(1, 6)}}
             elif "ratings" not in ratings_data[source_key] or not isinstance(ratings_data[source_key].get("ratings"), dict):
                  ratings_data[source_key]["ratings"] = {str(i): 0 for i in range(1, 6)}
-            # Ensure name is up-to-date
             ratings_data[source_key]["name"] = author_name
 
-            # Increment the rating count for this value
             rating_key_str = str(rating_int)
             ratings_data[source_key]["ratings"][rating_key_str] = ratings_data[source_key]["ratings"].get(rating_key_str, 0) + 1
-
-            # Save the updated ratings
             save_ratings()
 
-            # Calculate the new average rating
             total_ratings = 0; weighted_sum = 0
             for star_str, count in ratings_data[source_key].get("ratings", {}).items():
                 try:
@@ -6978,10 +7383,8 @@ async def handle_callback_query(update, context):
             if total_ratings > 0:
                 average_rating = weighted_sum / total_ratings
                 rating_display = f"{average_rating:.1f}⭐({total_ratings})"
-                # await query.answer(f"You rated {author_name} {rating_int}⭐. New average: {rating_display}")
                 logger.info(f"Rating recorded for {author_name}: {rating_int} stars. New avg: {rating_display}")
             else:
-                # await query.answer(f"You rated {author_name} {rating_int}⭐")
                 logger.info(f"Rating recorded for {author_name}: {rating_int} stars.")
 
             # --- Remove rating buttons ---
@@ -6995,20 +7398,97 @@ async def handle_callback_query(update, context):
                 if new_keyboard: await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_keyboard))
                 else: await query.edit_message_reply_markup(reply_markup=None)
             except Exception as edit_err: logger.warning(f"Could not edit reply markup after rating: {edit_err}")
-            # --- End remove buttons ---
 
         except Exception as e:
             print(f"Error processing rating: {e}")
             logger.error("Error processing rating", exc_info=True)
-            # await query.answer("Rating failed. Please try again.")
-    elif data == "noop_processing":
-        # Do nothing for the placeholder button
-        pass
-    elif data == "rate_noop":
-        # Do nothing for the rating header
-        pass
+
+    elif action_type == "cloudflare_solved":
+        logger.info(f"Processing cloudflare_solved callback: {data}")
+        try:
+            if len(parts) > 1:
+                clicked_account_index_str = parts[1]
+                clicked_account_index = int(clicked_account_index_str)
+
+                global WAITING_FOR_CLOUDFLARE_CONFIRMATION, CLOUDFLARE_ACCOUNT_INDEX, cloudflare_solved_event
+                if WAITING_FOR_CLOUDFLARE_CONFIRMATION and CLOUDFLARE_ACCOUNT_INDEX == clicked_account_index:
+                    cloudflare_solved_event.set()
+                    await query.answer("Confirmation received. Resuming login check...")
+                    await query.edit_message_text(text=query.message.text + "\n\n✅ Confirmation received.", reply_markup=None)
+                    logger.info(f"Cloudflare confirmation processed for account index {clicked_account_index}.")
+                elif CLOUDFLARE_ACCOUNT_INDEX != clicked_account_index:
+                    await query.answer("⚠️ This confirmation is for a different account's Cloudflare check.", show_alert=True)
+                    logger.warning(f"Cloudflare confirmation received for wrong account index ({clicked_account_index} vs {CLOUDFLARE_ACCOUNT_INDEX}).")
+                else:
+                    await query.answer("ℹ️ Not currently waiting for this confirmation.", show_alert=True)
+                    logger.warning(f"Received unexpected Cloudflare confirmation: {data} (Waiting: {WAITING_FOR_CLOUDFLARE_CONFIRMATION}, Waiting Index: {CLOUDFLARE_ACCOUNT_INDEX})")
+                    try: await query.edit_message_reply_markup(reply_markup=None)
+                    except: pass
+            else:
+                logger.error(f"Missing account index in cloudflare_solved callback data '{data}'")
+                await query.answer("❌ Error processing confirmation (invalid data).", show_alert=True)
+
+        except (IndexError, ValueError) as parse_err:
+            logger.error(f"Error parsing cloudflare_solved callback data '{data}': {parse_err}")
+            await query.answer("❌ Error processing confirmation.", show_alert=True)
+        except Exception as e:
+            logger.error(f"Error handling cloudflare_solved callback '{data}': {e}", exc_info=True)
+            await query.answer("❌ Error processing confirmation.", show_alert=True)
+
+    elif action_type == "headless_follow":
+        logger.info(f"Processing headless_follow callback: {parts[1] if len(parts) > 1 else 'Invalid Format'}")
+        try:
+            if len(parts) < 2: raise ValueError("Missing data after headless_follow:")
+            decision_parts = parts[1].split(":", 1)
+            decision = decision_parts[0]
+            target_username = decision_parts[1] if len(decision_parts) > 1 else None
+
+            if decision == "yes":
+                if not is_user_admin(query.from_user.id):
+                    logger.warning(f"User {query.from_user.id} tried to disable headless via follow prompt without admin rights.")
+                    await query.answer("❌ Access denied (Admin required).", show_alert=True)
+                    try: await query.edit_message_text("❌ Action cancelled (No admin rights).")
+                    except: pass
+                    return
+
+                global is_headless_enabled
+                is_headless_enabled = False
+                save_settings()
+                logger.info(f"Headless mode disabled by user {query.from_user.id} via follow prompt.")
+                follow_command_text = f"/follow @{target_username}" if target_username else "/follow <username>"
+                await query.edit_message_text(
+                    f"✅ Headless mode has been disabled.\n\n"
+                    f"‼️ **Please restart the bot now.**\n\n"
+                    f"After restarting, use the command `{follow_command_text}` again.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+
+            elif decision == "no":
+                logger.info(f"User {query.from_user.id} cancelled follow action due to headless mode.")
+                await query.edit_message_text("❌ Follow action cancelled. Headless mode remains active.")
+                await resume_scraping()
+            else:
+                logger.warning(f"Unknown decision in headless_follow callback: {decision}")
+                await query.edit_message_text("❌ Unknown action.")
+                await resume_scraping()
+
+        except ValueError as ve:
+            logger.error(f"Error parsing headless_follow callback data ({parts[1] if len(parts) > 1 else 'N/A'}): {ve}", exc_info=True)
+            await query.edit_message_text("❌ Error processing request (invalid data format).")
+            await resume_scraping()
+        except Exception as e:
+            logger.error(f"Error processing headless_follow callback: {e}", exc_info=True)
+            await query.edit_message_text("❌ Error processing request.")
+            await resume_scraping()
+
+    elif action_type == "noop_processing":
+        pass # Do nothing for the placeholder button
+    elif action_type == "rate_noop":
+        pass # Do nothing for the rating header
     else:
         # Handle other callbacks (sync, help, etc.) - Call the main handler
+        # Ensure button_callback_handler exists and is correctly defined elsewhere
+        # This assumes button_callback_handler handles the rest
         await button_callback_handler(update, context)
 
 
@@ -7094,7 +7574,7 @@ async def autofollow_mode_command(update: Update, context: ContextTypes.DEFAULT_
     auto_follow_mode = new_mode
     save_settings()
     await update.message.reply_text(f"✅ Auto-Follow mode set to '{new_mode.upper()}'.")
-    # NEW: If mode is set to SLOW, directly show the interval command
+    #  If mode is set to SLOW, directly show the interval command
     if new_mode == "slow":
         # Ensure the global variable is available here
         global auto_follow_interval_minutes
@@ -7116,6 +7596,22 @@ async def autofollow_mode_command(update: Update, context: ContextTypes.DEFAULT_
 
 
     await resume_scraping()
+
+async def search_tickers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggles the Ticker search functionality."""
+    global search_tickers_enabled
+    # is_scraping_paused is handled by the admin wrapper
+
+    # Toggle the setting
+    search_tickers_enabled = not search_tickers_enabled
+    save_settings() # Save the new state
+
+    # Send confirmation message
+    status_text = "ENABLED 🟢" if search_tickers_enabled else "DISABLED 🔴"
+    await update.message.reply_text(f"✅ Ticker search is now {status_text}")
+    logger.info(f"Ticker search toggled to {status_text} by user {update.message.from_user.id}")
+
+    # resume_scraping is handled by the admin wrapper
 
 async def autofollow_interval_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Sets the interval for Slow Mode (min-max minutes)."""
@@ -7344,6 +7840,7 @@ async def run():
         add_admin_command_handler(application, "cancelsync", cancel_sync_command)
         add_admin_command_handler(application, "rates", show_ratings_command) # Maybe leave ratings public?
         add_admin_command_handler(application, "backupfollowers", backup_followers_command)
+        add_admin_command_handler(application, "setmaxage", set_max_age_command)
 
         # Following Database Commands
         add_admin_command_handler(application, "scrapefollowing", scrape_following_command)
@@ -7382,6 +7879,10 @@ async def run():
         add_admin_command_handler(application, "addadmin", add_admin_command)
         add_admin_command_handler(application, "removeadmin", remove_admin_command)
         add_admin_command_handler(application, "listadmins", list_admins_command)
+        # Ticker Search Toggle Command
+        add_admin_command_handler(application, "searchtickers", search_tickers_command)
+        # Headless Mode Toggle Command
+        add_admin_command_handler(application, "toggleheadless", toggle_headless_command)
 
 
         # Callback Handler for Buttons
@@ -7464,19 +7965,23 @@ async def run():
 
         running_status = "⏸️ PAUSED 🟡 (Schedule)" if is_scraping_paused and is_schedule_pause else ("⏸️ PAUSED 🟡 (Manual)" if is_scraping_paused else "▶️ RUNNING 🟢")
         mode_text = "Full 💯 (CA + Keywords)" if search_mode == "full" else "📝 CA ONLY"
-        schedule_status = "ON ✅" if schedule_enabled else "OFF ❌"
+        schedule_status = "ON 🟢" if schedule_enabled else "OFF ❌"
         current_username_welcome = get_current_account_username() or "N/A"
         autofollow_mode_display = auto_follow_mode.upper()
         if auto_follow_mode == "slow":
             autofollow_mode_display += f" ({auto_follow_interval_minutes[0]}-{auto_follow_interval_minutes[1]} min)"
         elif auto_follow_mode == "off":
              autofollow_mode_display = "OFF ⏸️"
+        ticker_status_welcome = "ON 🟢" if search_tickers_enabled else "OFF 🔴"
+        headless_status_welcome = "ON 🟢" if is_headless_enabled else "OFF 🔴"
         welcome_message = (
             f"🤖 raw-bot-X 🚀 START\n"
             f"👉 Acc {current_account+1} (@{current_username_welcome})\n\n"
             f"📊 ▫️STATUS▫️\n"
             f"{running_status}\n"
             f"🔍 Search mode: {mode_text}\n"
+            f"💲 Ticker Search: {ticker_status_welcome}\n"
+            f"👻 Headless Mode: {headless_status_welcome}\n" # New line for Headless status
             f"⏰ Schedule: {schedule_status} ({schedule_pause_start} - {schedule_pause_end})\n"
             f"🏃🏼‍♂️‍➡️ Auto-Follow: {autofollow_mode_display}\n"
         )
@@ -7545,7 +8050,7 @@ async def run():
 
                 # 3. If we are here, the bot is NOT paused
 
-                # --- NEW: Periodic WebDriver Restart ---
+                # ---  Periodic WebDriver Restart ---
                 global last_driver_restart_time, driver # Access globals
                 restart_interval_seconds = 4 * 60 * 60 # 4 hours
 
@@ -7606,7 +8111,7 @@ async def run():
 
                 # --- END WebDriver Restart ---
 
-                # --- NEW: Periodic Auto-Follow Check (Mode-based) ---
+                # ---  Periodic Auto-Follow Check (Mode-based) ---
                 if auto_follow_mode == "slow":
                     # --- Slow Mode Logic ---
                     min_sec = auto_follow_interval_minutes[0] * 60
@@ -7806,7 +8311,7 @@ async def show_ratings_command(update: Update, context: ContextTypes.DEFAULT_TYP
     output_messages = []
     current_message = ""
 
-    # === NEW: Top 3 Section ===
+    # ===  Top 3 Section ===
     top_3_output = "🏆 <b>Top 3 Rated Sources</b> 🏆\n"
     top_3_output += "     ⚜️⚜️⚜️\n"
     if not sorted_averages:
@@ -7947,6 +8452,138 @@ async def list_admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text(f"👑 Current Admin User IDs:\n{admin_list_str}", parse_mode=ParseMode.MARKDOWN)
 
 # --- End Admin Management Commands ---
+
+async def set_max_age_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sets the maximum age (in minutes) for tweets to be processed."""
+    global max_tweet_age_minutes
+    # pause/resume is handled by the admin wrapper
+
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text(
+            f"ℹ️ Please provide the maximum age in minutes.\n"
+            f"Current: {max_tweet_age_minutes} min\n\n"
+            f"Format: `/setmaxage <minutes>`\n\n"
+            f"Example: `/setmaxage {max_tweet_age_minutes}`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    try:
+        new_age = int(context.args[0])
+        if new_age >= 1: # Must be at least 1 minute
+            max_tweet_age_minutes = new_age
+            save_settings()
+            await update.message.reply_text(f"✅ Maximum tweet age set to {new_age} minutes.")
+            logger.info(f"Maximum tweet age set to {new_age} minutes by user {update.message.from_user.id}")
+        else:
+            await update.message.reply_text("❌ Age must be at least 1 minute.")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid input. Please provide a whole number (minutes).")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error setting max age: {e}")
+        logger.error(f"Error setting max tweet age to '{context.args[0]}': {e}", exc_info=True)
+
+# --- Headless Mode Toggle Command ---
+async def toggle_headless_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggles the Headless mode ON/OFF (requires restart)."""
+    global is_headless_enabled
+    # is_scraping_paused is handled by the admin wrapper
+
+    # Toggle the setting
+    is_headless_enabled = not is_headless_enabled
+    save_settings() # Save the new state
+
+    # Send confirmation message
+    status_text = "ENABLED 🟢" if is_headless_enabled else "DISABLED 🔴"
+    await update.message.reply_text(f"✅ Headless mode toggled to {status_text}. Restarting WebDriver...")
+    logger.info(f"Headless mode toggled to {status_text} by user {update.message.from_user.id} via command. Triggering driver restart.")
+
+    # Call the restart helper function
+    await restart_driver_and_login(update)
+
+    # resume_scraping is handled by the admin wrapper AND the helper function
+# --- End Headless Mode Toggle Command ---
+
+
+# --- Helper Function for Driver Restart ---
+async def restart_driver_and_login(update_or_query):
+    """Quits the current driver, creates a new one based on current settings, and logs in."""
+    global driver, last_driver_restart_time, application # Need application for sending messages if update_or_query is None
+
+    # Determine how to send messages
+    message_sender = None
+    if hasattr(update_or_query, 'message') and update_or_query.message:
+        message_sender = update_or_query.message # From CommandHandler update or CallbackQuery
+    elif application: # Fallback for internal calls without update context
+        message_sender = application.bot
+    else:
+        logger.error("Cannot send message in restart_driver_and_login: No update/query or application.")
+        # Proceed with restart attempt anyway, but without user feedback
+
+    async def send_msg(text):
+        if message_sender:
+            try:
+                if hasattr(message_sender, 'reply_text'):
+                    await message_sender.reply_text(text)
+                elif hasattr(message_sender, 'send_message') and CHANNEL_ID: # If it's the bot object
+                    await message_sender.send_message(chat_id=CHANNEL_ID, text=text)
+                else:
+                    logger.warning(f"Could not send restart message: {text}")
+            except Exception as send_err:
+                logger.error(f"Error sending message during driver restart: {send_err}")
+        else:
+            print(f"INFO (No Sender): {text}") # Log to console if no sender
+
+    await send_msg("🔄 Restarting WebDriver due to settings change...")
+    await pause_scraping() # Pause main scraping
+
+    login_ok_after_restart = False
+    try:
+        # Close old driver safely
+        if driver:
+            print("Closing old WebDriver...")
+            try:
+                driver.quit()
+            except Exception as quit_err:
+                print(f"WARNING: Error closing old driver (possibly already closed): {quit_err}")
+        driver = None # Explicitly set to None
+
+        # Create new driver (will read the new headless setting)
+        print("Creating new WebDriver...")
+        driver = create_driver()
+
+        # Log in again
+        print("Attempting login with current account...")
+        if await login(): # login() uses global current_account
+            print("Login after WebDriver restart successful.")
+            await switch_to_following_tab() # Important: Switch to Following tab
+            await send_msg("✅ WebDriver restart and login successful. New settings are active.")
+            last_driver_restart_time = time.time() # Update timestamp
+            login_ok_after_restart = True
+        else:
+            print("ERROR: Login after WebDriver restart failed!")
+            await send_msg("❌ ERROR: Login after WebDriver restart failed! Please check credentials or try switching accounts.")
+            # Driver might exist but login failed
+            if driver:
+                try: driver.quit()
+                except: pass
+                driver = None
+
+    except Exception as restart_err:
+        print(f"ERROR during WebDriver restart/login: {restart_err}")
+        logger.error("Exception during WebDriver restart/login", exc_info=True)
+        await send_msg(f"❌ Critical error during WebDriver restart: {str(restart_err)[:200]}")
+        # Ensure driver is None if creation/login failed critically
+        if driver:
+            try: driver.quit()
+            except: pass
+        driver = None
+    finally:
+        await resume_scraping() # Resume scraping regardless of outcome
+        await asyncio.sleep(2) # Short pause after the whole process
+
+    return login_ok_after_restart
+# --- End Helper Function ---
 
 # --- Your cleanup() function ---
 async def cleanup():
