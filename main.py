@@ -284,6 +284,50 @@ is_db_scrape_running = False # Flag for concurrency
 cancel_db_scrape_flag = False # Flag for cancellation
 # ===> END Following Database <===
 
+# ===> Scrape Queue (for headless restart) <===
+SCRAPE_QUEUE_FILE = "scrape_queue.txt"
+
+def add_username_to_scrape_queue(username):
+    """Appends a username to the scrape queue file."""
+    try:
+        # Ensure username is clean (no @, strip whitespace)
+        clean_username = username.strip().lstrip('@')
+        if not re.match(r'^[A-Za-z0-9_]{1,15}$', clean_username):
+            logger.warning(f"[Scrape Queue] Invalid username format '{username}' - not adding.")
+            return False
+        with open(SCRAPE_QUEUE_FILE, 'a', encoding='utf-8') as f:
+            f.write(f"{clean_username}\n")
+        logger.info(f"[Scrape Queue] Added @{clean_username} to queue file.")
+        return True
+    except Exception as e:
+        logger.error(f"[Scrape Queue] Error adding @{username} to queue file: {e}", exc_info=True)
+        return False
+
+def read_and_clear_scrape_queue():
+    """Reads all usernames from the queue file and clears it."""
+    usernames = []
+    if os.path.exists(SCRAPE_QUEUE_FILE):
+        try:
+            with open(SCRAPE_QUEUE_FILE, 'r', encoding='utf-8') as f:
+                # Read, strip whitespace, remove '@' just in case, filter empty lines and duplicates
+                raw_lines = [line.strip().lstrip('@') for line in f if line.strip()]
+                # Keep order but remove duplicates
+                seen = set()
+                usernames = [u for u in raw_lines if not (u in seen or seen.add(u))]
+
+            # Clear the file after reading successfully
+            with open(SCRAPE_QUEUE_FILE, 'w', encoding='utf-8') as f:
+                f.write("") # Write empty string to clear
+            logger.info(f"[Scrape Queue] Read {len(usernames)} unique usernames and cleared queue file.")
+        except Exception as e:
+            logger.error(f"[Scrape Queue] Error reading/clearing queue file: {e}", exc_info=True)
+            # Attempt to clear anyway if reading failed but file exists
+            try:
+                with open(SCRAPE_QUEUE_FILE, 'w', encoding='utf-8') as f: f.write("")
+            except: pass
+    return usernames
+# ===> END Scrape Queue <===
+
 # Post counting variables
 POSTS_COUNT_FILE = "posts_count.json"
 # Schedule variables
@@ -1776,6 +1820,7 @@ async def scrape_target_following(update: Update, target_username: str):
     """
     Scrapes the 'Following' list of *any* X user, extracts follower counts
     and updates the `following_database`. (With cancellation option)
+    This is the restored working version. Manages the is_db_scrape_running flag.
     """
     global driver, is_scraping_paused, pause_event, following_database
     global is_db_scrape_running, cancel_db_scrape_flag # Import flags
@@ -1783,21 +1828,25 @@ async def scrape_target_following(update: Update, target_username: str):
     # Clean the target username
     target_username = target_username.strip().lstrip('@')
     if not re.match(r'^[A-Za-z0-9_]{1,15}$', target_username):
-        await update.message.reply_text(f"❌ Invalid target username: {target_username}")
+        logger.error(f"[DB Scrape Internal] Invalid target username received: {target_username}")
+        if update and hasattr(update, 'message') and update.message:
+             await update.message.reply_text(f"❌ Invalid target username: {target_username}")
         return # End early
 
+    # Check if a scrape is already running (important for standalone calls)
     if is_db_scrape_running:
-        await update.message.reply_text("⚠️ A database scrape process is already running.")
+        logger.warning(f"[DB Scrape @{target_username}] Attempted to start while another scrape is running.")
+        if update and hasattr(update, 'message') and update.message:
+            await update.message.reply_text("⚠️ A database scrape process is already running.")
         return
 
     # ===== Task Start Marker =====
     is_db_scrape_running = True
-    cancel_db_scrape_flag = False
+    cancel_db_scrape_flag = False # Reset flag for this specific run
     # ================================
 
-    print(f"[DB Scrape] Starting scrape of the following list of @{target_username}...")
-    await update.message.reply_text(f"⏳ Starting scrape for @{target_username}...\n"
-                                     f"   To cancel: `/canceldbscrape`")
+    print(f"[DB Scrape @{target_username}] Starting scrape...")
+    # Message is sent by the calling command/task if update exists
 
     await pause_scraping() # Pause main scraping
 
@@ -1808,9 +1857,24 @@ async def scrape_target_following(update: Update, target_username: str):
     navigation_successful = False
     db_changed = False # Flag to know if saving is needed
 
+    # === Helper function for sending status messages ===
+    async def _send_scrape_status(text):
+        """Sends status either as reply or to main channel."""
+        prefix = f"[DB Scrape @{target_username}] "
+        if update and hasattr(update, 'message') and update.message:
+            try:
+                await update.message.reply_text(text)
+            except Exception as e:
+                logger.error(f"{prefix}Failed to send reply to user: {e}")
+                await send_telegram_message(f"{prefix}{text}") # Fallback
+        else:
+            # If update is None (e.g., called from queue), send to main channel
+            await send_telegram_message(f"{prefix}{text}")
+    # === End Helper function ===
+
     try: # Main try block for the entire function
         following_url = f"https://x.com/{target_username}/following"
-        print(f"[DB Scrape] Navigating to: {following_url}")
+        print(f"[DB Scrape @{target_username}] Navigating to: {following_url}")
         driver.get(following_url)
         await asyncio.sleep(random.uniform(5, 8)) # Longer wait for external profiles
 
@@ -1826,8 +1890,8 @@ async def scrape_target_following(update: Update, target_username: str):
                 try:
                     WebDriverWait(driver, 2).until(EC.presence_of_element_located((By.XPATH, indicator)))
                     error_text = driver.find_element(By.XPATH, indicator).text
-                    await update.message.reply_text(f"❌ Error accessing @{target_username}/following: {error_text}")
-                    print(f"[DB Scrape] Error: {error_text}")
+                    await _send_scrape_status(f"❌ Error accessing @{target_username}/following: {error_text}")
+                    print(f"[DB Scrape @{target_username}] Profile Error: {error_text}")
                     error_found = True
                     break
                 except (TimeoutException, NoSuchElementException):
@@ -1837,7 +1901,7 @@ async def scrape_target_following(update: Update, target_username: str):
 
         except Exception as profile_check_err:
             if "Profile inaccessible" not in str(profile_check_err):
-                 print(f"[DB Scrape] Unexpected error during profile check: {profile_check_err}")
+                 print(f"[DB Scrape @{target_username}] Unexpected error during profile check: {profile_check_err}")
             raise # Re-raise the error to exit the try block
 
         # --- End Check ---
@@ -1845,7 +1909,7 @@ async def scrape_target_following(update: Update, target_username: str):
         user_cell_button_xpath = '//button[@data-testid="UserCell"]'
         # Wait for the first appearance of UserCells
         WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.XPATH, user_cell_button_xpath)))
-        print("[DB Scrape] Found initial UserCell buttons.")
+        print(f"[DB Scrape @{target_username}] Found initial UserCell buttons.")
 
         scroll_attempts_without_new = 0
         max_scroll_attempts_without_new = 5
@@ -1853,9 +1917,9 @@ async def scrape_target_following(update: Update, target_username: str):
         # --- Start of the main scroll loop ---
         while scroll_attempts_without_new < max_scroll_attempts_without_new:
             if cancel_db_scrape_flag:
-                print("[DB Scrape] Cancellation signal received.")
+                print(f"[DB Scrape @{target_username}] Cancellation signal received.")
                 cancelled_early = True
-                await update.message.reply_text("🟡 Database scrape is being cancelled...")
+                await _send_scrape_status("🟡 Database scrape is being cancelled...")
                 break
 
             initial_processed_count = len(processed_in_this_scrape)
@@ -1863,7 +1927,7 @@ async def scrape_target_following(update: Update, target_username: str):
             # --- User extraction and processing per scroll view ---
             try: # Try block for finding cells in this view
                 user_cells = driver.find_elements(By.XPATH, user_cell_button_xpath)
-                print(f"[DB Scrape] Found {len(user_cells)} UserCells in this view.")
+                print(f"[DB Scrape @{target_username}] Found {len(user_cells)} UserCells in this view.")
 
                 # --- Iterate safely over the found cells ---
                 for cell_index, cell_button in enumerate(user_cells):
@@ -1894,7 +1958,7 @@ async def scrape_target_following(update: Update, target_username: str):
                         except (TimeoutException, NoSuchElementException, StaleElementReferenceException):
                             continue # Next cell
                         except Exception as user_err:
-                            print(f"  [DB Scrape] Error (Cell {cell_index}) during username extraction: {user_err}")
+                            print(f"  [DB Scrape @{target_username}] Error (Cell {cell_index}) during username extraction: {user_err}")
                             continue # Next cell
 
                         # Check: Skip if no username or already processed
@@ -1912,7 +1976,7 @@ async def scrape_target_following(update: Update, target_username: str):
                         except (TimeoutException, NoSuchElementException):
                             pass # No bio is okay
                         except Exception as bio_err:
-                            print(f"  [DB Scrape] Error (Cell {cell_index}) extracting bio for @{scraped_username}: {bio_err}")
+                            print(f"  [DB Scrape @{target_username}] Error (Cell {cell_index}) extracting bio for @{scraped_username}: {bio_err}")
                         # --- END Bio Extraction ---
 
                         # 3. Extract follower count (Hover)
@@ -1952,22 +2016,22 @@ async def scrape_target_following(update: Update, target_username: str):
                                                      found_text = True
                                                      break
                                         except (NoSuchElementException, StaleElementReferenceException): continue
-                                        except Exception as e_xpath: print(f"  [DB Scrape] Follower text attempt {i+1} ('{text_xpath}') - Unexpected error: {e_xpath}")
+                                        except Exception as e_xpath: print(f"  [DB Scrape @{target_username}] Follower text attempt {i+1} ('{text_xpath}') - Unexpected error: {e_xpath}")
                                     if found_text:
                                         follower_count = parse_follower_count(follower_text)
-                                        print(f"  [DB Scrape] @{scraped_username} - Parsed followers: {follower_count} (Raw: '{follower_text}')")
-                                except TimeoutException as te_inner: print(f"  [DB Scrape] Warning (Cell {cell_index}): Timeout *inside* HoverCard @{scraped_username}. {te_inner}")
-                                except (NoSuchElementException, StaleElementReferenceException) as e_inner: print(f"  [DB Scrape] Warning (Cell {cell_index}): Element not found *inside* HoverCard @{scraped_username}. {e_inner}")
-                                except Exception as inner_err: print(f"  [DB Scrape] Unexpected error *inside* HoverCard @{scraped_username}: {inner_err}"); logger.warning(f"Unexpected error inside HoverCard processing for {scraped_username}", exc_info=True)
+                                        print(f"  [DB Scrape @{target_username}] @{scraped_username} - Parsed followers: {follower_count} (Raw: '{follower_text}')")
+                                except TimeoutException as te_inner: print(f"  [DB Scrape @{target_username}] Warning (Cell {cell_index}): Timeout *inside* HoverCard @{scraped_username}. {te_inner}")
+                                except (NoSuchElementException, StaleElementReferenceException) as e_inner: print(f"  [DB Scrape @{target_username}] Warning (Cell {cell_index}): Element not found *inside* HoverCard @{scraped_username}. {e_inner}")
+                                except Exception as inner_err: print(f"  [DB Scrape @{target_username}] Unexpected error *inside* HoverCard @{scraped_username}: {inner_err}"); logger.warning(f"Unexpected error inside HoverCard processing for {scraped_username}", exc_info=True)
                                 finally:
                                     # --- Close HoverCard by scrolling ---
                                     try:
-                                        driver.execute_script("window.scrollBy(0, 1);")
+                                        driver.execute_script("window.scrollBy(0, 1);") # Minimal scroll to close
                                         await asyncio.sleep(random.uniform(0.2, 0.4))
-                                    except Exception as close_err: print(f"  [DB Scrape] Warning (Cell {cell_index}): Error closing HoverCard for @{scraped_username}: {close_err}")
-                        except TimeoutException as te_outer: print(f"  [DB Scrape] Warning (Cell {cell_index}): Timeout waiting for HoverCard for @{scraped_username}. {te_outer}")
-                        except (NoSuchElementException, StaleElementReferenceException) as e_outer: print(f"  [DB Scrape] Warning (Cell {cell_index}): Element not found during hover setup for @{scraped_username}. {e_outer}")
-                        except Exception as hover_err: print(f"  [DB Scrape] Unexpected error during hover setup for @{scraped_username}: {hover_err}"); logger.warning(f"Unexpected JS hover setup/trigger error for {scraped_username}", exc_info=True)
+                                    except Exception as close_err: print(f"  [DB Scrape @{target_username}] Warning (Cell {cell_index}): Error closing HoverCard for @{scraped_username}: {close_err}")
+                        except TimeoutException as te_outer: print(f"  [DB Scrape @{target_username}] Warning (Cell {cell_index}): Timeout waiting for HoverCard for @{scraped_username}. {te_outer}")
+                        except (NoSuchElementException, StaleElementReferenceException) as e_outer: print(f"  [DB Scrape @{target_username}] Warning (Cell {cell_index}): Element not found during hover setup for @{scraped_username}. {e_outer}")
+                        except Exception as hover_err: print(f"  [DB Scrape @{target_username}] Unexpected error during hover setup for @{scraped_username}: {hover_err}"); logger.warning(f"Unexpected JS hover setup/trigger error for {scraped_username}", exc_info=True)
                         # --- End Follower Count Extraction ---
 
                         # 4. Update database (with bio)
@@ -1995,10 +2059,10 @@ async def scrape_target_following(update: Update, target_username: str):
                         processed_in_this_scrape.add(scraped_username)
 
                     except StaleElementReferenceException:
-                        print(f"  [DB Scrape] Error (Cell {cell_index}): Stale Element Reference. Skipping this cell.")
+                        print(f"  [DB Scrape @{target_username}] Error (Cell {cell_index}): Stale Element Reference. Skipping this cell.")
                         continue # Go to the next cell
                     except Exception as cell_processing_error:
-                        print(f"  [DB Scrape] Unexpected error processing cell {cell_index} (User: {'@'+scraped_username if scraped_username else 'Unknown'}): {cell_processing_error}")
+                        print(f"  [DB Scrape @{target_username}] Unexpected error processing cell {cell_index} (User: {'@'+scraped_username if scraped_username else 'Unknown'}): {cell_processing_error}")
                         logger.warning(f"Unexpected error processing cell {cell_index}", exc_info=True)
                         continue # Go to the next cell
                     # --- END of the comprehensive try block for a cell ---
@@ -2008,7 +2072,7 @@ async def scrape_target_following(update: Update, target_username: str):
 
             except Exception as find_err:
                  # Error finding user_cells initially
-                 print(f"[DB Scrape] Critical error finding UserCells: {find_err}")
+                 print(f"[DB Scrape @{target_username}] Critical error finding UserCells: {find_err}")
                  break # Abort the outer while loop
 
             # --- After processing cells in this view ---
@@ -2017,7 +2081,7 @@ async def scrape_target_following(update: Update, target_username: str):
 
             current_scroll_pos = driver.execute_script("return window.pageYOffset;")
             total_scroll_height = driver.execute_script("return document.body.scrollHeight;")
-            print(f"[DB Scrape] Scroll-Pos: {int(current_scroll_pos)}/{int(total_scroll_height)}, Processed={current_processed_count} (+{newly_processed_in_loop} iteration), DB Updates={users_added_or_updated}, Failed attempts={scroll_attempts_without_new}")
+            print(f"[DB Scrape @{target_username}] Scroll-Pos: {int(current_scroll_pos)}/{int(total_scroll_height)}, Processed={current_processed_count} (+{newly_processed_in_loop} iteration), DB Updates={users_added_or_updated}, Failed attempts={scroll_attempts_without_new}")
 
             if current_processed_count == last_found_count:
                 scroll_attempts_without_new += 1
@@ -2027,36 +2091,34 @@ async def scrape_target_following(update: Update, target_username: str):
             last_found_count = current_processed_count
 
             if scroll_attempts_without_new >= max_scroll_attempts_without_new:
-                print(f"[DB Scrape] Stopping scrolling: {max_scroll_attempts_without_new} attempts without new users.")
+                print(f"[DB Scrape @{target_username}] Stopping scrolling: {max_scroll_attempts_without_new} attempts without new users.")
                 break
 
             if cancel_db_scrape_flag: break
 
-            # Scroll for the next round
-            # ===> CHANGED: Increased scroll multiplier due to zoom <===
+            # Scroll for the next round (THIS IS THE ORIGINAL WORKING SCROLL)
             driver.execute_script("window.scrollBy(0, window.innerHeight * 1.5);")
-            # ===> END CHANGE <===
             wait_time = random.uniform(1.5, 2.5) # Keep wait time the same for now
             await asyncio.sleep(wait_time)
             # --- End of the while loop ---
 
         # --- After the scroll loop (normal or cancelled) ---
         if cancelled_early:
-            print(f"[DB Scrape] Process cancelled. {len(processed_in_this_scrape)} users processed until then.")
+            print(f"[DB Scrape @{target_username}] Process cancelled. {len(processed_in_this_scrape)} users processed until then.")
             if db_changed:
                 print("[DB Scrape] Saving database changes made so far...")
                 save_following_database()
-                await update.message.reply_text(f"🟡 Scrape cancelled. {users_added_or_updated} database updates were saved.")
+                await _send_scrape_status(f"🟡 Scrape cancelled. {users_added_or_updated} database updates were saved.")
             else:
-                await update.message.reply_text(f"🛑 Scrape cancelled. No database changes made.")
+                await _send_scrape_status(f"🛑 Scrape cancelled. No database changes made.")
         else:
-            print(f"[DB Scrape] Scrolling completed. Processed {len(processed_in_this_scrape)} unique users in total.")
+            print(f"[DB Scrape @{target_username}] Scrolling completed. Processed {len(processed_in_this_scrape)} unique users in total.")
             if db_changed:
                 print("[DB Scrape] Saving final database changes...")
                 save_following_database()
-                await update.message.reply_text(f"✅ Scrape for @{target_username} completed. {users_added_or_updated} database updates performed ({len(following_database)} total).")
+                await _send_scrape_status(f"✅ Scrape for @{target_username} completed. {users_added_or_updated} database updates performed ({len(following_database)} total).")
             else:
-                await update.message.reply_text(f"✅ Scrape for @{target_username} completed. No new updates for the database.")
+                await _send_scrape_status(f"✅ Scrape for @{target_username} completed. No new updates for the database.")
 
     except Exception as e:
         # Error handling for the outer try block
@@ -2064,7 +2126,7 @@ async def scrape_target_following(update: Update, target_username: str):
              pass # Message was already sent
         else:
             error_message = f"💥 Critical error during DB scrape for @{target_username}: {e}"
-            await update.message.reply_text(error_message)
+            await _send_scrape_status(error_message)
             print(error_message)
             logger.error(f"Critical error during DB scrape for @{target_username}: {e}", exc_info=True)
             # Save DB anyway if changes were made
@@ -2073,29 +2135,29 @@ async def scrape_target_following(update: Update, target_username: str):
                 save_following_database()
 
     finally: # ===== IMPORTANT FINALLY BLOCK =====
-        print("[DB Scrape] Finally block reached.")
+        print(f"[DB Scrape @{target_username}] Finally block reached.")
         # Return to the main timeline
-        print("[DB Scrape] Attempting to return to the main timeline (/home)...")
+        print(f"[DB Scrape @{target_username}] Attempting to return to the main timeline (/home)...")
         try:
             driver.get("https://x.com/home")
             await asyncio.sleep(random.uniform(4, 6))
             await switch_to_following_tab()
-            print("[DB Scrape] Back on /home 'Following' tab.")
+            print(f"[DB Scrape @{target_username}] Back on /home 'Following' tab.")
             navigation_successful = True
         except Exception as nav_err:
             error_msg = f"⚠️ Error returning to the main timeline after DB scrape: {nav_err}."
             print(error_msg)
-            try: await update.message.reply_text(error_msg)
-            except: pass
+            await _send_scrape_status(error_msg)
 
         # Resume main scraping
-        print("[DB Scrape] Resuming main scraping.")
+        print(f"[DB Scrape @{target_username}] Resuming main scraping.")
         await resume_scraping()
 
         # ===== Task End Marker =====
+        # This function now manages the flag for its own execution
         is_db_scrape_running = False
-        cancel_db_scrape_flag = False
-        print("[DB Scrape] Status flags reset.")
+        cancel_db_scrape_flag = False # Reset here as well for safety
+        print(f"[DB Scrape @{target_username}] Status flags reset.")
         # =============================
 
 async def recover_followers_logic(update: Update):
@@ -2618,33 +2680,186 @@ async def resume_scraping():
 
 async def scrape_following_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Handler for /scrapefollowing <username>. Starts the scrape process for
-    the target user's following list as a background task.
+    Handler for /scrapefollowing <username1> [username2...].
+    Queues usernames if headless, otherwise processes them sequentially.
     """
-    global is_db_scrape_running # Check if a scrape is already running
+    global is_db_scrape_running, is_headless_enabled, driver, cancel_db_scrape_flag
 
-    # Argument check
-    if not context.args or len(context.args) != 1:
-        await update.message.reply_text("❌ Please provide exactly ONE X username after the command.\nFormat: `/scrapefollowing <username>`")
+    # --- Argument Parsing for Multiple Usernames ---
+    if not context.args:
+        await update.message.reply_text("❌ Please provide at least one X username.\nFormat: `/scrapefollowing <user1>` [user2] ...", parse_mode=ParseMode.MARKDOWN)
+        return # Wrapper handles resume
+
+    target_usernames = []
+    invalid_usernames = []
+    input_text = " ".join(context.args)
+    potential_usernames = {name.strip().lstrip('@') for name in re.split(r'[,\s]+', input_text) if name.strip()}
+
+    for username in potential_usernames:
+        if re.match(r'^[A-Za-z0-9_]{1,15}$', username):
+            target_usernames.append(username)
+        else:
+            invalid_usernames.append(username)
+
+    if not target_usernames:
+        await update.message.reply_text(f"❌ No valid usernames provided. Invalid: {', '.join(invalid_usernames)}" if invalid_usernames else "❌ No usernames provided.")
+        return # Wrapper handles resume
+
+    if invalid_usernames:
+        await update.message.reply_text(f"⚠️ Invalid usernames skipped: {', '.join(invalid_usernames)}")
+    # --- End Argument Parsing ---
+
+    # Check if a scrape is already running (still needed here)
+    # Use a short wait/retry loop in case the flag is briefly True from a previous run ending
+    for _ in range(3): # Try up to 3 times
+        if is_db_scrape_running:
+            logger.warning("[Scrape Command] DB scrape seems to be running, waiting briefly...")
+            await asyncio.sleep(2)
+        else:
+            break # Flag is False, proceed
+    else: # Loop finished without break
+        await update.message.reply_text("⚠️ A database scrape process is still running after waiting. Please wait or use `/canceldbscrape`.")
+        return # Wrapper handles resume
+
+
+    # --- Headless Mode Handling ---
+    original_headless_state = is_headless_enabled
+    needs_headless_restore = False
+    restart_success = True # Assume success initially
+
+    if original_headless_state:
+        logger.warning(f"User {update.message.from_user.id} initiated /scrapefollowing with headless ON.")
+        # Add all valid usernames to the queue
+        queued_count = 0
+        failed_queue_count = 0
+        for username in target_usernames:
+            if add_username_to_scrape_queue(username):
+                queued_count += 1
+            else:
+                failed_queue_count += 1
+
+        queue_msg = f"{queued_count} username(s) added to the processing queue."
+        if failed_queue_count > 0:
+            queue_msg += f" ({failed_queue_count} failed to queue - check logs)."
+
+        keyboard = [[
+            InlineKeyboardButton("✅ Yes, disable Headless & Restart", callback_data=f"headless_scrape:yes"),
+            InlineKeyboardButton("❌ No, keep Headless (Queue Only)", callback_data=f"headless_scrape:no")
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            f"👻 **Headless Mode Active** 👻\n\n"
+            f"Scraping following lists requires interaction and is unreliable in headless mode.\n\n"
+            f"{queue_msg}\n\n"
+            f"Do you want to disable headless mode now?\n"
+            f"(This requires a **bot restart**. Queued scrapes will start automatically after restart if headless is disabled).",
+            reply_markup=reply_markup
+        )
+        # Do NOT start scraping. Wrapper handles resume.
         return
+    # --- End Headless Mode Check ---
 
-    target_username = context.args[0].strip().lstrip('@')
-    if not re.match(r'^[A-Za-z0-9_]{1,15}$', target_username):
-        await update.message.reply_text(f"❌ Invalid target username: {target_username}")
-        return
+    # --- Normal Sequential Execution (Headless OFF) ---
+    # Start the sequential processing in a background task
+    # so the command handler can return quickly.
+    await update.message.reply_text(f"✅ Starting sequential database scrape for {len(target_usernames)} users in the background...\n"
+                                     f"   Users: {', '.join(target_usernames)}\n"
+                                     f"   To cancel: `/canceldbscrape`")
 
-    # Check if a scrape is already running
-    if is_db_scrape_running:
-        await update.message.reply_text("⚠️ A database scrape process is already running. Please wait or use `/canceldbscrape`.")
-        return
+    asyncio.create_task(process_multiple_scrapes_sequentially(update, target_usernames))
 
-    # Send message that the task is starting
-    await update.message.reply_text(f"✅ Database scrape for @{target_username} is starting in the background...")
+    # No resume_scraping here, the task runs independently. The wrapper doesn't resume either.
 
-    # Start the actual logic as a background task
-    asyncio.create_task(scrape_target_following(update, target_username))
 
-    # No resume_scraping here, the task runs independently and manages itself.
+async def process_multiple_scrapes_sequentially(update: Update, usernames: list):
+    """
+    Task to process multiple scrape requests one after another.
+    Calls scrape_target_following for each username.
+    """
+    global is_db_scrape_running, cancel_db_scrape_flag
+
+    processed_count = 0
+    cancelled = False
+    # Reset flag before starting loop
+    cancel_db_scrape_flag = False
+
+    logger.info(f"[Multi Scrape Task] Starting sequential processing for {len(usernames)} users.")
+
+    try:
+        for i, username in enumerate(usernames):
+            # Check cancellation flag before starting each user
+            if cancel_db_scrape_flag:
+                cancelled = True
+                await update.message.reply_text(f"🟡 Scrape sequence cancelled before processing @{username}.")
+                logger.warning(f"[Multi Scrape Task] Cancellation requested before processing @{username}.")
+                break
+
+            # Check if another scrape is somehow running (safety check)
+            if is_db_scrape_running:
+                 logger.warning(f"[Multi Scrape Task] is_db_scrape_running is True before calling for @{username}. Waiting...")
+                 await update.message.reply_text(f"⏳ Waiting for previous scrape to finish before starting @{username}...")
+                 while is_db_scrape_running:
+                     await asyncio.sleep(5)
+                     if cancel_db_scrape_flag: # Check again during wait
+                         cancelled = True
+                         break
+                 if cancelled:
+                     await update.message.reply_text(f"🟡 Scrape sequence cancelled while waiting for @{username}.")
+                     break
+                 logger.info(f"[Multi Scrape Task] Previous scrape finished. Proceeding with @{username}.")
+
+
+            await update.message.reply_text(f"⏳ Processing user {i+1}/{len(usernames)}: @{username}...")
+            logger.info(f"[Multi Scrape Task] Calling scrape_target_following for @{username} ({i+1}/{len(usernames)}).")
+
+            # Call the core scraping logic for a single user
+            # scrape_target_following now manages is_db_scrape_running and pause/resume
+            try:
+                # Pass the update object
+                await scrape_target_following(update, username)
+                # scrape_target_following will set is_db_scrape_running to False in its finally block
+
+                # Check flag again *after* the call completes
+                if cancel_db_scrape_flag:
+                    cancelled = True
+                    logger.warning(f"[Multi Scrape Task] Cancellation detected after processing @{username}.")
+                    break
+            except Exception as single_scrape_err:
+                logger.error(f"[Multi Scrape Task] Error during scrape_target_following call for @{username}: {single_scrape_err}", exc_info=True)
+                await update.message.reply_text(f"❌ Error scraping @{username}. See logs. Continuing...")
+                # Ensure flags are reset if sub-task failed badly
+                is_db_scrape_running = False
+                if is_scraping_paused: await resume_scraping()
+
+            processed_count += 1
+            # Optional short delay between users
+            if not cancelled: # Don't wait if cancelled
+                logger.debug(f"[Multi Scrape Task] Waiting before next user...")
+                await asyncio.sleep(random.uniform(5, 10))
+
+    except Exception as loop_err:
+        logger.error(f"[Multi Scrape Task] Unexpected error in processing loop: {loop_err}", exc_info=True)
+        await update.message.reply_text(f"💥 Critical error during multi-scrape task. Check logs.")
+    finally:
+        # Final cleanup and status message
+        is_db_scrape_running = False # Ensure flag is reset finally
+        cancel_db_scrape_flag = False
+        logger.info(f"[Multi Scrape Task] Sequence finished. Processed Attempts: {processed_count}, Cancelled: {cancelled}")
+
+        summary_msg = f"🏁 Multi-Scrape Sequence Finished 🏁\n"
+        summary_msg += f"   - Total Users Requested: {len(usernames)}\n"
+        summary_msg += f"   - Processed Attempts: {processed_count}\n"
+        if cancelled:
+            summary_msg += f"   - Status: Cancelled 🛑\n"
+        else:
+            summary_msg += f"   - Status: Completed ✅\n"
+
+        await update.message.reply_text(summary_msg)
+
+        # Ensure main scraping is resumed if it was left paused
+        if is_scraping_paused:
+            logger.warning("[Multi Scrape Task] Scraping was paused at the end. Resuming.")
+            await resume_scraping()
 
 async def add_from_db_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -3985,7 +4200,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         current_list_preview = "    (List is empty)"
     # Info line for the list
-    current_list_info = f"{current_list_count} Users in `{current_list_filename}`"
+    current_list_info = f"{current_list_count} Users in {current_list_filename}"
 
     # --- Build message ---
     ticker_status_text = "ENABLED 🟢" if search_tickers_enabled else "DISABLED 🔴"
@@ -6146,6 +6361,9 @@ def get_contract_links(contract, chain):
 
 def format_time(datetime_str):
     global max_tweet_age_minutes # Access the global setting
+    # --- DEBUG LOGGING ---
+    print(f"DEBUG format_time: Using max_tweet_age_minutes = {max_tweet_age_minutes}")
+    # --- END DEBUG LOGGING ---
     is_recent = False # Default: Not recent
     formatted_string = "📅 Time invalid"
     try:
@@ -6169,8 +6387,18 @@ def format_time(datetime_str):
 
         # --- Determine if the post is recent (using configured max age) ---
         max_age_seconds = max_tweet_age_minutes * 60 # Calculate max age in seconds
+        # --- DEBUG LOGGING ---
+        print(f"DEBUG format_time: seconds_ago={seconds_ago:.1f}, max_age_seconds={max_age_seconds} (from {max_tweet_age_minutes} min)")
+        # --- END DEBUG LOGGING ---
         if 0 <= seconds_ago < max_age_seconds: # Use the calculated value
             is_recent = True
+            # --- DEBUG LOGGING ---
+            print(f"DEBUG format_time: Post IS recent.")
+            # --- END DEBUG LOGGING ---
+        else:
+            # --- DEBUG LOGGING ---
+            print(f"DEBUG format_time: Post IS NOT recent.")
+            # --- END DEBUG LOGGING ---
         # --- End recent check ---
 
         # --- Format the display string based on age ---
@@ -6477,9 +6705,10 @@ async def process_tweets():
                     except (TimeoutException, NoSuchElementException, StaleElementReferenceException): pass
 
                     # --- Skip if older than 15 minutes (strict check) ---
-                    # This check now uses the updated 'is_recent' which is True only if < 15 min
+                    # This check now uses the updated 'is_recent' which is True only if < max_tweet_age_minutes
                     if not tweet_is_recent:
-                        print(f"    post {tweet_id} skipped: Too old ({time_str} > 15 min)")
+                        # Use the global variable in the log message
+                        print(f"    post {tweet_id} skipped: Too old ({time_str} > {max_tweet_age_minutes} min)")
                         # Mark as processed so we don't check it again in this round
                         processed_in_this_round.add(tweet_id)
                         processed_tweets.append(tweet_id)
@@ -7161,57 +7390,57 @@ def get_contract_links(contract, chain):
 
     return ''.join(links)
 
-def format_time(datetime_str):
-    is_recent = False # Default: Not recent
-    formatted_string = "📅 Time invalid"
-    try:
-        # Attempt to use the configured timezone
-        local_tz = ZoneInfo("Europe/Berlin")
-    except Exception:
-        # Fallback to a fixed offset if timezone info is unavailable
-        print("WARNING: Could not load 'Europe/Berlin' timezone. Using UTC+2 fallback.")
-        local_tz = timezone(timedelta(hours=2), "UTC+02:00_Fallback")
+# def format_time(datetime_str):
+#     is_recent = False # Default: Not recent
+#     formatted_string = "📅 Time invalid"
+#     try:
+#         # Attempt to use the configured timezone
+#         local_tz = ZoneInfo("Europe/Berlin")
+#     except Exception:
+#         # Fallback to a fixed offset if timezone info is unavailable
+#         print("WARNING: Could not load 'Europe/Berlin' timezone. Using UTC+2 fallback.")
+#         local_tz = timezone(timedelta(hours=2), "UTC+02:00_Fallback")
 
-    try:
-        # Parse the UTC time from the tweet
-        tweet_time_utc = datetime.fromisoformat(datetime_str.replace('Z', '+00:00')).replace(tzinfo=timezone.utc)
-        # Convert to the local timezone
-        tweet_time_local = tweet_time_utc.astimezone(local_tz)
-        # Get the current time in the same local timezone
-        current_time_local = datetime.now(local_tz)
-        # Calculate the difference
-        time_diff = current_time_local - tweet_time_local
-        seconds_ago = time_diff.total_seconds()
+#     try:
+#         # Parse the UTC time from the tweet
+#         tweet_time_utc = datetime.fromisoformat(datetime_str.replace('Z', '+00:00')).replace(tzinfo=timezone.utc)
+#         # Convert to the local timezone
+#         tweet_time_local = tweet_time_utc.astimezone(local_tz)
+#         # Get the current time in the same local timezone
+#         current_time_local = datetime.now(local_tz)
+#         # Calculate the difference
+#         time_diff = current_time_local - tweet_time_local
+#         seconds_ago = time_diff.total_seconds()
 
-        # --- Determine if the tweet is recent (within 15 minutes) ---
-        # 900 seconds = 15 minutes
-        if 0 <= seconds_ago < 900:
-            is_recent = True
-        # --- End recent check ---
+#         # --- Determine if the tweet is recent (within 15 minutes) ---
+#         # 900 seconds = 15 minutes
+#         if 0 <= seconds_ago < 900:
+#             is_recent = True
+#         # --- End recent check ---
 
-        # --- Format the display string based on age ---
-        if seconds_ago < 0:
-            # Tweet is from the future (clock skew?)
-            formatted_string = f"📅 {tweet_time_local.strftime('%H:%M %d.%m.%y')} (Future?)"
-        elif seconds_ago < 3600: # Under 1 hour (includes the <15 min case)
-            minutes_ago = int(seconds_ago // 60)
-            formatted_string = f"📅 {tweet_time_local.strftime('%H:%M %d.%m.%y')} ({minutes_ago} min)"
-        elif seconds_ago < 86400: # Under 1 day (but older than 1 hour)
-            hours_ago = int(seconds_ago // 3600)
-            formatted_string = f"📅 {tweet_time_local.strftime('%H:%M %d.%m.%y')} ({hours_ago} hrs)"
-        else: # Older than 1 day
-            formatted_string = f"📅 {tweet_time_local.strftime('%d.%m.%y %H:%M')}"
-        # --- End string formatting ---
+#         # --- Format the display string based on age ---
+#         if seconds_ago < 0:
+#             # Tweet is from the future (clock skew?)
+#             formatted_string = f"📅 {tweet_time_local.strftime('%H:%M %d.%m.%y')} (Future?)"
+#         elif seconds_ago < 3600: # Under 1 hour (includes the <15 min case)
+#             minutes_ago = int(seconds_ago // 60)
+#             formatted_string = f"📅 {tweet_time_local.strftime('%H:%M %d.%m.%y')} ({minutes_ago} min)"
+#         elif seconds_ago < 86400: # Under 1 day (but older than 1 hour)
+#             hours_ago = int(seconds_ago // 3600)
+#             formatted_string = f"📅 {tweet_time_local.strftime('%H:%M %d.%m.%y')} ({hours_ago} hrs)"
+#         else: # Older than 1 day
+#             formatted_string = f"📅 {tweet_time_local.strftime('%d.%m.%y %H:%M')}"
+#         # --- End string formatting ---
 
-    except ValueError:
-        # Error parsing the datetime string, keep default "invalid" message
-        pass
-    except Exception as e:
-        # Log other unexpected errors during time formatting
-        print(f"ERROR in format_time: {e}")
-        # Keep default "invalid" message
+#     except ValueError:
+#         # Error parsing the datetime string, keep default "invalid" message
+#         pass
+#     except Exception as e:
+#         # Log other unexpected errors during time formatting
+#         print(f"ERROR in format_time: {e}")
+#         # Keep default "invalid" message
 
-    return formatted_string, is_recent
+#     return formatted_string, is_recent
 
 
 async def process_full_text_request(query, context, tweet_url): # Added context
@@ -7299,6 +7528,7 @@ async def process_full_text_request(query, context, tweet_url): # Added context
 
 async def handle_callback_query(update, context):
     """Handles all button clicks."""
+    global is_headless_enabled
     query = update.callback_query
     data = query.data
 
@@ -7481,8 +7711,57 @@ async def handle_callback_query(update, context):
             await query.edit_message_text("❌ Error processing request.")
             await resume_scraping()
 
+    elif action_type == "headless_scrape":
+        logger.info(f"Processing headless_scrape callback: {parts[1] if len(parts) > 1 else 'Invalid Format'}")
+        try:
+            if len(parts) < 2: raise ValueError("Missing data after headless_scrape:")
+            decision = parts[1] # Should be 'yes' or 'no'
+
+            if decision == "yes":
+                # --- Admin Check ---
+                if not is_user_admin(query.from_user.id):
+                    logger.warning(f"User {query.from_user.id} tried to disable headless via scrape prompt without admin rights.")
+                    await query.answer("❌ Access denied (Admin required).", show_alert=True)
+                    try: await query.edit_message_text("❌ Action cancelled (No admin rights).")
+                    except: pass
+                    # No resume here, original command handler resumes on denial
+                    return
+                # --- End Admin Check ---
+
+                is_headless_enabled = False
+                save_settings()
+                logger.info(f"Headless mode disabled by user {query.from_user.id} via scrape prompt.")
+                await query.edit_message_text(
+                    f"✅ Headless mode has been disabled.\n\n"
+                    f"‼️ **Restarting WebDriver now...**\n\n"
+                    f"Queued scrapes will start automatically after login if the queue is not empty."
+                )
+                # Call the restart helper function
+                await restart_driver_and_login(query)
+                # No resume here, restart_driver_and_login handles it
+
+            elif decision == "no":
+                logger.info(f"User {query.from_user.id} chose to keep headless mode active for scraping (queued).")
+                await query.edit_message_text("✅ Headless mode remains active. Scrape requests remain queued.")
+                await resume_scraping() # Resume scraping, as the command handler paused
+            else:
+                logger.warning(f"Unknown decision in headless_scrape callback: {decision}")
+                await query.edit_message_text("❌ Unknown action.")
+                await resume_scraping() # Resume scraping
+
+        except ValueError as ve:
+            logger.error(f"Error parsing headless_scrape callback data ({parts[1] if len(parts) > 1 else 'N/A'}): {ve}", exc_info=True)
+            await query.edit_message_text("❌ Error processing request (invalid data format).")
+            await resume_scraping() # Resume scraping
+        except Exception as e:
+            logger.error(f"Error processing headless_scrape callback: {e}", exc_info=True)
+            await query.edit_message_text("❌ Error processing request.")
+            await resume_scraping() # Resume scraping
+
+
     elif action_type == "noop_processing":
         pass # Do nothing for the placeholder button
+
     elif action_type == "rate_noop":
         pass # Do nothing for the rating header
     else:
@@ -7992,6 +8271,33 @@ async def run():
         await send_telegram_message(welcome_message, reply_markup=reply_markup)
         print("Start message sent.")
 
+        # --- Initial Queue Check on Startup ---
+        if not is_headless_enabled: # Only check if not starting in headless
+            queued_usernames = read_and_clear_scrape_queue()
+            if queued_usernames:
+                logger.info(f"Found {len(queued_usernames)} usernames in scrape queue on startup. Starting tasks...")
+                await send_telegram_message(f"▶️ Bot started. Starting {len(queued_usernames)} queued scrape task(s)...")
+                # Use asyncio.create_task to run scrapes concurrently after startup
+                tasks = []
+                processed_for_tasks = set()
+                for username in queued_usernames:
+                     if username not in processed_for_tasks:
+                        logger.info(f"  -> Creating scrape task for @{username}")
+                        # Pass None for update, task will use send_telegram_message
+                        task = asyncio.create_task(scrape_target_following(None, username))
+                        tasks.append(task)
+                        processed_for_tasks.add(username)
+                        await asyncio.sleep(1) # Stagger task creation slightly
+                logger.info(f"Launched {len(tasks)} scrape tasks from startup queue.")
+                # Don't wait for completion here, let them run in background
+        elif is_headless_enabled:
+            logger.info("Bot starting in headless mode. Scrape queue will not be processed automatically on startup.")
+            # Optionally check if queue has items and inform user
+            if os.path.exists(SCRAPE_QUEUE_FILE) and os.path.getsize(SCRAPE_QUEUE_FILE) > 0:
+                 await send_telegram_message("ℹ️ Bot started in headless mode. There are usernames in the scrape queue. Disable headless mode and restart to process them.")
+        # --- End Initial Queue Check ---
+
+
         # --- Main Loop ---
         print("Starting main loop...")
         while True:
@@ -8196,25 +8502,31 @@ async def run():
                 if action_was_processed:
                     continue # Start next loop iteration immediately after button action
 
-                # Decide if scrolling happens in this iteration (e.g., 80% probability)
-                if random.random() < 1: # Scrolls in 80% of cases
-                    try:
-                        # Random scroll distance (e.g., 60% to 110% of window height)
-                        scroll_percentage = random.uniform(0.9, 3.5)
-                        scroll_command = f"window.scrollBy(0, window.innerHeight * {scroll_percentage});"
-                        print(f"[Run Loop] Scrolling down by {scroll_percentage:.2f} * viewport height...") # Console output
-                        driver.execute_script(scroll_command)
+                # Decide if scrolling happens in this iteration (ONLY if not paused)
+                if pause_event.is_set(): # Check if the pause event is NOT set (i.e., bot is running)
+                    if random.random() < 1: # Scrolls in 80% of cases WHEN RUNNING
+                        try:
+                            # Random scroll distance
+                            scroll_percentage = random.uniform(0.9, 3.5)
+                            scroll_command = f"window.scrollBy(0, window.innerHeight * {scroll_percentage});"
+                            print(f"[Run Loop] Scrolling down by {scroll_percentage:.2f} * viewport height...") # Console output
+                            driver.execute_script(scroll_command)
 
-                        # Random wait time after scrolling (larger range)
-                        wait_after_scroll = random.uniform(0.2, 0.7)
-                        await asyncio.sleep(wait_after_scroll)
-                    except Exception as scroll_err:
-                        print(f"Error scrolling in run loop: {scroll_err}")
+                            # Random wait time after scrolling
+                            wait_after_scroll = random.uniform(0.2, 0.7)
+                            await asyncio.sleep(wait_after_scroll)
+                        except Exception as scroll_err:
+                            print(f"Error scrolling in run loop: {scroll_err}")
+                    else:
+                        # print("[Run Loop] Skipping scroll this iteration.") # Optional: Keep or remove log
+                        await asyncio.sleep(random.uniform(0.5, 1.5)) # Still wait even if not scrolling
                 else:
-                    print("[Run Loop] Skipping scroll this iteration.")
-                    await asyncio.sleep(random.uniform(0.5, 1.5))
+                    # If paused, just wait briefly instead of scrolling
+                    # print("[Run Loop] Paused, skipping scroll.") # Optional log
+                    await asyncio.sleep(1.0) # Wait 1 second if paused
 
-                # --- Queue Check 4: After Scrolling ---
+                # --- Queue Check 4: After Scrolling / Pause Wait ---
+                # Queue check should happen regardless of scroll
                 action_was_processed = await check_and_process_queue(application)
                 if action_was_processed:
                     continue # Start next loop iteration immediately after button action
@@ -8542,14 +8854,49 @@ async def restart_driver_and_login(update_or_query):
         # Close old driver safely
         if driver:
             print("Closing old WebDriver...")
+            await asyncio.sleep(1.0) # Kleine Pause VOR dem Schließen
             try:
                 driver.quit()
+                await asyncio.sleep(1.5) # Etwas längere Pause NACH dem Schließen
             except Exception as quit_err:
-                print(f"WARNING: Error closing old driver (possibly already closed): {quit_err}")
-        driver = None # Explicitly set to None
+                print(f"WARNING: Error closing old driver (possibly already closed or timed out): {quit_err}")
+                # Auch wenn quit() fehlschlägt, versuchen wir Prozesse zu beenden
+
+        # --- Force kill lingering processes (Linux focused) ---
+        # Dies hilft, wenn driver.quit() hängt oder nicht alle Prozesse beendet
+        print("Attempting to forcefully kill lingering browser/driver processes...")
+        try:
+            # Befehle zum Beenden von Chrome/Chromium und Chromedriver
+            # -f matcht den vollen Pfad/Argumente, SIGTERM (15) ist Standard (graceful)
+            kill_commands = [
+                ['pkill', '-f', 'chrome'],
+                ['pkill', '-f', 'chromium'],
+                ['pkill', '-f', 'chromedriver']
+            ]
+            for cmd in kill_commands:
+                try:
+                    # Kurzer Timeout für jeden Kill-Befehl
+                    subprocess.run(cmd, timeout=5, check=False, capture_output=True)
+                    await asyncio.sleep(0.3) # Kurze Pause zwischen Kills
+                except FileNotFoundError:
+                    print(f"WARNING: Command '{cmd[0]}' not found. Skipping kill.")
+                    break # Wenn pkill nicht da ist, brauchen wir nicht weiterzumachen
+                except subprocess.TimeoutExpired:
+                    print(f"WARNING: Command '{' '.join(cmd)}' timed out.")
+                except Exception as run_err:
+                     print(f"WARNING: Error running kill command '{' '.join(cmd)}': {run_err}")
+
+            print("Process kill commands executed (attempted).")
+            await asyncio.sleep(1.5) # Längere Pause nach den Kill-Versuchen
+        except Exception as kill_err:
+            print(f"WARNING: Error during force kill block: {kill_err}")
+        # --- End force kill ---
+
+        driver = None # Explizit auf None setzen, falls quit() fehlschlug oder für Klarheit
 
         # Create new driver (will read the new headless setting)
         print("Creating new WebDriver...")
+        await asyncio.sleep(2.0) # Zusätzliche Pause VOR dem Erstellen des neuen Drivers
         driver = create_driver()
 
         # Log in again
@@ -8579,6 +8926,35 @@ async def restart_driver_and_login(update_or_query):
             except: pass
         driver = None
     finally:
+        # --- Start Queued Scrapes (only if login succeeded and headless is OFF) ---
+        if login_ok_after_restart and not is_headless_enabled:
+            queued_usernames = read_and_clear_scrape_queue()
+            if queued_usernames:
+                logger.info(f"Found {len(queued_usernames)} usernames in scrape queue after restart. Starting tasks...")
+                await send_msg(f"✅ Headless mode disabled. Starting {len(queued_usernames)} queued scrape task(s)...")
+                # Use asyncio.create_task to run scrapes concurrently after restart
+                tasks = []
+                processed_for_tasks = set()
+                for username in queued_usernames:
+                     if username not in processed_for_tasks:
+                        logger.info(f"  -> Creating scrape task for @{username}")
+                        # Pass None for update, task will use send_telegram_message
+                        # Run scrape_target_following directly as a task
+                        task = asyncio.create_task(scrape_target_following(None, username))
+                        tasks.append(task)
+                        processed_for_tasks.add(username)
+                        await asyncio.sleep(1) # Stagger task creation slightly
+                # Optional: Wait for these initial tasks if needed, or let them run in background
+                # await asyncio.gather(*tasks)
+                logger.info(f"Launched {len(tasks)} scrape tasks from queue.")
+            else:
+                logger.info("Scrape queue is empty after restart.")
+        elif login_ok_after_restart and is_headless_enabled:
+             logger.info("Headless mode is still enabled after restart, not processing scrape queue.")
+        elif not login_ok_after_restart:
+             logger.warning("Login failed after restart, not processing scrape queue.")
+        # --- End Start Queued Scrapes ---
+
         await resume_scraping() # Resume scraping regardless of outcome
         await asyncio.sleep(2) # Short pause after the whole process
 
