@@ -6405,8 +6405,10 @@ def format_time(datetime_str):
         if seconds_ago < 0:
             # post is from the future (clock skew?)
             formatted_string = f"📅 {tweet_time_local.strftime('%H:%M %d.%m.%y')} (Future?)"
-        elif seconds_ago < 3600: # Under 1 hour
-            minutes_ago = int(seconds_ago // 60)
+        elif seconds_ago < 180: # NEW: Under 3 minutes -> Show seconds
+            formatted_string = f"📅 {tweet_time_local.strftime('%H:%M %d.%m.%y')} ({seconds_ago:.1f} sec)"
+        elif seconds_ago < 3600: # Under 1 hour (but >= 60 seconds)
+            minutes_ago = int(seconds_ago // 180)
             formatted_string = f"📅 {tweet_time_local.strftime('%H:%M %d.%m.%y')} ({minutes_ago} min)"
         elif seconds_ago < 86400: # Under 1 day
             hours_ago = int(seconds_ago // 3600)
