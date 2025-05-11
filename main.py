@@ -50,6 +50,137 @@ except ImportError:
         # Make ZoneInfo point to the fallback
         ZoneInfo = lambda tz_name: FixedOffsetZone()
 
+# --- Timezone Configuration ---
+DEFAULT_FALLBACK_TIMEZONE_STR = "Europe/Berlin" # Used if .env and system TZ fails
+USER_CONFIGURED_TIMEZONE = None # Will be set by load_user_timezone
+USER_TIMEZONE_STR = "" # Will be set to the name of the timezone being used
+
+def get_system_timezone_name():
+    """Attempts to get the system's IANA timezone name."""
+    try:
+        # datetime.now().astimezone().tzname() can be unreliable for IANA names.
+        # It often returns abbreviations (PST, CET) or fixed offsets.
+        # A more robust method for system timezone is using the 'tzlocal' library,
+        # but we aim for a solution without new mandatory dependencies.
+
+        # On Linux, try reading /etc/timezone or /etc/localtime symlink
+        if platform.system() == "Linux":
+            try:
+                with open("/etc/timezone", "r") as f:
+                    tz_name = f.read().strip()
+                    ZoneInfo(tz_name) # Validate it's a known IANA name
+                    return tz_name
+            except Exception:
+                pass # File not found or invalid content
+            try:
+                # /etc/localtime is often a symlink to /usr/share/zoneinfo/Region/City
+                localtime_path = os.path.realpath("/etc/localtime")
+                if localtime_path.startswith("/usr/share/zoneinfo/"):
+                    # Extract like "Region/City"
+                    tz_name = localtime_path[len("/usr/share/zoneinfo/"):]
+                    ZoneInfo(tz_name) # Validate
+                    return tz_name
+            except Exception:
+                pass # Symlink not as expected or invalid
+        
+        # If not Linux or above methods failed, try a more general approach
+        # This is less reliable for getting a direct IANA name usable by ZoneInfo
+        # but can give a hint.
+        system_tz_offset_name = datetime.now().astimezone().tzname()
+        if system_tz_offset_name:
+            try:
+                # Check if the system name is directly usable by ZoneInfo
+                ZoneInfo(system_tz_offset_name)
+                return system_tz_offset_name
+            except:
+                # If not directly usable, it's likely an abbreviation or offset.
+                # We can't reliably convert this to an IANA name without more tools.
+                print(f"DEBUG: System tzname() returned '{system_tz_offset_name}', which is not a direct IANA name for ZoneInfo.")
+                pass
+
+    except Exception as e_sys_detect:
+        print(f"DEBUG: Error during system timezone detection: {e_sys_detect}")
+    return None
+
+def load_user_timezone():
+    """Loads the timezone in order of priority: .env, system, fallback."""
+    global USER_CONFIGURED_TIMEZONE, USER_TIMEZONE_STR, DEFAULT_FALLBACK_TIMEZONE_STR
+
+    env_timezone_str = os.getenv("TIMEZONE")
+
+    if env_timezone_str:
+        print(f"INFO: 'TIMEZONE={env_timezone_str}' found in .env. Attempting to load...")
+        try:
+            USER_CONFIGURED_TIMEZONE = ZoneInfo(env_timezone_str)
+            USER_TIMEZONE_STR = env_timezone_str
+            print(f"INFO: Successfully loaded timezone from .env: '{USER_TIMEZONE_STR}'")
+            return
+        except Exception as e_env_tz:
+            print(f"WARNING: Could not load timezone '{env_timezone_str}' from .env: {e_env_tz}.")
+            print(f"         Ensure it's a valid IANA TZ Database Name (e.g., 'America/New_York', 'Europe/Paris').")
+            print(f"         See: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones")
+            print(f"         Will try to use system timezone or fallback.")
+            # Fall through to try system timezone
+    else:
+        print("INFO: 'TIMEZONE' not set in .env. Attempting to use system timezone.")
+
+    # Try to get system timezone
+    system_tz_name = get_system_timezone_name()
+    if system_tz_name:
+        print(f"INFO: Detected system timezone as '{system_tz_name}'. Attempting to load...")
+        try:
+            USER_CONFIGURED_TIMEZONE = ZoneInfo(system_tz_name)
+            USER_TIMEZONE_STR = system_tz_name
+            print(f"INFO: Successfully loaded system timezone: '{USER_TIMEZONE_STR}'")
+            print(f"      To override, set 'TIMEZONE' in your config.env file.")
+            return
+        except Exception as e_sys_tz:
+            print(f"WARNING: Could not load detected system timezone '{system_tz_name}': {e_sys_tz}.")
+            print(f"         Falling back to default: '{DEFAULT_FALLBACK_TIMEZONE_STR}'.")
+            # Fall through to default fallback
+    else:
+        print(f"INFO: Could not determine a usable system timezone. Falling back to default: '{DEFAULT_FALLBACK_TIMEZONE_STR}'.")
+        print(f"      You can set 'TIMEZONE' in config.env for a specific zone (e.g., 'America/New_York').")
+        print(f"      See: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones")
+
+
+    # Fallback to default (e.g., "Europe/Berlin")
+    try:
+        USER_CONFIGURED_TIMEZONE = ZoneInfo(DEFAULT_FALLBACK_TIMEZONE_STR)
+        USER_TIMEZONE_STR = DEFAULT_FALLBACK_TIMEZONE_STR
+        print(f"INFO: Successfully loaded default fallback timezone: '{USER_TIMEZONE_STR}'")
+    except Exception as e_fb_tz:
+        print(f"ERROR: Could not load default fallback timezone '{DEFAULT_FALLBACK_TIMEZONE_STR}': {e_fb_tz}.")
+        print(f"       Using a fixed UTC offset or pure UTC as last resort.")
+        # Last resort: Use the FixedOffsetZone (if zoneinfo/pytz are missing) or UTC
+        try:
+            USER_CONFIGURED_TIMEZONE = ZoneInfo(None) # This will use FixedOffsetZone if zoneinfo/pytz are missing
+            
+            # Determine the name of the fallback timezone object
+            if hasattr(USER_CONFIGURED_TIMEZONE, '_name') and USER_CONFIGURED_TIMEZONE._name: # Our FixedOffsetZone
+                USER_TIMEZONE_STR = USER_CONFIGURED_TIMEZONE._name
+            elif hasattr(USER_CONFIGURED_TIMEZONE, 'zone') and USER_CONFIGURED_TIMEZONE.zone: # pytz wrapper for ZoneInfo
+                USER_TIMEZONE_STR = USER_CONFIGURED_TIMEZONE.zone
+            elif isinstance(USER_CONFIGURED_TIMEZONE, timezone) and USER_CONFIGURED_TIMEZONE.utcoffset(None) == timedelta(0):
+                USER_TIMEZONE_STR = "UTC"
+            else: # Fallback for other tzinfo objects or if name is not descriptive
+                offset = USER_CONFIGURED_TIMEZONE.utcoffset(datetime.now())
+                if offset is not None:
+                    offset_hours = offset.total_seconds() / 3600
+                    USER_TIMEZONE_STR = f"UTC{offset_hours:+03.0f}:00_Fallback"
+                else: # Should not happen with our FixedOffsetZone or UTC
+                    USER_TIMEZONE_STR = "Unknown_Offset_Fallback"
+            print(f"INFO: Using '{USER_TIMEZONE_STR}' as final fallback timezone.")
+        except Exception as e_final_fb:
+            USER_CONFIGURED_TIMEZONE = timezone.utc # Absolute last resort
+            USER_TIMEZONE_STR = "UTC"
+            print(f"CRITICAL ERROR: All timezone loading failed catastrophically: {e_final_fb}. Using UTC as absolute fallback.")
+
+load_user_timezone()
+# --- End Timezone Configuration ---
+
+from bs4 import BeautifulSoup
+
 from bs4 import BeautifulSoup
 # Note: datetime, timezone, timedelta already imported above
 from selenium import webdriver
@@ -248,14 +379,14 @@ is_scraping_paused = False
 pause_event = asyncio.Event()
 pause_event.set()  # Not paused by default
 is_schedule_pause = False  # Flag to distinguish if pause comes from scheduler
-# Variable to track first run for optimized tweet processing
+# Variable to track first run for optimized post processing
 first_run = True
-# Search mode: "full" for CA + Keywords, "ca_only" for only CA
-search_mode = "full"
-# Ticker search: True to enable searching for $Tickers, False to disable
-search_tickers_enabled = True # Default: Enabled
+# Search settings:
+search_keywords_enabled = True # Default: Enabled
+search_ca_enabled = True       # Default: Enabled
+search_tickers_enabled = True  # Default: Enabled (existing)
 
-# Maximum tweet age in minutes to be considered recent
+# Maximum post age in minutes to be considered recent
 max_tweet_age_minutes = 15 # Default value
 
 # Headless mode: True to run Chrome without GUI
@@ -283,6 +414,11 @@ following_database = {} # Loaded on startup
 is_db_scrape_running = False # Flag for concurrency
 cancel_db_scrape_flag = False # Flag for cancellation
 # ===> END Following Database <===
+
+is_any_scheduled_browser_task_running = False # True if Sync or FollowList schedule is active
+is_scheduled_follow_list_running = False    # True if process_follow_list_schedule_logic is active
+cancel_scheduled_follow_list_flag = False # To cancel the scheduled follow list task
+
 
 # ===> Scrape Queue (for headless restart) <===
 SCRAPE_QUEUE_FILE = "scrape_queue.txt"
@@ -335,6 +471,20 @@ SCHEDULE_FILE = "schedule.json"
 schedule_enabled = False
 schedule_pause_start = "00:00"  # Default start time in 24-hour format
 schedule_pause_end = "00:00"    # Default end time in 24-hour format
+
+# --- New Schedules ---
+# For Sync Followers
+schedule_sync_enabled = False
+schedule_sync_start_time = "03:00"  # Default start time for sync
+schedule_sync_end_time = "03:30"    # Default end time for sync
+last_sync_schedule_run_date = None # Stores date of last run
+
+# For Follow List Processing
+schedule_follow_list_enabled = False
+schedule_follow_list_start_time = "04:00" # Default start time for follow list
+schedule_follow_list_end_time = "04:30"   # Default end time for follow list
+last_follow_list_schedule_run_date = None # Stores date of last run
+# --- End New Schedules ---
 posts_count = {
     "found": {
         "today": 0,
@@ -368,7 +518,7 @@ RATINGS_FILE = "ratings.json"
 ratings_data = {} # Loaded on startup
 # ===> END Rating System <===
 
-# Stores tweet URLs for the last messages
+# Stores post URLs for the last messages
 last_tweet_urls = {}
 
 rate_limit_patterns = [
@@ -387,31 +537,29 @@ def display_ascii_animation(art_lines, delay_min=0.05, delay_max=0.1):
         time.sleep(random.uniform(delay_min, delay_max))
 
 def load_settings():
-    """Loads settings from the file, including scraping, auto-follow, ticker search, headless mode, and max tweet age."""
-    global search_mode, is_scraping_paused, pause_event
-    global auto_follow_mode, auto_follow_interval_minutes # Auto-Follow Globals
-    global search_tickers_enabled # Ticker Search Global
-    global is_headless_enabled #  Headless Mode Global
-    global max_tweet_age_minutes # Max Tweet Age Global
+    """Loads settings from the file, including scraping, auto-follow, search toggles, headless mode, and max post age."""
+    global is_scraping_paused, pause_event
+    global auto_follow_mode, auto_follow_interval_minutes
+    global search_keywords_enabled, search_ca_enabled, search_tickers_enabled
+    global is_headless_enabled
+    global max_tweet_age_minutes
 
     # --- Define default values ---
-    default_search_mode = "full"
-    default_scraping_paused = True  # Default: PAUSED
-    default_autofollow_mode = "off" # Default: OFF
-    default_autofollow_interval = [15, 30] # Default: 15-30 minutes
-    default_search_tickers_enabled = True # Default: Ticker search ON
-    default_headless_enabled = False # Default: Headless OFF
-    default_max_tweet_age = 15 # Default: 15 minutes
+    default_scraping_paused = True
+    default_autofollow_mode = "off"
+    default_autofollow_interval = [15, 30]
+    default_search_keywords_enabled = True
+    default_search_ca_enabled = True
+    default_search_tickers_enabled = True
+    default_headless_enabled = False
+    default_max_tweet_age = 15
 
     try:
         if os.path.exists(SETTINGS_FILE):
             with open(SETTINGS_FILE, 'r') as f:
                 settings = json.load(f)
-                search_mode = settings.get("search_mode", default_search_mode)
                 is_scraping_paused = settings.get("is_scraping_paused", default_scraping_paused)
-                # Load the new mode and interval
                 auto_follow_mode = settings.get("auto_follow_mode", default_autofollow_mode)
-                # Ensure the interval is a list of 2 numbers
                 loaded_interval = settings.get("auto_follow_interval_minutes", default_autofollow_interval)
                 if isinstance(loaded_interval, list) and len(loaded_interval) == 2 and all(isinstance(x, int) for x in loaded_interval):
                     auto_follow_interval_minutes = loaded_interval
@@ -419,13 +567,10 @@ def load_settings():
                     print(f"WARNING: Invalid auto_follow_interval_minutes in {SETTINGS_FILE}. Using default: {default_autofollow_interval}")
                     auto_follow_interval_minutes = default_autofollow_interval
 
-                # Load the new ticker search setting
+                search_keywords_enabled = settings.get("search_keywords_enabled", default_search_keywords_enabled)
+                search_ca_enabled = settings.get("search_ca_enabled", default_search_ca_enabled)
                 search_tickers_enabled = settings.get("search_tickers_enabled", default_search_tickers_enabled)
-
-                # Load the new headless mode setting
                 is_headless_enabled = settings.get("is_headless_enabled", default_headless_enabled)
-
-                # Load the new max tweet age setting
                 loaded_max_age = settings.get("max_tweet_age_minutes", default_max_tweet_age)
                 if isinstance(loaded_max_age, int) and loaded_max_age >= 1:
                     max_tweet_age_minutes = loaded_max_age
@@ -434,37 +579,39 @@ def load_settings():
                     max_tweet_age_minutes = default_max_tweet_age
 
                 print(f"Settings loaded:")
-                print(f"  - Search mode: {search_mode}")
                 print(f"  - Scraping: {'PAUSED' if is_scraping_paused else 'ACTIVE'}")
                 print(f"  - Auto-Follow Mode: {auto_follow_mode.upper()}")
                 if auto_follow_mode == "slow":
                     print(f"  - Auto-Follow Interval: {auto_follow_interval_minutes[0]}-{auto_follow_interval_minutes[1]} Min")
+                print(f"  - Keyword Search: {'ENABLED' if search_keywords_enabled else 'DISABLED'}")
+                print(f"  - CA Search: {'ENABLED' if search_ca_enabled else 'DISABLED'}")
                 print(f"  - Ticker Search: {'ENABLED' if search_tickers_enabled else 'DISABLED'}")
                 print(f"  - Headless Mode: {'ENABLED' if is_headless_enabled else 'DISABLED'}")
-                print(f"  - Max Tweet Age: {max_tweet_age_minutes} minutes") # Print loaded value
+                print(f"  - Max post Age: {max_tweet_age_minutes} minutes")
 
         else:
             print("No settings file found, setting default values and creating file...")
-            search_mode = default_search_mode
             is_scraping_paused = default_scraping_paused
             auto_follow_mode = default_autofollow_mode
             auto_follow_interval_minutes = default_autofollow_interval
+            search_keywords_enabled = default_search_keywords_enabled
+            search_ca_enabled = default_search_ca_enabled
             search_tickers_enabled = default_search_tickers_enabled
             is_headless_enabled = default_headless_enabled
-            max_tweet_age_minutes = default_max_tweet_age # Set default
-            # Save the default values immediately to create the file
-            save_settings() # save_settings needs to know the new keys!
+            max_tweet_age_minutes = default_max_tweet_age
+            save_settings()
             print(f"Default settings file '{SETTINGS_FILE}' has been created.")
 
     except (json.JSONDecodeError, Exception) as e:
         print(f"Error loading settings ({type(e).__name__}): {e}. Using default values.")
-        search_mode = default_search_mode
         is_scraping_paused = default_scraping_paused
         auto_follow_mode = default_autofollow_mode
         auto_follow_interval_minutes = default_autofollow_interval
+        search_keywords_enabled = default_search_keywords_enabled
+        search_ca_enabled = default_search_ca_enabled
         search_tickers_enabled = default_search_tickers_enabled
         is_headless_enabled = default_headless_enabled
-        max_tweet_age_minutes = default_max_tweet_age # Set default on error
+        max_tweet_age_minutes = default_max_tweet_age
 
     # --- IMPORTANT: Set asyncio.Event based on loaded status ---
     if is_scraping_paused:
@@ -473,21 +620,22 @@ def load_settings():
         pause_event.set()   # Running
 
 def save_settings():
-    """Saves current settings to the file, incl. scraping, auto-follow, ticker search, headless mode, and max tweet age."""
-    global search_mode, is_scraping_paused
-    global auto_follow_mode, auto_follow_interval_minutes # Auto-Follow Globals
-    global search_tickers_enabled # Ticker Search Global
-    global is_headless_enabled # Headless Mode Global
-    global max_tweet_age_minutes # Max Tweet Age Global
+    """Saves current settings to the file, incl. scraping, auto-follow, search toggles, headless mode, and max post age."""
+    global is_scraping_paused
+    global auto_follow_mode, auto_follow_interval_minutes
+    global search_keywords_enabled, search_ca_enabled, search_tickers_enabled
+    global is_headless_enabled
+    global max_tweet_age_minutes
     try:
         settings = {
-            "search_mode": search_mode,
             "is_scraping_paused": is_scraping_paused,
             "auto_follow_mode": auto_follow_mode,
             "auto_follow_interval_minutes": auto_follow_interval_minutes,
+            "search_keywords_enabled": search_keywords_enabled,
+            "search_ca_enabled": search_ca_enabled,
             "search_tickers_enabled": search_tickers_enabled,
             "is_headless_enabled": is_headless_enabled,
-            "max_tweet_age_minutes": max_tweet_age_minutes 
+            "max_tweet_age_minutes": max_tweet_age_minutes
         }
         with open(SETTINGS_FILE, 'w') as f:
             json.dump(settings, f, indent=4)
@@ -586,13 +734,16 @@ def load_ratings():
                 print(f"Rating data loaded for {len(ratings_data)} sources.")
         else:
             ratings_data = {}
-            print("No rating file found, starting with an empty database.")
+            print(f"No rating file found ({RATINGS_FILE}), starting with an empty database and creating the file.")
+            save_ratings() # Create the file with empty data
     except json.JSONDecodeError:
-        print(f"ERROR: {RATINGS_FILE} is corrupt. Starting with an empty database.")
+        print(f"ERROR: {RATINGS_FILE} is corrupt. Starting with an empty database and creating a new file.")
         ratings_data = {}
+        save_ratings() # Create a new, empty ratings file
     except Exception as e:
-        print(f"Error loading rating data: {e}")
+        print(f"Error loading rating data: {e}. Initializing empty and attempting to save.")
         ratings_data = {}
+        save_ratings() # Attempt to create a new, empty ratings file
 
 def save_ratings():
     """Saves the current rating data to the file."""
@@ -614,13 +765,16 @@ def load_following_database():
                 print(f"Following database loaded ({len(following_database)} entries).")
         else:
             following_database = {}
-            print("No following database file found, starting with an empty database.")
+            print(f"No following database file found ({FOLLOWING_DB_FILE}), starting with an empty database and creating the file.")
+            save_following_database() # Create the file with empty data
     except json.JSONDecodeError:
-        print(f"ERROR: {FOLLOWING_DB_FILE} is corrupt. Starting with an empty database.")
+        print(f"ERROR: {FOLLOWING_DB_FILE} is corrupt. Starting with an empty database and creating a new file.")
         following_database = {}
+        save_following_database() # Create a new, empty database file
     except Exception as e:
-        print(f"Error loading the following database: {e}")
+        print(f"Error loading the following database: {e}. Initializing empty and attempting to save.")
         following_database = {}
+        save_following_database() # Attempt to create a new, empty database file
 
 def save_following_database():
     """Saves the current following database to the file."""
@@ -693,6 +847,64 @@ def get_current_backup_file_path():
         safe_username = re.sub(r'[\\/*?:"<>|]', "_", username)
         return FOLLOWER_BACKUP_TEMPLATE.format(safe_username)
     return None
+
+def ensure_data_files_exist():
+    """
+    Checks for the existence of data files that are not automatically
+    created by their load functions and creates them empty if they don't exist.
+    This is primarily for account-specific lists and the global list.
+    """
+    print("INFO: Ensuring all necessary data files exist...")
+
+    # 1. Global Followed Users File
+    if not os.path.exists(GLOBAL_FOLLOWED_FILE):
+        print(f"INFO: Global followed users file '{GLOBAL_FOLLOWED_FILE}' not found. Creating empty file.")
+        save_set_to_file(set(), GLOBAL_FOLLOWED_FILE)
+
+    # 2. Scrape Queue File
+    if not os.path.exists(SCRAPE_QUEUE_FILE):
+        print(f"INFO: Scrape queue file '{SCRAPE_QUEUE_FILE}' not found. Creating empty file.")
+        try:
+            with open(SCRAPE_QUEUE_FILE, 'w', encoding='utf-8') as f:
+                f.write("") # Create empty file
+        except Exception as e:
+            print(f"ERROR: Could not create empty scrape queue file '{SCRAPE_QUEUE_FILE}': {e}")
+
+    # 3. Account-specific files
+    if not ACCOUNTS:
+        print("WARNING: No accounts configured. Skipping creation of account-specific files.")
+        return
+
+    for i, account_info in enumerate(ACCOUNTS):
+        acc_username = account_info.get("username")
+        # Use a generic identifier if username is missing, for file path generation
+        safe_username_for_file = None
+        if acc_username:
+            safe_username_for_file = re.sub(r'[\\/*?:"<>|]', "_", acc_username)
+        else:
+            # Fallback if username is not set for the account in ACCOUNTS
+            # This might happen if .env is incomplete but ACCOUNTS list was still populated
+            safe_username_for_file = f"account_{i+1}_unknown"
+            print(f"WARNING: Username for account index {i} is missing. Using generic filename part '{safe_username_for_file}'.")
+
+
+        # a. Account Follow List (add_contacts_*.txt)
+        # We need to use the logic from get_current_follow_list_path but for *any* account
+        # This is a bit tricky as get_current_follow_list_path depends on current_account
+        # Let's construct it directly here.
+        follow_list_filename = FOLLOW_LIST_TEMPLATE.format(safe_username_for_file)
+        if not os.path.exists(follow_list_filename):
+            print(f"INFO: Account follow list '{follow_list_filename}' for '{acc_username or f'Account {i+1}'}' not found. Creating empty file.")
+            save_set_to_file(set(), follow_list_filename)
+
+        # b. Account Follower Backup (follower_backup_*.txt)
+        # Similar direct construction for backup file path
+        backup_filename = FOLLOWER_BACKUP_TEMPLATE.format(safe_username_for_file)
+        if not os.path.exists(backup_filename):
+            print(f"INFO: Account follower backup '{backup_filename}' for '{acc_username or f'Account {i+1}'}' not found. Creating empty file.")
+            save_set_to_file(set(), backup_filename)
+
+    print("INFO: Data file existence check complete.")
 
 def create_driver():
     options = webdriver.ChromeOptions()
@@ -1488,8 +1700,11 @@ async def unfollow_user(username):
         driver.get(f"https://x.com/{username}")
         await asyncio.sleep(random.uniform(2, 4))
 
-        # If we're here, check for unfollow button
-        unfollow_button_xpath = [
+        # If we're here, check for various "unfollow" or "currently following" buttons
+        # Priority 1: Standard "Following" button (text-based or with specific aria-label)
+        # This indicates we are clearly in a "following" state.
+        following_state_button_xpaths = [
+            "//button[@data-testid='user-follow-button']//span[text()='Following']", # TestID with "Following" text
             "//button[@aria-label='Following @" + username + "']",
             "//button[contains(@aria-label, 'Following @" + username + "')]",
             "//button[starts-with(@aria-label, 'Following @')]",
@@ -1497,117 +1712,92 @@ async def unfollow_user(username):
             "//div[@role='button' and contains(@aria-label, 'Following @')]"
         ]
 
+        # Priority 2: Alternative "Unfollow" button (often with an icon, aria-label "Unfollow @username")
+        # This button might appear directly if the UI decides to show it instead of "Following".
+        # It still means we are currently following them, and clicking it initiates unfollow.
+        alternative_unfollow_button_xpaths = [
+            # Specific to the button you provided: aria-label="Unfollow @username" and contains an SVG
+            "//button[@aria-label='Unfollow @" + username + "' and .//svg]",
+            "//div[@role='button' and @aria-label='Unfollow @" + username + "' and .//svg]"
+        ]
+
+        # Combine the lists, giving priority to the "Following" state buttons
+        unfollow_button_xpath_candidates = following_state_button_xpaths + alternative_unfollow_button_xpaths
+
         unfollow_button = None
-        for xpath in unfollow_button_xpath:
+        for xpath in unfollow_button_xpath_candidates: # Use the new combined list
             try:
-                unfollow_button = WebDriverWait(driver, 3).until(
+                unfollow_button = WebDriverWait(driver, 2).until( # Slightly shorter timeout per attempt
                     EC.element_to_be_clickable((By.XPATH, xpath))
                 )
-                print(f"Found unfollow button using XPath: {xpath}")
-                break
+                print(f"Found a clickable 'currently following' or 'unfollow initiation' button using XPath: {xpath}")
+                break # Found a suitable button
             except:
-                continue
+                continue # Try next XPath
 
         if unfollow_button:
-            print(f"Found unfollow button for @{username}, clicking it")
-            await asyncio.sleep(random.uniform(1, 2))
+            print(f"Found initial 'following' or 'unfollow initiation' button for @{username}, clicking it...")
+            await asyncio.sleep(random.uniform(0.5, 1.5)) # Shorter sleep before click
             unfollow_button.click()
-            await asyncio.sleep(random.uniform(2, 3))
+            await asyncio.sleep(random.uniform(1.5, 2.5)) # Wait for popup/dropdown to appear
 
-            # Handle confirmation dialog - using multiple approaches
-            print("Looking for confirmation dialog")
+            # Handle confirmation dialog - trying different types
+            print("Looking for confirmation dialog or dropdown menu item...")
             confirmation_found = False
 
-            # Approach 1: Using data-testid
-            try:
-                confirm_button = WebDriverWait(driver, 3).until(
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, 'button[data-testid="confirmationSheetConfirm"]'))
-                )
-                if confirm_button:
-                    print("Found confirmation button by data-testid, clicking it")
-                    confirm_button.click()
-                    confirmation_found = True
-                    await asyncio.sleep(random.uniform(1, 2))
-            except Exception as e:
-                print(f"Could not find confirmation by data-testid: {e}")
+            # --- PRIORITY 1: Standard Confirmation Dialog (larger popup) ---
+            standard_dialog_xpaths = [
+                '//button[@data-testid="confirmationSheetConfirm"]',          # Most reliable for standard dialog
+                '//div[@role="dialog"]//span[text()="Unfollow"]/ancestor::button[1]', # Text-based in dialog
+                '//div[@role="dialog"]//button[1]' # Fallback: first button in any dialog (use with caution)
+            ]
+            # Less reliable / more specific XPaths for standard dialog (can be added if needed)
+            # xpath1 = '//*[@id="layers"]/div[2]/div/div/div/div/div/div[2]/div[2]/div[2]/button[1]'
+            # xpath2 = '/html/body/div[1]/div/div/div[1]/div[2]/div/div/div/div/div/div[2]/div[2]/div[2]/button[1]'
+            # css_selector = "#layers > div:nth-child(2) > div > div > div > div > div > div.css-175oi2r... > button:nth-child(1)"
 
-            # Approach 2: Using text content
-            if not confirmation_found:
-                try:
-                    unfollow_text_button = WebDriverWait(driver, 2).until(
-                        EC.element_to_be_clickable((By.XPATH, '//span[text()="Unfollow"]/ancestor::button'))
-                    )
-                    if unfollow_text_button:
-                        print("Found confirmation button by text 'Unfollow', clicking it")
-                        unfollow_text_button.click()
-                        confirmation_found = True
-                        await asyncio.sleep(random.uniform(1, 2))
-                except Exception as e2:
-                    print(f"Could not find confirmation by text: {e2}")
 
-            # Approach 3: Using the CSS selector you provided
-            if not confirmation_found:
+            for i, xpath in enumerate(standard_dialog_xpaths):
                 try:
-                    css_selector = "#layers > div:nth-child(2) > div > div > div > div > div > div.css-175oi2r.r-1ny4l3l.r-18u37iz.r-1pi2tsx.r-1777fci.r-1xcajam.r-ipm5af.r-1kihuf0.r-xr3zp9.r-1awozwy.r-1pjcn9w.r-9dcw1g > div.css-175oi2r.r-14lw9ot.r-pm9dpa.r-1rnoaur.r-1867qdf.r-z6ln5t.r-494qqr.r-f8sm7e.r-13qz1uu.r-1ye8kvj > div.css-175oi2r.r-eqz5dr.r-1hc659g.r-7lkd7n.r-11c0sde.r-13qz1uu > button:nth-child(1)"
-                    confirm_button = WebDriverWait(driver, 2).until(
-                        EC.element_to_be_clickable((By.CSS_SELECTOR, css_selector))
+                    confirm_button = WebDriverWait(driver, 1.5).until( # Short wait for each attempt
+                        EC.element_to_be_clickable((By.XPATH, xpath))
                     )
                     if confirm_button:
-                        print("Found confirmation button by complex CSS selector, clicking it")
+                        print(f"Found standard confirmation button (Attempt {i+1} with XPath: {xpath}), clicking it...")
                         confirm_button.click()
                         confirmation_found = True
-                        await asyncio.sleep(random.uniform(1, 2))
-                except Exception as e3:
-                    print(f"Could not find confirmation by CSS selector: {e3}")
+                        await asyncio.sleep(random.uniform(1, 2)) # Wait for action
+                        break # Exit loop once found and clicked
+                except Exception as e_std_dialog:
+                    # print(f"Debug: Standard dialog attempt {i+1} with '{xpath}' failed: {e_std_dialog}")
+                    pass # Continue to next XPath or next approach
 
-            # Approach 4: Using the XPath you provided
+            # --- PRIORITY 2: Dropdown Menu Confirmation (if standard dialog not found) ---
             if not confirmation_found:
+                print("Standard confirmation dialog not found, checking for dropdown menu item...")
                 try:
-                    xpath1 = '//*[@id="layers"]/div[2]/div/div/div/div/div/div[2]/div[2]/div[2]/button[1]'
-                    confirm_button = WebDriverWait(driver, 2).until(
-                        EC.element_to_be_clickable((By.XPATH, xpath1))
+                    # XPath based on your provided HTML for the dropdown item:
+                    # It looks for a div with role="menuitem" that contains a span with the exact text "Unfollow @username"
+                    # The username variable needs to be correctly substituted.
+                    dropdown_item_xpath = f'//div[@data-testid="Dropdown"]//div[@role="menuitem" and .//span[text()="Unfollow @{username}"]]'
+                    
+                    dropdown_confirm_button = WebDriverWait(driver, 3).until(
+                        EC.element_to_be_clickable((By.XPATH, dropdown_item_xpath))
                     )
-                    if confirm_button:
-                        print("Found confirmation button by XPath 1, clicking it")
-                        confirm_button.click()
+                    if dropdown_confirm_button:
+                        print(f"Found 'Unfollow @{username}' in dropdown menu, clicking it...")
+                        dropdown_confirm_button.click()
                         confirmation_found = True
-                        await asyncio.sleep(random.uniform(1, 2))
-                except Exception as e4:
-                    print(f"Could not find confirmation by XPath 1: {e4}")
-
-            # Approach 5: Using the full XPath you provided
-            if not confirmation_found:
-                try:
-                    xpath2 = '/html/body/div[1]/div/div/div[1]/div[2]/div/div/div/div/div/div[2]/div[2]/div[2]/button[1]'
-                    confirm_button = WebDriverWait(driver, 2).until(
-                        EC.element_to_be_clickable((By.XPATH, xpath2))
-                    )
-                    if confirm_button:
-                        print("Found confirmation button by XPath 2, clicking it")
-                        confirm_button.click()
-                        confirmation_found = True
-                        await asyncio.sleep(random.uniform(1, 2))
-                except Exception as e5:
-                    print(f"Could not find confirmation by XPath 2: {e5}")
-
-            # Approach 6: More general approach - first button in the dialog
-            if not confirmation_found:
-                try:
-                    general_button = WebDriverWait(driver, 2).until(
-                        EC.element_to_be_clickable((By.XPATH, '//div[@role="dialog"]//button[1]'))
-                    )
-                    if general_button:
-                        print("Found first button in dialog, clicking it")
-                        general_button.click()
-                        confirmation_found = True
-                        await asyncio.sleep(random.uniform(1, 2))
-                except Exception as e6:
-                    print(f"Could not find first button in dialog: {e6}")
+                        await asyncio.sleep(random.uniform(1, 2)) # Wait for action
+                except Exception as e_dropdown:
+                    print(f"Could not find or click 'Unfollow @{username}' in dropdown menu: {e_dropdown}")
 
             if not confirmation_found:
-                print("WARNING: Could not find any confirmation button")
+                print("WARNING: Could not find or click any confirmation button (standard dialog or dropdown). Unfollow might not have completed.")
+            else:
+                print("Confirmation step processed.")
 
-            print("Sending success message")
+            print("Sending success message") # This line was already there
             try:
                 await send_telegram_message(f"✅ Successfully unfollowed @{username}")
             except Exception as msg_err:
@@ -1829,8 +2019,8 @@ async def scrape_target_following(update: Update, target_username: str):
     target_username = target_username.strip().lstrip('@')
     if not re.match(r'^[A-Za-z0-9_]{1,15}$', target_username):
         logger.error(f"[DB Scrape Internal] Invalid target username received: {target_username}")
-        if update and hasattr(update, 'message') and update.message:
-             await update.message.reply_text(f"❌ Invalid target username: {target_username}")
+    if update and hasattr(update, 'message') and update.message:
+        await update.message.reply_text(f"❌ Invalid target username: {target_username}")
         return # End early
 
     # Check if a scrape is already running (important for standalone calls)
@@ -2236,13 +2426,13 @@ async def recover_followers_logic(update: Update):
         await resume_scraping() # Resume at the end of the task
 
 async def like_tweet(tweet_url):
-    """Like a tweet on X"""
+    """Like a post on X"""
     try:
-        print(f"Navigating to tweet URL: {tweet_url}")
+        print(f"Navigating to post URL: {tweet_url}")
         # Save current URL to return later
         current_url = driver.current_url
 
-        # Navigate to the tweet URL
+        # Navigate to the post URL
         driver.get(tweet_url)
         await asyncio.sleep(random.uniform(3, 5))
 
@@ -2346,13 +2536,13 @@ def save_current_account_follow_list():
         print(f"Could not save follow list for account @{account_username}: Path could not be created.")
 
 async def repost_tweet(tweet_url):
-    """Repost a tweet on X"""
+    """Repost a post on X"""
     try:
-        print(f"Navigating to tweet URL for repost: {tweet_url}")
+        print(f"Navigating to post URL for repost: {tweet_url}")
         # Save current URL to return later
         current_url = driver.current_url
 
-        # Navigate to the tweet URL
+        # Navigate to the post URL
         driver.get(tweet_url)
         await asyncio.sleep(random.uniform(3, 5))
 
@@ -2484,14 +2674,14 @@ async def repost_tweet(tweet_url):
         return False
 
 async def get_full_tweet_text(tweet_url):
-    """Navigates to a tweet URL, scrapes its full text content, and navigates back."""
+    """Navigates to a post URL, scrapes its full text content, and navigates back."""
     global driver
     try:
         print(f"Navigating to {tweet_url} to get full text...")
         driver.get(tweet_url)
         await asyncio.sleep(random.uniform(3, 6)) # Allow time for page load
 
-        # Wait for the main tweet text element to be present
+        # Wait for the main post text element to be present
         tweet_text_element = WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.XPATH, '//article[@data-testid="tweet"]//div[@data-testid="tweetText"]'))
         )
@@ -2519,7 +2709,7 @@ async def get_full_tweet_text(tweet_url):
         return full_text
 
     except (TimeoutException, NoSuchElementException, StaleElementReferenceException) as e:
-        print(f"Error finding tweet text element for {tweet_url}: {e}")
+        print(f"Error finding post text element for {tweet_url}: {e}")
         # --- Navigate back even on error ---
         print("Navigating back to home timeline after finding error in get_full_text...")
         try:
@@ -2562,30 +2752,98 @@ async def get_full_tweet_text(tweet_url):
 def load_schedule():
     """Load schedule settings from file"""
     global schedule_enabled, schedule_pause_start, schedule_pause_end
+    global schedule_sync_enabled, schedule_sync_start_time, schedule_sync_end_time, last_sync_schedule_run_date
+    global schedule_follow_list_enabled, schedule_follow_list_start_time, schedule_follow_list_end_time, last_follow_list_schedule_run_date
+
+    # Defaults are already set in global variables.
+    # These local defaults are for the data.get() calls if keys are missing.
+    # They should reflect the initial global defaults.
+    _default_schedule_enabled_local = False
+    _default_pause_start_local = "00:00"
+    _default_pause_end_local = "00:00"
+    _default_sync_enabled_local = False
+    _default_sync_start_time_local = "03:00" # Match global default
+    _default_sync_end_time_local = "03:30"   # Match global default
+    _default_follow_list_enabled_local = False
+    _default_follow_list_start_time_local = "04:00" # Match global default
+    _default_follow_list_end_time_local = "04:30"   # Match global default
+
     try:
         if os.path.exists(SCHEDULE_FILE):
             with open(SCHEDULE_FILE, 'r') as f:
                 data = json.load(f)
-                schedule_enabled = data.get("enabled", False)
-                schedule_pause_start = data.get("pause_start", "00:00")
-                schedule_pause_end = data.get("pause_end", "00:00")
-    except Exception as e:
-        print(f"Error loading schedule settings: {e}")
-        schedule_enabled = False
-        schedule_pause_start = "00:00"
-        schedule_pause_end = "00:00"
+                # Load values from file, using current global values as fallback if key is missing
+                # This ensures that if a key is removed from the file, the bot doesn't revert to hardcoded defaults here,
+                # but keeps its current (potentially user-set via command) global value.
+                schedule_enabled = data.get("enabled", schedule_enabled)
+                schedule_pause_start = data.get("pause_start", schedule_pause_start)
+                schedule_pause_end = data.get("pause_end", schedule_pause_end)
+
+                schedule_sync_enabled = data.get("schedule_sync_enabled", schedule_sync_enabled)
+                schedule_sync_start_time = data.get("schedule_sync_start_time", schedule_sync_start_time)
+                schedule_sync_end_time = data.get("schedule_sync_end_time", schedule_sync_end_time)
+                schedule_follow_list_enabled = data.get("schedule_follow_list_enabled", schedule_follow_list_enabled)
+                schedule_follow_list_start_time = data.get("schedule_follow_list_start_time", schedule_follow_list_start_time)
+                schedule_follow_list_end_time = data.get("schedule_follow_list_end_time", schedule_follow_list_end_time)
+                last_sync_date_str = data.get("last_sync_schedule_run_date")
+                if last_sync_date_str:
+                    try: last_sync_schedule_run_date = datetime.strptime(last_sync_date_str, "%Y-%m-%d").date()
+                    except ValueError: last_sync_schedule_run_date = None
+                else: last_sync_schedule_run_date = None
+
+                last_follow_date_str = data.get("last_follow_list_schedule_run_date")
+                if last_follow_date_str:
+                    try: last_follow_list_schedule_run_date = datetime.strptime(last_follow_date_str, "%Y-%m-%d").date()
+                    except ValueError: last_follow_list_schedule_run_date = None
+                else: last_follow_list_schedule_run_date = None
+            print("Schedule settings loaded.")
+            print(f"  DEBUG LOAD: schedule_sync_start_time='{schedule_sync_start_time}', schedule_sync_end_time='{schedule_sync_end_time}'")
+            print(f"  DEBUG LOAD: schedule_follow_list_start_time='{schedule_follow_list_start_time}', schedule_follow_list_end_time='{schedule_follow_list_end_time}'")
+        else:
+            print(f"No schedule file found ({SCHEDULE_FILE}), using initial default settings and creating the file.")
+            # Globals already hold their initial defaults. We just need to ensure last run dates are None.
+            last_sync_schedule_run_date = None
+            last_follow_list_schedule_run_date = None
+            save_schedule() # Create the file with current global (default) settings
+            print(f"  DEBUG LOAD (New File Created with Globals): schedule_sync_start_time='{schedule_sync_start_time}', schedule_sync_end_time='{schedule_sync_end_time}'")
+            print(f"  DEBUG LOAD (New File Created with Globals): schedule_follow_list_start_time='{schedule_follow_list_start_time}', schedule_follow_list_end_time='{schedule_follow_list_end_time}'")
+            last_sync_schedule_run_date = None
+            last_follow_list_schedule_run_date = None
+            save_schedule() # Create the file with default settings
+            print(f"  DEBUG LOAD (New File): schedule_sync_start_time='{schedule_sync_start_time}', schedule_sync_end_time='{schedule_sync_end_time}'")
+            print(f"  DEBUG LOAD (New File): schedule_follow_list_start_time='{schedule_follow_list_start_time}', schedule_follow_list_end_time='{schedule_follow_list_end_time}'")
+    except (json.JSONDecodeError, Exception) as e:
+        print(f"Error loading schedule settings: {e}. Using current global values (likely defaults) and attempting to create/update the file.")
+        # Globals retain their current values. We just need to ensure last run dates are None if file is corrupt.
+        last_sync_schedule_run_date = None
+        last_follow_list_schedule_run_date = None
+        save_schedule() # Attempt to create/update the file with current global values
+        print(f"  DEBUG LOAD (Exception, Saved Globals): schedule_sync_start_time='{schedule_sync_start_time}', schedule_sync_end_time='{schedule_sync_end_time}'")
+        print(f"  DEBUG LOAD (Exception, Saved Globals): schedule_follow_list_start_time='{schedule_follow_list_start_time}', schedule_follow_list_end_time='{schedule_follow_list_end_time}'")
 
 def save_schedule():
     """Save schedule settings to file"""
     global schedule_enabled, schedule_pause_start, schedule_pause_end
+    global schedule_sync_enabled, schedule_sync_start_time, schedule_sync_end_time, last_sync_schedule_run_date
+    global schedule_follow_list_enabled, schedule_follow_list_start_time, schedule_follow_list_end_time, last_follow_list_schedule_run_date
     try:
         data = {
             "enabled": schedule_enabled,
             "pause_start": schedule_pause_start,
-            "pause_end": schedule_pause_end
+            "pause_end": schedule_pause_end,
+
+            "schedule_sync_enabled": schedule_sync_enabled,
+            "schedule_sync_start_time": schedule_sync_start_time,
+            "schedule_sync_end_time": schedule_sync_end_time,
+            "last_sync_schedule_run_date": last_sync_schedule_run_date.strftime("%Y-%m-%d") if last_sync_schedule_run_date else None,
+
+            "schedule_follow_list_enabled": schedule_follow_list_enabled,
+            "schedule_follow_list_start_time": schedule_follow_list_start_time,
+            "schedule_follow_list_end_time": schedule_follow_list_end_time,
+            "last_follow_list_schedule_run_date": last_follow_list_schedule_run_date.strftime("%Y-%m-%d") if last_follow_list_schedule_run_date else None,
         }
         with open(SCHEDULE_FILE, 'w') as f:
-            json.dump(data, f)
+            json.dump(data, f, indent=4) # Added indent for readability
     except Exception as e:
         print(f"Error saving schedule settings: {e}")
 
@@ -2604,12 +2862,12 @@ def check_schedule():
         return False
 
     try:
-        try:
-            local_tz = ZoneInfo("Europe/Berlin")
-        except Exception:
-            print("WARNING: Could not load timezone 'Europe/Berlin', using fallback.")
-            local_tz = ZoneInfo(None) # Uses the fallback
-
+        # Use the globally configured timezone
+        local_tz = USER_CONFIGURED_TIMEZONE
+        if local_tz is None: # Should not happen
+            print("CRITICAL ERROR: USER_CONFIGURED_TIMEZONE is None in check_schedule. Defaulting to UTC.")
+            local_tz = timezone.utc
+        
         now_local = datetime.now(local_tz)
         today_local = now_local.date()
 
@@ -2653,7 +2911,7 @@ def check_schedule():
 
 # New functions for Pause/Resume
 async def pause_scraping():
-    """Pauses tweet scraping"""
+    """Pauses post scraping"""
     global is_scraping_paused, driver
     is_scraping_paused = True
     pause_event.clear()
@@ -2671,7 +2929,7 @@ async def pause_scraping():
     save_settings() # Save the new pause status
 
 async def resume_scraping():
-    """Resumes tweet scraping"""
+    """Resumes post scraping"""
     global is_scraping_paused
     is_scraping_paused = False
     pause_event.set()
@@ -2879,58 +3137,68 @@ async def add_from_db_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     criteria_count = 0 # Counts how many criteria were specified
 
     # --- Parse arguments ---
-    current_keyword = None
-    keyword_args = []
+    current_keyword_parsing_mode = None # To handle multi-word keyword values
     if context.args:
         for arg in context.args:
             arg_lower = arg.lower()
-            if arg_lower.startswith("followers:"):
+
+            # Check for followers (short 'f:' or long 'followers:')
+            if arg_lower.startswith("followers:") or arg_lower.startswith("f:"):
                 try:
-                    # --- CORRECTED: Use the new parsing function ---
-                    follower_str = arg.split(":", 1)[1]
-                    if not follower_str: # Check if there's anything after ":"
-                        raise IndexError("Empty value after followers:")
-
-                    min_followers = parse_follower_count(follower_str)
-                    # parse_follower_count returns 0 on error, which is treated as a valid minimum value.
-                    # An explicit check for < 0 is no longer necessary.
-
+                    key_name = "followers" if arg_lower.startswith("followers:") else "f"
+                    value_str = arg.split(":", 1)[1]
+                    if not value_str:
+                        await update.message.reply_text(f"❌ Missing value for '{key_name}:'.")
+                        return
+                    min_followers = parse_follower_count(value_str)
                     criteria_count += 1
-                    current_keyword = None # End keyword collection
-                except IndexError:
-                    await update.message.reply_text(f"❌ Missing value for 'followers:'.")
+                    current_keyword_parsing_mode = None # Reset keyword mode
+                except IndexError: # Should be caught by "not value_str"
+                    await update.message.reply_text(f"❌ Missing value for '{key_name}:'.")
                     return
-                # ValueError is now handled internally by parse_follower_count.
-            elif arg_lower.startswith("seen:"):
+                # parse_follower_count handles internal errors and returns 0
+
+            # Check for seen (short 's:' or long 'seen:')
+            elif arg_lower.startswith("seen:") or arg_lower.startswith("s:"):
                 try:
-                    min_seen = int(arg.split(":", 1)[1])
-                    if min_seen < 1: raise ValueError("Seen must be >= 1")
+                    key_name = "seen" if arg_lower.startswith("seen:") else "s"
+                    value_str = arg.split(":", 1)[1]
+                    if not value_str:
+                        await update.message.reply_text(f"❌ Missing value for '{key_name}:'.")
+                        return
+                    min_seen = int(value_str)
+                    if min_seen < 1:
+                        await update.message.reply_text(f"❌ Value for '{key_name}:' must be >= 1.")
+                        return
                     criteria_count += 1
-                    current_keyword = None # End keyword collection
+                    current_keyword_parsing_mode = None # Reset keyword mode
                 except (ValueError, IndexError):
-                    await update.message.reply_text(f"❌ Invalid value for 'seen:'. Please provide a number >= 1.")
+                    await update.message.reply_text(f"❌ Invalid value for '{key_name}:'. Please provide a number >= 1.")
                     return
-            elif arg_lower.startswith("keywords:"):
-                criteria_count += 1
-                current_keyword = "keywords" # Mark that we expect keywords
-                # --- CORRECTED: Process keywords directly ---
-                value_part = arg.split(":", 1)[1] # Get everything after 'keywords:'
-                # Split by comma OR space, remove empty entries
-                found_kws = [kw.strip() for kw in re.split(r'[,\s]+', value_part) if kw.strip()]
-                if found_kws:
-                    keywords.extend(found_kws) # Add the found keywords directly
-                else:
-                    # If nothing or only spaces/commas follow 'keywords:'
-                    pass # Wait for subsequent arguments
-            elif current_keyword == "keywords":
-                # --- CORRECTED: Treat subsequent arguments as individual keywords ---
-                # Also split by comma/space here, in case multiple are in one arg
+
+            # Check for keywords (short 'k:' or long 'keywords:')
+            elif arg_lower.startswith("keywords:") or arg_lower.startswith("k:"):
+                try:
+                    value_part = arg.split(":", 1)[1]
+                    # Split by comma OR space, remove empty entries
+                    found_kws = [kw.strip() for kw in re.split(r'[,\s]+', value_part) if kw.strip()]
+                    if found_kws:
+                        keywords.extend(found_kws)
+                        criteria_count += 1 # Count criteria only if keywords are actually provided
+                    current_keyword_parsing_mode = "keywords" # Enter keyword mode for subsequent args
+                except IndexError: # No value after 'keywords:' or 'k:'
+                    current_keyword_parsing_mode = "keywords" # Still enter mode, expect keywords in next arg
+
+            elif current_keyword_parsing_mode == "keywords":
+                # Subsequent arguments are treated as keywords if in keyword mode
                 found_kws = [kw.strip() for kw in re.split(r'[,\s]+', arg) if kw.strip()]
-                keywords.extend(found_kws)
-                # Stay in keyword mode in case more arguments follow
+                if found_kws:
+                    keywords.extend(found_kws)
+                    if criteria_count == 0 or not keywords: # Ensure criteria_count is incremented if this is the first time keywords are added
+                        criteria_count +=1
+                # Stay in keyword mode for more keywords unless a new criterion starts
             else:
-                # Argument doesn't belong to a known key
-                await update.message.reply_text(f"❓ Unknown argument or missing key: '{arg}'.\nUse `followers:`, `seen:`, or `keywords:`.")
+                await update.message.reply_text(f"❓ Unknown argument or missing key: '{arg}'.\nUse `followers:`(or `f:`), `seen:`(or `s:`), or `keywords:`(or `k:`).")
                 return
 
     # --- CORRECTED: Final cleanup of keywords ---
@@ -3059,6 +3327,10 @@ async def cancel_db_scrape_command(update: Update, context: ContextTypes.DEFAULT
 async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle callback queries with improved logging and robustness."""
     global current_account_usernames_to_follow
+    global search_keywords_enabled, search_ca_enabled, search_tickers_enabled # Add these here
+    global schedule_enabled, schedule_sync_enabled, schedule_follow_list_enabled # For other toggles
+    global is_headless_enabled # For headless toggle
+    global auto_follow_mode, auto_follow_interval_minutes # For autofollow mode buttons
     query = update.callback_query
     # === 1. Answer IMMEDIATELY ===
     try:
@@ -3103,8 +3375,8 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                 return
 
             # --- Process actions ---
+            # Admin check is already done by handle_callback_query
             if action == "create_backup": # Offered only in the "No Backup" case
-                # Admin check not needed for backup creation itself
                 await query.edit_message_text("✅ Backup for the current account is starting in the background...")
                 # Create an emulated update instance for backup_followers_logic
                 emulated_update_for_backup = type('obj', (object,), {'message': query.message})
@@ -3112,14 +3384,6 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                 logger.info("Follower backup task started via sync callback (create_backup option).")
 
             elif action == "proceed": # This is the case "Backup missing/empty, user wants to add"
-                # +++ Admin Check HERE +++
-                if not is_user_admin(query.from_user.id):
-                    logger.warning(f"User {query.from_user.id} tried to proceed sync (no backup) without admin rights.")
-                    await query.answer("❌ Access denied (Admin required).", show_alert=True)
-                    try: await query.edit_message_text("❌ Action cancelled (No admin rights).")
-                    except: pass
-                    return # Abort
-                # --- End Admin Check ---
                 await query.edit_message_text(f"✅ Sync (add only) for @{current_active_username} is starting in the background...")
                 backup_filepath = get_current_backup_file_path()
                 # Load the global list fresh before the task starts
@@ -3130,14 +3394,6 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                 logger.info("Follower sync task started via sync callback (proceed - no backup case).")
 
             elif action == "proceed_sync": # This is the case "Backup exists, user confirms sync"
-                # +++ Admin Check HERE +++
-                if not is_user_admin(query.from_user.id):
-                    logger.warning(f"User {query.from_user.id} tried to proceed sync (normal) without admin rights.")
-                    await query.answer("❌ Access denied (Admin required).", show_alert=True)
-                    try: await query.edit_message_text("❌ Action cancelled (No admin rights).")
-                    except: pass
-                    return # Abort
-                # --- End Admin Check ---
                 await query.edit_message_text(f"✅ Sync for @{current_active_username} is starting in the background...")
                 backup_filepath = get_current_backup_file_path()
                 # Load the global list fresh before the task starts
@@ -3162,14 +3418,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         # ===== CLEAR FOLLOW LIST CALLBACKS =====
         elif action_type == "confirm_clear_follow_list":
              logger.info("Processing confirm_clear_follow_list callback.")
-              # +++ Admin Check HERE +++
-             if not is_user_admin(query.from_user.id):
-                 logger.warning(f"User {query.from_user.id} tried to confirm clear list without admin rights.")
-                 await query.answer("❌ Access denied (Admin required).", show_alert=True)
-                 try: await query.edit_message_text("❌ Action cancelled (No admin rights).")
-                 except: pass
-                 return # Abort
-             # --- End Admin Check ---
+             # Admin check is already done by handle_callback_query
 
              if len(parts) < 2:
                   logger.warning("Invalid clear_follow_list callback format.")
@@ -3232,8 +3481,8 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             if len(parts) < 2:
                  logger.warning("Invalid help callback format.")
                  await query.edit_message_text("❌ Invalid help callback format.")
-                 return
-            payload = parts[1] # Payload is defined HERE
+                 return # No resume here, this is a quick action
+            payload = parts[1] 
             logger.info(f"Processing help payload: {payload}")
 
             # --- Tasks ---
@@ -3241,44 +3490,127 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                  await query.message.reply_text("✅ Follower backup is starting in the background...")
                  asyncio.create_task(backup_followers_logic(emulated_update))
                  logger.info("Follower backup task started via help callback.")
-                 return # Task runs, no resume here
-            elif payload == "sync_follows":
+                 return 
+            elif payload == "sync_follows": # This is for MANUAL sync
                  await query.message.reply_text("✅ Starting check for follower synchronization...")
-                 await sync_followers_command(emulated_update, None)
+                 await sync_followers_command(emulated_update, None) # context is None
                  logger.info("sync_followers_command called via help callback.")
-                 return # sync_followers_command manages resume/task
+                 return 
 
-            # --- Direct Command Calls (manage their own pause/resume) ---
-            elif payload in ["pause", "resume", "mode_full", "mode_ca", "stats", "ping", "keywords", "account", "schedule_on", "schedule_off", "schedule", "mode", "help", "show_rates", "build_global", "global_info", "status", "autofollow_status", "cancel_fast_follow", "autofollow_mode_off", "autofollow_mode_slow", "autofollow_mode_fast"]:
-                 logger.debug(f"Calling command handler for help payload: {payload}")
-                 if payload == "pause": await pause_command(emulated_update, None)
-                 elif payload == "resume": await resume_command(emulated_update, None)
-                 elif payload == "mode_full": await mode_full_command(emulated_update, None)
-                 elif payload == "mode_ca": await mode_ca_command(emulated_update, None)
-                 elif payload == "stats": await stats_command(emulated_update, None)
-                 elif payload == "ping": await ping_command(emulated_update, None)
-                 elif payload == "keywords": await keywords_command(emulated_update, None)
-                 elif payload == "account": await account_command(emulated_update, None)
-                 elif payload == "schedule_on": await schedule_on_command(emulated_update, None)
-                 elif payload == "schedule_off": await schedule_off_command(emulated_update, None)
-                 elif payload == "schedule": await schedule_command(emulated_update, None)
-                 elif payload == "mode": await mode_command(emulated_update, None)
-                 elif payload == "help": await help_command(emulated_update, None)
-                 elif payload == "show_rates": await show_ratings_command(emulated_update, None)
-                 elif payload == "build_global": await build_global_from_backups_command(emulated_update, None) # Call for button
-                 elif payload == "status": await status_command(emulated_update, None)
-                 elif payload == "autofollow_status": await autofollow_status_command(emulated_update, None)
-                 elif payload == "cancel_fast_follow": await cancel_fast_follow_command(emulated_update, None)
-                 elif payload == "autofollow_mode_off":
-                     mock_context = type('obj', (object,), {'args': ["off"]})
-                     await autofollow_mode_command(emulated_update, mock_context)
-                 elif payload == "autofollow_mode_slow":
-                     mock_context = type('obj', (object,), {'args': ["slow"]})
-                     await autofollow_mode_command(emulated_update, mock_context)
-                 elif payload == "autofollow_mode_fast":
-                     mock_context = type('obj', (object,), {'args': ["fast"]})
-                     await autofollow_mode_command(emulated_update, mock_context)
-                 return # The called commands handle resume
+            # --- NEUER HANDLER: Toggle Pause/Resume ---
+            elif payload == "toggle_pause_resume":
+                logger.info("Processing toggle_pause_resume help payload.")
+                if is_scraping_paused:
+                    await resume_command(emulated_update, None)
+                else:
+                    await pause_command(emulated_update, None)
+                try: 
+                    original_markup = query.message.reply_markup
+                    if original_markup:
+                        new_keyboard = []
+                        for row in original_markup.inline_keyboard:
+                            new_row = []
+                            for button in row:
+                                if button.callback_data == "help:toggle_pause_resume":
+                                    new_button_text = ("RUNNING 🟢" if not is_scraping_paused else
+                                                       ("SCHEDULE PAUSED 🟡" if is_schedule_pause else
+                                                        "PAUSED 🟡"))
+                                    new_row.append(InlineKeyboardButton(new_button_text, callback_data="help:toggle_pause_resume"))
+                                else: new_row.append(button)
+                            new_keyboard.append(new_row)
+                        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_keyboard))
+                except Exception as e: logger.error(f"Error updating pause/resume button: {e}")
+                return
+
+            # --- NEUER HANDLER: Toggle Main Schedule ---
+            elif payload == "toggle_main_schedule":
+                logger.info("Processing toggle_main_schedule help payload.")
+                if schedule_enabled:
+                    await schedule_off_command(emulated_update, None)
+                else:
+                    await schedule_on_command(emulated_update, None)
+                try: 
+                    original_markup = query.message.reply_markup
+                    if original_markup:
+                        new_keyboard = []
+                        for row in original_markup.inline_keyboard:
+                            new_row = []
+                            for button in row:
+                                if button.callback_data == "help:toggle_main_schedule":
+                                    new_button_text = f"⏰ Main Sched. {'🟢' if schedule_enabled else '🔴'}"
+                                    new_row.append(InlineKeyboardButton(new_button_text, callback_data="help:toggle_main_schedule"))
+                                else: new_row.append(button)
+                            new_keyboard.append(new_row)
+                        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_keyboard))
+                except Exception as e: logger.error(f"Error updating main schedule button: {e}")
+                return
+
+            # # --- ANGEPASSTER HANDLER: Mode Full ---
+            # elif payload == "mode_full":
+            #     logger.info("Processing mode_full help payload.")
+            #     await mode_full_command(emulated_update, None) 
+            #     try: 
+            #         original_markup = query.message.reply_markup
+            #         if original_markup:
+            #             new_keyboard = []
+            #             for row in original_markup.inline_keyboard:
+            #                 new_row = []
+            #                 for button_in_row in row:
+            #                     if button_in_row.callback_data == "help:mode_full":
+            #                         new_row.append(InlineKeyboardButton(f"🔍 FULL {'🟢' if search_mode == 'full' else '⚪'}", callback_data="help:mode_full"))
+            #                     elif button_in_row.callback_data == "help:mode_ca": 
+            #                         new_row.append(InlineKeyboardButton(f"🔍 CA {'🟢' if search_mode == 'ca_only' else '⚪'}", callback_data="help:mode_ca"))
+            #                     else: new_row.append(button_in_row)
+            #                 new_keyboard.append(new_row)
+            #             await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_keyboard))
+            #     except Exception as e: logger.error(f"Error updating mode buttons after mode_full: {e}")
+            #     return
+
+            # # --- ANGEPASSTER HANDLER: Mode CA ---
+            # elif payload == "mode_ca":
+            #     logger.info("Processing mode_ca help payload.")
+            #     await mode_ca_command(emulated_update, None) 
+            #     try: 
+            #         original_markup = query.message.reply_markup
+            #         if original_markup:
+            #             new_keyboard = []
+            #             for row in original_markup.inline_keyboard:
+            #                 new_row = []
+            #                 for button_in_row in row:
+            #                     if button_in_row.callback_data == "help:mode_ca":
+            #                         new_row.append(InlineKeyboardButton(f"🔍 CA {'🟢' if search_mode == 'ca_only' else '⚪'}", callback_data="help:mode_ca"))
+            #                     elif button_in_row.callback_data == "help:mode_full": 
+            #                         new_row.append(InlineKeyboardButton(f"🔍 FULL {'🟢' if search_mode == 'full' else '⚪'}", callback_data="help:mode_full"))
+            #                     else: new_row.append(button_in_row)
+            #                 new_keyboard.append(new_row)
+            #             await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_keyboard))
+            #     except Exception as e: logger.error(f"Error updating mode buttons after mode_ca: {e}")
+            #     return
+            
+            # --- Andere direkte Befehlsaufrufe (stelle sicher, dass jeder mit 'return' endet) ---
+            elif payload == "stats": await stats_command(emulated_update, None); return
+            elif payload == "ping": await ping_command(emulated_update, None); return
+            elif payload == "keywords": await keywords_command(emulated_update, None); return
+            elif payload == "account": await account_command(emulated_update, None); return
+            elif payload == "schedule": await schedule_command(emulated_update, None); return
+            elif payload == "mode": await mode_command(emulated_update, None); return
+            elif payload == "help": await help_command(emulated_update, None); return
+            elif payload == "show_rates": await show_ratings_command(emulated_update, None); return
+            elif payload == "build_global": await build_global_from_backups_command(emulated_update, None); return
+            elif payload == "status": await status_command(emulated_update, None); return
+            elif payload == "autofollow_status": await autofollow_status_command(emulated_update, None); return
+            elif payload == "cancel_fast_follow": await cancel_fast_follow_command(emulated_update, None); return
+            elif payload == "autofollow_mode_off":
+                mock_context = type('obj', (object,), {'args': ["off"]})
+                await autofollow_mode_command(emulated_update, mock_context); return
+            elif payload == "autofollow_mode_slow":
+                mock_context = type('obj', (object,), {'args': ["slow"]})
+                await autofollow_mode_command(emulated_update, mock_context); return
+            elif payload == "autofollow_mode_fast":
+                mock_context = type('obj', (object,), {'args': ["fast"]})
+                await autofollow_mode_command(emulated_update, mock_context); return
+            elif payload == "show_all_schedules": 
+                await show_detailed_schedules_command(emulated_update, None); return
 
             # --- "Prepare" Payloads (send only text) ---
             elif payload == "prepare_addusers":
@@ -3303,72 +3635,154 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                  await resume_scraping(); return
             elif payload == "prepare_like":
                  logger.info("Processing prepare_like help payload.")
-                 await query.message.reply_text("Copy and add the tweet URL:\n\n`/like `", parse_mode=ParseMode.MARKDOWN)
+                 await query.message.reply_text("Copy and add the post URL:\n\n`/like `", parse_mode=ParseMode.MARKDOWN)
                  await resume_scraping(); return
             elif payload == "prepare_repost":
                  logger.info("Processing prepare_repost help payload.")
-                 await query.message.reply_text("Copy and add the tweet URL:\n\n`/repost `", parse_mode=ParseMode.MARKDOWN)
+                 await query.message.reply_text("Copy and add the post URL:\n\n`/repost `", parse_mode=ParseMode.MARKDOWN)
                  await resume_scraping(); return
             elif payload == "prepare_switchaccount":
                  logger.info("Processing prepare_switchaccount help payload.")
                  await query.message.reply_text("Copy and add the account number:\n\n`/switchaccount `", parse_mode=ParseMode.MARKDOWN)
                  await resume_scraping(); return
-            elif payload == "prepare_scheduletime":
+            elif payload == "prepare_scheduletime": 
                  logger.info("Processing prepare_scheduletime help payload.")
                  await query.message.reply_text("Copy and add the time range (HH:MM-HH:MM):\n\n`/scheduletime `", parse_mode=ParseMode.MARKDOWN)
                  await resume_scraping(); return
-            elif payload == "set_schedule": # Formerly show_schedule_set_command
+            elif payload == "prepare_schedule_sync_time": 
+                 logger.info("Processing prepare_schedule_sync_time help payload.")
+                 await query.message.reply_text(f"Copy and add time window (HH:MM-HH:MM) for Scheduled Sync:\n\n`/schedulesynctime {schedule_sync_start_time}-{schedule_sync_end_time}`", parse_mode=ParseMode.MARKDOWN)
+                 await resume_scraping(); return
+            elif payload == "prepare_schedule_follow_list_time": 
+                 logger.info("Processing prepare_schedule_follow_list_time help payload.")
+                 await query.message.reply_text(f"Copy and add time window (HH:MM-HH:MM) for Scheduled Follow List:\n\n`/schedulefollowlisttime {schedule_follow_list_start_time}-{schedule_follow_list_end_time}`", parse_mode=ParseMode.MARKDOWN)
+                 await resume_scraping(); return
+            elif payload == "set_schedule": # Alias, behalten für Abwärtskompatibilität falls Buttons noch existieren
                  logger.info("Processing set_schedule help payload (now prepare_scheduletime).")
                  await query.message.reply_text("Copy and add the time range (HH:MM-HH:MM):\n\n`/scheduletime `", parse_mode=ParseMode.MARKDOWN)
                  await resume_scraping(); return
             elif payload == "prepare_autofollow_interval":
                  logger.info("Processing prepare_autofollow_interval help payload.")
-                 # Show the current interval in the prepared command
                  current_interval = f"{auto_follow_interval_minutes[0]}-{auto_follow_interval_minutes[1]}"
                  await query.message.reply_text(f"Copy, change Min/Max (minutes):\n\n`/autofollowinterval {current_interval}`", parse_mode=ParseMode.MARKDOWN)
-                 await resume_scraping()
-                 return
+                 await resume_scraping(); return
 
-            elif payload == "cancel_action":
-                 logger.info("Processing cancel_action.")
-                 try:
-                     # Use query.edit_message_text to edit the button's message
-                     await query.edit_message_text("✅ Action cancelled.")
-                 except telegram.error.BadRequest as e:
-                     # Catch error if the message cannot be edited
-                     # (e.g., because it's too old or already removed)
-                     if "message to edit not found" in str(e).lower() or "message can't be edited" in str(e).lower():
-                         logger.warning(f"Could not edit message on cancel_action (likely old): {e}")
-                         # Optional: Send a new message as confirmation if editing fails
-                         # await query.message.reply_text("Action cancelled.")
-                     else:
-                         # Log other BadRequests
-                         logger.error(f"BadRequest editing message on cancel_action: {e}", exc_info=True)
-                 except Exception as e:
-                     # Log other unexpected errors
-                     logger.error(f"Error editing message on cancel_action: {e}", exc_info=True)
+            # --- Bestehende Toggle Payloads ---
+            elif payload == "toggle_schedule_sync": 
+                global schedule_sync_enabled
+                schedule_sync_enabled = not schedule_sync_enabled
+                save_schedule()
+                status_text = "ENABLED 🟢" if schedule_sync_enabled else "DISABLED 🔴"
+                logger.info(f"Scheduled Sync toggled to {status_text} via help button by user {query.from_user.id}")
+                await query.answer(f"Scheduled Sync: {status_text}")
+                try:
+                    original_markup = query.message.reply_markup
+                    if original_markup:
+                        new_keyboard = []
+                        for row in original_markup.inline_keyboard:
+                            new_row = []
+                            for button in row:
+                                if button.callback_data == "help:toggle_schedule_sync":
+                                    new_button_text = f"🔄 Sched. Sync {'🟢' if schedule_sync_enabled else '🔴'}"
+                                    new_row.append(InlineKeyboardButton(new_button_text, callback_data="help:toggle_schedule_sync"))
+                                else: new_row.append(button)
+                            new_keyboard.append(new_row)
+                        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_keyboard))
+                except Exception as e: logger.error(f"Error updating help button for Sched. Sync: {e}")
+                return 
 
-                 # Resume scraping even if editing the message fails
-                 await resume_scraping() # Resume after cancellation
-                 return
+            elif payload == "toggle_schedule_follow_list": 
+                global schedule_follow_list_enabled
+                schedule_follow_list_enabled = not schedule_follow_list_enabled
+                save_schedule()
+                status_text = "ENABLED 🟢" if schedule_follow_list_enabled else "DISABLED 🔴"
+                logger.info(f"Scheduled Follow List toggled to {status_text} via help button by user {query.from_user.id}")
+                await query.answer(f"Scheduled Follow List: {status_text}")
+                try:
+                    original_markup = query.message.reply_markup
+                    if original_markup:
+                        new_keyboard = []
+                        for row in original_markup.inline_keyboard:
+                            new_row = []
+                            for button in row:
+                                if button.callback_data == "help:toggle_schedule_follow_list":
+                                    new_button_text = f"🚶‍♂️‍➡️ Sched. Follow {'🟢' if schedule_follow_list_enabled else '🔴'}"
+                                    new_row.append(InlineKeyboardButton(new_button_text, callback_data="help:toggle_schedule_follow_list"))
+                                else: new_row.append(button)
+                            new_keyboard.append(new_row)
+                        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_keyboard))
+                except Exception as e: logger.error(f"Error updating help button for Sched. Follow: {e}")
+                return 
+
+            elif payload == "toggle_keywords":
+                # global search_keywords_enabled # REMOVE THIS LINE
+                logger.info("Processing toggle_keywords help payload.")
+                search_keywords_enabled = not search_keywords_enabled
+                save_settings()
+                status_text = "ENABLED 🟢" if search_keywords_enabled else "DISABLED 🔴"
+                logger.info(f"Keyword search toggled to {status_text} via help button by user {query.from_user.id}")
+                try:
+                    original_markup = query.message.reply_markup
+                    if original_markup:
+                        new_keyboard = []
+                        for row in original_markup.inline_keyboard:
+                            new_row = []
+                            for button in row:
+                                if button.callback_data == "help:toggle_keywords":
+                                    new_button_text = f"🔑 Keywords {'🟢' if search_keywords_enabled else '🔴'}"
+                                    new_row.append(InlineKeyboardButton(new_button_text, callback_data="help:toggle_keywords"))
+                                elif button.callback_data == "help:toggle_ca": # Keep other buttons in row updated
+                                    new_button_text = f"📝 CA {'🟢' if search_ca_enabled else '🔴'}"
+                                    new_row.append(InlineKeyboardButton(new_button_text, callback_data="help:toggle_ca"))
+                                elif button.callback_data == "help:toggle_tickers": # Keep other buttons in row updated
+                                    new_button_text = f"💲 Ticker {'🟢' if search_tickers_enabled else '🔴'}"
+                                    new_row.append(InlineKeyboardButton(new_button_text, callback_data="help:toggle_tickers"))
+                                else:
+                                    new_row.append(button)
+                            new_keyboard.append(new_row)
+                        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_keyboard))
+                except Exception as e: logger.error(f"Error updating help button for keyword toggle: {e}")
+                await query.answer(f"Keyword search: {status_text}")
+                return
+
+            elif payload == "toggle_ca":
+                # global search_ca_enabled # REMOVE THIS LINE
+                logger.info("Processing toggle_ca help payload.")
+                search_ca_enabled = not search_ca_enabled
+                save_settings()
+                status_text = "ENABLED 🟢" if search_ca_enabled else "DISABLED 🔴"
+                logger.info(f"CA search toggled to {status_text} via help button by user {query.from_user.id}")
+                try:
+                    original_markup = query.message.reply_markup
+                    if original_markup:
+                        new_keyboard = []
+                        for row in original_markup.inline_keyboard:
+                            new_row = []
+                            for button in row:
+                                if button.callback_data == "help:toggle_ca":
+                                    new_button_text = f"📝 CA {'🟢' if search_ca_enabled else '🔴'}"
+                                    new_row.append(InlineKeyboardButton(new_button_text, callback_data="help:toggle_ca"))
+                                elif button.callback_data == "help:toggle_keywords": # Keep other buttons in row updated
+                                    new_button_text = f"🔑 Keywords {'🟢' if search_keywords_enabled else '🔴'}"
+                                    new_row.append(InlineKeyboardButton(new_button_text, callback_data="help:toggle_keywords"))
+                                elif button.callback_data == "help:toggle_tickers": # Keep other buttons in row updated
+                                    new_button_text = f"💲 Ticker {'🟢' if search_tickers_enabled else '🔴'}"
+                                    new_row.append(InlineKeyboardButton(new_button_text, callback_data="help:toggle_tickers"))
+                                else:
+                                    new_row.append(button)
+                            new_keyboard.append(new_row)
+                        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_keyboard))
+                except Exception as e: logger.error(f"Error updating help button for CA toggle: {e}")
+                await query.answer(f"CA search: {status_text}")
+                return
 
             elif payload == "toggle_tickers":
                 logger.info("Processing toggle_tickers help payload.")
-                # --- Admin Check HERE ---
-                if not is_user_admin(query.from_user.id):
-                    logger.warning(f"User {query.from_user.id} tried to toggle tickers without admin rights.")
-                    await query.answer("❌ Access denied (Admin required).", show_alert=True)
-                    # No resume needed as help command itself resumes
-                    return # Abort
-                # --- End Admin Check ---
-
-                global search_tickers_enabled
+                #global search_tickers_enabled
                 search_tickers_enabled = not search_tickers_enabled
                 save_settings()
                 status_text = "ENABLED 🟢" if search_tickers_enabled else "DISABLED 🔴"
                 logger.info(f"Ticker search toggled to {status_text} via help button by user {query.from_user.id}")
-
-                # --- Update the button in the original help message ---
                 try:
                     original_markup = query.message.reply_markup
                     if original_markup:
@@ -3377,48 +3791,22 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                             new_row = []
                             for button in row:
                                 if button.callback_data == "help:toggle_tickers":
-                                    # Update the text of this specific button
-                                    new_button_text = f"🔎 Ticker {'🟢' if search_tickers_enabled else '🔴'}"
+                                    new_button_text = f"💲 Ticker {'🟢' if search_tickers_enabled else '🔴'}" # Emoji geändert
                                     new_row.append(InlineKeyboardButton(new_button_text, callback_data="help:toggle_tickers"))
-                                else:
-                                    new_row.append(button) # Keep other buttons
+                                else: new_row.append(button) 
                             new_keyboard.append(new_row)
                         await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_keyboard))
-                        await query.answer(f"Ticker search: {status_text}") # Give feedback via answer
-                    else:
-                        # Fallback if markup couldn't be read
-                        await query.message.reply_text(f"✅ Ticker search is now {status_text}")
-
-                except telegram.error.BadRequest as e:
-                     if "message is not modified" in str(e).lower():
-                         await query.answer(f"Ticker search: {status_text}") # Still give feedback
-                     else:
-                         logger.error(f"BadRequest editing help message for ticker toggle: {e}", exc_info=True)
-                         await query.message.reply_text(f"✅ Ticker search is now {status_text} (could not update button).")
-                except Exception as e:
-                    logger.error(f"Error updating help message button for ticker toggle: {e}", exc_info=True)
-                    await query.message.reply_text(f"✅ Ticker search is now {status_text} (could not update button).")
-
-                # No resume_scraping here, the help command handler resumes
+                except Exception as e: logger.error(f"Error updating help button for ticker toggle: {e}")
+                await query.answer(f"Ticker search: {status_text}") 
                 return
-
 
             elif payload == "toggle_headless":
                 logger.info("Processing toggle_headless help payload.")
-                # --- Admin Check HERE ---
-                if not is_user_admin(query.from_user.id):
-                    logger.warning(f"User {query.from_user.id} tried to toggle headless without admin rights.")
-                    await query.answer("❌ Access denied (Admin required).", show_alert=True)
-                    return # Abort
-                # --- End Admin Check ---
-
                 global is_headless_enabled
                 is_headless_enabled = not is_headless_enabled
                 save_settings()
                 status_text = "ENABLED 🟢" if is_headless_enabled else "DISABLED 🔴"
                 logger.info(f"Headless mode toggled to {status_text} via help button by user {query.from_user.id}")
-
-                # --- Update the button in the original help message ---
                 try:
                     original_markup = query.message.reply_markup
                     if original_markup:
@@ -3427,44 +3815,27 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                             new_row = []
                             for button in row:
                                 if button.callback_data == "help:toggle_headless":
-                                    # Update the text of this specific button
                                     new_button_text = f"👻 Headless {'🟢' if is_headless_enabled else '🔴'}"
                                     new_row.append(InlineKeyboardButton(new_button_text, callback_data="help:toggle_headless"))
-                                else:
-                                    new_row.append(button) # Keep other buttons
+                                else: new_row.append(button)
                             new_keyboard.append(new_row)
                         await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_keyboard))
-                        await query.answer(f"Headless mode: {status_text}") # Give feedback via answer
-                    else:
-                        # Fallback if markup couldn't be read
-                        await query.message.reply_text(f"✅ Headless mode is now {status_text}")
-
-                except telegram.error.BadRequest as e:
-                     if "message is not modified" in str(e).lower():
-                         await query.answer(f"Headless mode: {status_text}") # Still give feedback
-                     else:
-                         logger.error(f"BadRequest editing help message for headless toggle: {e}", exc_info=True)
-                         await query.message.reply_text(f"✅ Headless mode is now {status_text} (could not update button).")
-                except Exception as e:
-                    logger.error(f"Error updating help message button for headless toggle: {e}", exc_info=True)
-                    await query.message.reply_text(f"✅ Headless mode is now {status_text} (could not update button).")
-
-                # Inform user about driver restart
+                except Exception as e: logger.error(f"Error updating help button for headless toggle: {e}")
+                await query.answer(f"Headless mode: {status_text}") 
                 await query.message.reply_text(f"✅ Headless mode is now {status_text}. Restarting WebDriver...")
-                logger.info(f"Headless mode toggled to {status_text} by user {query.from_user.id} via button. Triggering driver restart.")
-
-                # Call the restart helper function (pass the query object)
                 await restart_driver_and_login(query)
-
-                # No resume_scraping needed here, the helper function handles it.
-                # The help command handler also resumes, but the helper ensures it happens.
                 return
+
+            elif payload == "cancel_action":
+                 logger.info("Processing cancel_action.")
+                 try: await query.edit_message_text("✅ Action cancelled.")
+                 except Exception as e: logger.error(f"Error editing message on cancel_action: {e}", exc_info=True)
+                 await resume_scraping(); return
 
             else:
                  logger.warning(f"Unknown help payload received: {payload}")
                  await query.message.reply_text(f"❌ Unknown help action: {payload}")
-                 await resume_scraping() # Resume on unknown action
-                 return
+                 await resume_scraping(); return
             # --- End Help Payloads ---
 
         # ===== LIKE/REPOST CALLBACKS (Queueing with full markup info) =====
@@ -3476,7 +3847,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                   return
 
              tweet_id = parts[1]
-             action_description = f"{action_type} for Tweet {tweet_id}"
+             action_description = f"{action_type} for post {tweet_id}"
              logger.info(f"Queueing action: {action_description}")
 
              # --- Immediate Feedback (change only the clicked button) ---
@@ -3849,7 +4220,7 @@ async def follow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "`/follow `"
             , parse_mode=ParseMode.MARKDOWN
         )
-    # await resume_scraping() # Resume is now handled after the check or at the end
+        await resume_scraping() # Resume before returning due to invalid arguments
         return
     # --- END CHANGE ---
 
@@ -3860,26 +4231,7 @@ async def follow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-    # --- Headless Mode Check ---
-    global is_headless_enabled
-    if is_headless_enabled:
-        logger.warning(f"User {update.message.from_user.id} attempted /follow @{username} while in headless mode.")
-        keyboard = [[
-            InlineKeyboardButton("✅ Yes, disable Headless & Restart", callback_data=f"headless_follow:yes:{username}"),
-            InlineKeyboardButton("❌ No, cancel Follow", callback_data=f"headless_follow:no:{username}")
-        ]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(
-            f"⚠️ **Headless Mode Active** ⚠️\n\n"
-            f"Following users might not work reliably in headless mode.\n\n"
-            f"Do you want to disable headless mode now?\n"
-            f"(This requires a **bot restart**. You will need to run `/follow @{username}` again after the restart.)",
-            reply_markup=reply_markup
-        )
-        # Do NOT resume scraping here, wait for button callback or timeout.
-        # Do NOT proceed with the follow logic below.
-        return
-    # --- End Headless Mode Check ---
+
 
     # --- Logic moved from process_follow_request here ---
     global global_followed_users_set
@@ -3914,7 +4266,7 @@ async def follow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Error message is now sent by follow_user()
         print(f"Manual follow failed: @{username}")
     # --- End Logic ---
-    await resume_scraping() # Resume scraping if the headless check didn't trigger
+    await resume_scraping() # Resume scraping at the end of the command
 
 async def unfollow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Unfollows a user, removes them from the global list and current backup."""
@@ -3995,12 +4347,12 @@ async def unfollow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Like / Repost ---
 async def like_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Likes a tweet via URL (Handler for /like)."""
+    """Likes a post via URL (Handler for /like)."""
     await pause_scraping()
     # --- CHANGED: Argument count and URL validation ---
     if not context.args or len(context.args) != 1:
         await update.message.reply_text(
-            "ℹ️ Please provide exactly ONE tweet URL after the command.\n\n"
+            "ℹ️ Please provide exactly ONE post URL after the command.\n\n"
             "Format: `/like <tweet_url>`\n\n"
             "Copy this and add the URL:\n"
             "`/like `"
@@ -4016,18 +4368,18 @@ async def like_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parsed_url = urlparse(input_url)
         # Check scheme and domain
         if not parsed_url.scheme in ['http', 'https'] or not (parsed_url.netloc.endswith('x.com') or parsed_url.netloc.endswith('twitter.com')):
-            raise ValueError("Not a valid X/Twitter domain")
-        # Check if the path looks like a tweet (optional, but recommended)
+            raise ValueError("Not a valid X domain")
+        # Check if the path looks like a post (optional, but recommended)
         # Example: /<username>/status/<id>
         if not re.match(r'^/[A-Za-z0-9_]+/status/\d+$', parsed_url.path):
              # Also allow /i/status/<id>
              if not re.match(r'^/i/status/\d+$', parsed_url.path):
-                  raise ValueError("URL does not seem to be a tweet link")
+                  raise ValueError("URL does not seem to be a post link")
         # Reconstruct the URL for consistency (optional)
         tweet_url = parsed_url.geturl()
 
     except ValueError as e:
-        await update.message.reply_text(f"❌ Invalid or unsupported URL: {e}.\nPlease provide a complete X.com/Twitter.com tweet URL.")
+        await update.message.reply_text(f"❌ Invalid or unsupported URL: {e}.\nPlease provide a complete X.com post URL.")
         await resume_scraping()
         return
     except Exception as e: # Other parsing errors
@@ -4040,7 +4392,7 @@ async def like_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🔍 Trying to like tweet: {tweet_url}")
     try:
         result = await like_tweet(tweet_url)
-        if result: await update.message.reply_text(f"✅ Tweet successfully liked!")
+        if result: await update.message.reply_text(f"✅ post successfully liked!")
         else: await update.message.reply_text(f"❌ Could not like tweet")
     except Exception as e:
         await update.message.reply_text(f"❌ Error liking: {str(e)[:100]}")
@@ -4048,12 +4400,12 @@ async def like_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await resume_scraping()
 
 async def repost_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reposts a tweet via URL (Handler for /repost)."""
+    """Reposts a post via URL (Handler for /repost)."""
     await pause_scraping()
     # --- CHANGED: Argument count and URL validation ---
     if not context.args or len(context.args) != 1:
         await update.message.reply_text(
-            "ℹ️ Please provide exactly ONE tweet URL after the command.\n\n"
+            "ℹ️ Please provide exactly ONE post URL after the command.\n\n"
             "Format: `/repost <tweet_url>`\n\n"
             "Copy this and add the URL:\n"
             "`/repost `"
@@ -4073,11 +4425,11 @@ async def repost_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Check if the path looks like a tweet
         if not re.match(r'^/[A-Za-z0-9_]+/status/\d+$', parsed_url.path):
              if not re.match(r'^/i/status/\d+$', parsed_url.path):
-                  raise ValueError("URL does not seem to be a tweet link")
+                  raise ValueError("URL does not seem to be a post link")
         tweet_url = parsed_url.geturl()
 
     except ValueError as e:
-        await update.message.reply_text(f"❌ Invalid or unsupported URL: {e}.\nPlease provide a complete X.com/Twitter.com tweet URL.")
+        await update.message.reply_text(f"❌ Invalid or unsupported URL: {e}.\nPlease provide a complete X.com post URL.")
         await resume_scraping()
         return
     except Exception as e: # Other parsing errors
@@ -4090,7 +4442,7 @@ async def repost_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🔍 Trying to repost tweet: {tweet_url}")
     try:
         result = await repost_tweet(tweet_url)
-        if result: await update.message.reply_text(f"✅ Tweet successfully reposted!")
+        if result: await update.message.reply_text(f"✅ post successfully reposted!")
         else: await update.message.reply_text(f"❌ Could not repost tweet")
     except Exception as e:
         await update.message.reply_text(f"❌ Error reposting: {str(e)[:100]}")
@@ -4106,7 +4458,7 @@ async def account_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Displays the help message (Handler for /help)."""
-    await pause_scraping()
+    # await pause_scraping() # REMOVED - show_help_message handles its own needs
     # The show_help_message function needs to be adapted to show the new syntax
     await show_help_message(update) # show_help_message handles resume itself
 
@@ -4123,14 +4475,18 @@ async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Displays a comprehensive operational status of the bot."""
-
-    # --- Gather information ---
+    # --- Global declarations must be at the very top of the function scope ---
     global is_scraping_paused, is_schedule_pause, search_mode, schedule_enabled, \
            schedule_pause_start, schedule_pause_end, is_periodic_follow_active, \
            current_account, ACCOUNTS, global_followed_users_set, \
            current_account_usernames_to_follow, GLOBAL_FOLLOWED_FILE, \
            auto_follow_mode, auto_follow_interval_minutes, is_fast_follow_running, \
-           search_tickers_enabled, is_headless_enabled # Added ticker search global
+           search_tickers_enabled, is_headless_enabled, USER_TIMEZONE_STR # Added USER_TIMEZONE_STR
+
+    # --- Store initial state AFTER global declarations ---
+    initial_pause_state = is_scraping_paused 
+
+    # --- Gather information ---
 
 
     # 1. Running status
@@ -4142,9 +4498,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 2. Current account
     current_username = get_current_account_username() or "N/A"
     account_info = f"Acc {current_account+1} (@{current_username})"
-
-    # 3. Search mode
-    mode_text = "Full (CA + Keywords)" if search_mode == "full" else "CA ONLY"
 
     # 4. Schedule
     schedule_status = "🟢" if schedule_enabled else "🔴"
@@ -4202,6 +4555,11 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Info line for the list
     current_list_info = f"{current_list_count} Users in {current_list_filename}"
 
+    # 7. New Schedules Status
+    sync_sched_disp = f"Sync: {'🟢 ON' if schedule_sync_enabled else '🔴 OFF'} at {schedule_sync_start_time}-{schedule_sync_end_time}"
+    fl_sched_disp = f"FollowList: {'🟢 ON' if schedule_follow_list_enabled else '🔴 OFF'} at {schedule_follow_list_start_time}-{schedule_follow_list_end_time}"
+    new_schedules_info = f"{sync_sched_disp}\n   └ {fl_sched_disp}"
+
     # --- Build message ---
     ticker_status_text = "ENABLED 🟢" if search_tickers_enabled else "DISABLED 🔴"
     headless_status_text = "ENABLED 🟢" if is_headless_enabled else "DISABLED 🔴"
@@ -4209,12 +4567,14 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 **Bot Overall Status** 📊\n\n"
         f"{'▶️' if not is_scraping_paused else ('⏸️⏰' if is_schedule_pause else '⏸️🟡')} **Operation:** {running_status}\n"
         f"🥷 **Active Account:** {account_info}\n"
-        f"🔍 **Search Mode:** {mode_text}\n"
-        f"💲 **Ticker Search:** {ticker_status_text}\n" # New line for Ticker status
-        f"⏰ **Schedule:** {schedule_details}\n"
+        f"🔑 **Keyword 🔎:** {'ENABLED 🟢' if search_keywords_enabled else 'DISABLED 🔴'}\n"
+        f"📝 **CA 🔎:** {'ENABLED 🟢' if search_ca_enabled else 'DISABLED 🔴'}\n"
+        f"💲 **Ticker 🔎:** {ticker_status_text}\n"
+        f"⏰ **Main Schedule:** {schedule_details}\n"
         f"👻 **Headless Mode:** {headless_status_text}\n" 
         f"🌍 **Global Follow List:** {global_list_info}\n"
         f"🤖 **Auto-Follow (Curr. Acc):** {autofollow_stat}\n"
+        f"🗓️ **Other Schedules:**\n   └ {new_schedules_info}\n" 
         f"📝 **Follow List (Curr. Acc):** {current_list_info}\n"
         f"{current_list_preview}"
     )
@@ -4228,7 +4588,7 @@ async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Displays the current search mode (Handler for /mode)."""
     await pause_scraping()
     global search_mode
-    mode_text = "CA + Keywords" if search_mode == "full" else "CA Only"
+    mode_text = "Keywords" if search_mode == "full" else "CA Only"
     await update.message.reply_text(f"🔍 Search mode: {mode_text}")
     await resume_scraping()
 
@@ -4239,9 +4599,9 @@ async def mode_full_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if search_mode != "full": # Only save if something changes
         search_mode = "full"
         save_settings() # Save the setting
-        await update.message.reply_text("✅ Search mode set to CA + Keywords")
+        await update.message.reply_text("✅ Search mode set to Keywords")
     else:
-        await update.message.reply_text("ℹ️ Search mode is already CA + Keywords.")
+        await update.message.reply_text("ℹ️ Search mode is already Keywords.")
     await resume_scraping()
 
 async def mode_ca_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4358,7 +4718,16 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
 
     # Auth code handling remains the main task here
     if WAITING_FOR_AUTH:
-        logger.debug(f"[Telegram Handler] Checking if message '{message_text}' matches 2FA format (Length: {len(message_text)}, Alnum: {message_text.isalnum()})...")
+        # +++ ADMIN CHECK FOR 2FA +++
+        if not is_user_admin(user_id):
+            logger.warning(f"[Telegram Handler] Non-admin user {user_id} attempted to send 2FA code ('{message_text}'). Ignoring.")
+            await update.message.reply_text("❌ Access denied. Only admins can provide 2FA codes.")
+            # Do NOT set AUTH_CODE, do NOT proceed with 2FA logic for this user.
+            return # Stop processing this message further
+        # +++ END ADMIN CHECK FOR 2FA +++
+
+        # Now that we know it's an admin, proceed with format check
+        logger.debug(f"[Telegram Handler] Admin {user_id} sent message '{message_text}'. Checking if it matches 2FA format (Length: {len(message_text)}, Alnum: {message_text.isalnum()})...")
         if 6 <= len(message_text) <= 10 and message_text.isalnum():
             logger.info(f"[Telegram Handler] Message matches 2FA format. Setting AUTH_CODE.") # Log match
             AUTH_CODE = message_text
@@ -4410,21 +4779,29 @@ def load_posts_count():
                 loaded_counts_data = data.get("counts", {})
 
                 # Important: Merge the loaded data with the default structure
-                posts_count = default_counts.copy()
-                for category, values in loaded_counts_data.items():
-                    if category in posts_count:
-                        if isinstance(values, dict):
-                             # Updates for 'found', 'scanned', 'weekdays'
-                             for key, value in values.items():
-                                 # Translate old key 'vorgestern' to 'day_before_yesterday' if necessary
-                                 target_key = "day_before_yesterday" if key == "vorgestern" else key
-                                 if target_key in posts_count[category]:
-                                     posts_count[category][target_key] = value
-                        elif category == "ads_total": # Specifically for ads_total
-                            posts_count["ads_total"] = values if isinstance(values, int) else 0
-                    else:
-                        # Add new category (shouldn't happen, but safe is safe)
-                        posts_count[category] = values
+                posts_count = default_counts.copy() # Start with a fresh default structure
+
+                # Iterate over categories found in the loaded data
+                for category_loaded, values_loaded in loaded_counts_data.items():
+                    if category_loaded in posts_count: # If category exists in our default structure
+                        if isinstance(values_loaded, dict): # For 'found', 'scanned', 'weekdays'
+                            if category_loaded in ["found", "scanned"]:
+                                for key_loaded, value_loaded in values_loaded.items():
+                                    # Translate old key 'vorgestern'
+                                    target_key = "day_before_yesterday" if key_loaded == "vorgestern" else key_loaded
+                                    # Ensure the target_key is valid for the category in default_counts
+                                    if target_key in posts_count[category_loaded]:
+                                        posts_count[category_loaded][target_key] = value_loaded
+                                    # else: print(f"Warning: Skipped unknown key '{key_loaded}' (->'{target_key}') in category '{category_loaded}' during count load.")
+                            elif category_loaded == "weekdays":
+                                # For weekdays, directly update if the day exists
+                                for day_loaded, day_data_loaded in values_loaded.items():
+                                    if day_loaded in posts_count["weekdays"]:
+                                        posts_count["weekdays"][day_loaded] = day_data_loaded
+                                    # else: print(f"Warning: Skipped unknown weekday '{day_loaded}' during count load.")
+                        elif category_loaded == "ads_total":
+                            posts_count["ads_total"] = values_loaded if isinstance(values_loaded, int) else 0
+                    # else: print(f"Warning: Skipped unknown category '{category_loaded}' during count load.")
 
                 # Ensure ads_total exists, even if it was missing in the file
                 if "ads_total" not in posts_count:
@@ -4442,16 +4819,19 @@ def load_posts_count():
         else:
             posts_count = default_counts.copy()
             last_count_date = datetime.now().date()
-            print(f"No {POSTS_COUNT_FILE} found, using default counters.")
+            print(f"No {POSTS_COUNT_FILE} found, using default counters and creating the file.")
+            save_posts_count() # Create the file with default counts
 
     except json.JSONDecodeError:
-         print(f"ERROR: {POSTS_COUNT_FILE} is corrupt (JSONDecodeError). Using default counters.")
+         print(f"ERROR: {POSTS_COUNT_FILE} is corrupt (JSONDecodeError). Using default counters and creating a new file.")
          posts_count = default_counts.copy()
          last_count_date = datetime.now().date()
+         save_posts_count() # Create a new file with default counts
     except Exception as e:
-        print(f"Error loading {POSTS_COUNT_FILE}: {e}")
+        print(f"Error loading {POSTS_COUNT_FILE}: {e}. Using default counters and attempting to create the file.")
         posts_count = default_counts.copy()
         last_count_date = datetime.now().date()
+        save_posts_count() # Attempt to create the file with default counts
 
     # Double check that ads_total exists
     if "ads_total" not in posts_count:
@@ -4620,28 +5000,40 @@ async def show_help_message(update: Update):
     separator_button = InlineKeyboardButton(" ", callback_data="noop_separator")
     global search_tickers_enabled, is_headless_enabled # Need both for button text
     keyboard = [
-        # ... (Keyboard definition remains unchanged) ...
-         [
-            InlineKeyboardButton("⏸️ Pause", callback_data="help:pause"),
-            InlineKeyboardButton("▶️ Resume", callback_data="help:resume")
+        [ # Combined Pause/Resume Button - Shows current status
+            InlineKeyboardButton(
+                ("RUNNING 🟢" if not is_scraping_paused else 
+                 ("SCHEDULE PAUSED 🟡" if is_schedule_pause else 
+                  "PAUSED 🟡")),
+                callback_data="help:toggle_pause_resume"
+            )
         ],
         [
             InlineKeyboardButton("📊 Status", callback_data="help:status")
         ],
         [
-            #InlineKeyboardButton("🔍 Show Mode", callback_data="help:mode"),
-            InlineKeyboardButton("🔍 FULL", callback_data="help:mode_full"),
-            InlineKeyboardButton("🔍 CA", callback_data="help:mode_ca"),
-            InlineKeyboardButton(f"🔍 Ticker {'🟢' if search_tickers_enabled else '🔴'}", callback_data="help:toggle_tickers")
+            InlineKeyboardButton(f"🔑 Words {'🟢' if search_keywords_enabled else '🔴'}", callback_data="help:toggle_keywords"),
+            InlineKeyboardButton(f"📝 CA {'🟢' if search_ca_enabled else '🔴'}", callback_data="help:toggle_ca"),
+            InlineKeyboardButton(f"💲 Ticker {'🟢' if search_tickers_enabled else '🔴'}", callback_data="help:toggle_tickers")
         ],
         [separator_button],
-        [
-            InlineKeyboardButton("⏰ Schedule", callback_data="help:schedule"),
-            InlineKeyboardButton("⏰ Set Time", callback_data="help:prepare_scheduletime")
+        [ # All Schedules Status
+            InlineKeyboardButton("🗓️ All Schedules", callback_data="help:show_all_schedules")
         ],
-        [
-            InlineKeyboardButton("⏰ Schedule ON", callback_data="help:schedule_on"),
-            InlineKeyboardButton("⏰ Schedule OFF", callback_data="help:schedule_off")
+        [ # Main Schedule Control
+            InlineKeyboardButton(
+                f"⏰ Main Sched. {'🟢' if schedule_enabled else '🔴'}", # Toggle On/Off
+                callback_data="help:toggle_main_schedule"
+            ),
+            InlineKeyboardButton("⏰ Set Main Time", callback_data="help:prepare_scheduletime") # Keep Set Time
+        ],
+        [ # Scheduled Sync
+            InlineKeyboardButton(f"🔄 Sched. Sync {'🟢' if schedule_sync_enabled else '🔴'}", callback_data="help:toggle_schedule_sync"),
+            InlineKeyboardButton("🔄 Set Sync Time (fast)", callback_data="help:prepare_schedule_sync_time")
+        ],
+        [ # Scheduled Follow List
+            InlineKeyboardButton(f"🚶‍♂️‍➡️ Sched. Follow {'🟢' if schedule_follow_list_enabled else '🔴'}", callback_data="help:toggle_schedule_follow_list"),
+            InlineKeyboardButton("🚶‍♂️‍➡️ Set Follow Time (fast)", callback_data="help:prepare_schedule_follow_list_time")
         ],
         [separator_button],
         [ # Mode & Account
@@ -4661,7 +5053,7 @@ async def show_help_message(update: Update):
              InlineKeyboardButton("🚶‍♂️‍➡️➕ Add2List", callback_data="help:prepare_addusers")
         ],
         [separator_button],
-        [ # Auto-Follow Control (NEW)
+        [ # Auto-Follow Control
             InlineKeyboardButton("AF Mode OFF", callback_data="help:autofollow_mode_off"),
             InlineKeyboardButton("AF Mode SLOW", callback_data="help:autofollow_mode_slow"),
             InlineKeyboardButton("AF Mode FAST", callback_data="help:autofollow_mode_fast")
@@ -4672,21 +5064,16 @@ async def show_help_message(update: Update):
             InlineKeyboardButton("AF Cancel FAST", callback_data="help:cancel_fast_follow")
         ],
         [separator_button],
-        [ # Like / Repost
-             InlineKeyboardButton("👍 Like", callback_data="help:prepare_like"),
-             InlineKeyboardButton("🔄 Repost", callback_data="help:prepare_repost")
-        ],
-        [separator_button],
         [ # Backup / Sync / Build
             InlineKeyboardButton("💾 Backup", callback_data="help:backup_followers"),
-            InlineKeyboardButton("🔄 Sync", callback_data="help:sync_follows"),
-            InlineKeyboardButton("🏗️ Build Global", callback_data="help:build_global") # New command also needs button
+            InlineKeyboardButton("🔄 Sync", callback_data="help:sync_follows"), # This is manual sync
+            InlineKeyboardButton("🏗️ Build Global", callback_data="help:build_global")
         ],
         [separator_button],
         [ # Stats / Rates
             InlineKeyboardButton("📊 Stats", callback_data="help:stats"),
             InlineKeyboardButton("⭐️ Rates", callback_data="help:show_rates"),
-            InlineKeyboardButton("🌍 Global Info", callback_data="help:global_info"), # New command also needs button
+            InlineKeyboardButton("🌍 Global Info", callback_data="help:global_info"),
             InlineKeyboardButton("🏓 Ping", callback_data="help:ping")
         ],
         [separator_button],
@@ -4696,66 +5083,79 @@ async def show_help_message(update: Update):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
+
+    global current_account, max_tweet_age_minutes, schedule_pause_start, schedule_pause_end, auto_follow_interval_minutes,schedule_sync_start_time, schedule_sync_end_time, schedule_follow_list_start_time, schedule_follow_list_end_time
+
+    next_account_display_val = (current_account + 1) % len(ACCOUNTS) + 1 if ACCOUNTS and len(ACCOUNTS) > 0 else 1
+
     await update.message.reply_text(
-        "🔺 🆘 `/help` - Show menu 🆘\n"
+        "🆘 `/help` - Show menu 🆘\n"
         " \n"
-        "🔸 🚶‍♂️‍➡️    Follow / Unfollow    🚶‍♂️\n"
-        "   /follow <username>  - Follows a user\n"
-        "   /unfollow <username>  - Unfollows a user\n"
-        "   /addusers <@user1 user2 ...>  - \n"
-        "         └ Adds users to the follow list.\n"
-        "   /autofollowmode <off|slow|fast> - Sets Auto-Follow mode\n"
-        "   /autofollowinterval <min>-<max> - Sets interval (Slow Mode)\n"
-        "   /autofollowstatus  - Shows Auto-Follow status\n"
-        "   /cancelfastfollow - Cancels running Fast-Follow\n"
-        "   /autofollowstatus  - Shows status and list length\n"
-        "   /clearfollowlist  - Clears the follow list\n"
+        "🚶‍♂️‍➡️    Follow / Unfollow    🚶‍♂️\n"
+        "   <code>/follow username</code>\n"
+        "   <code>/unfollow username</code>\n"
+        "   <code>/addusers @user1</code> user2 ...  - \n"
+        "      └ Adds to follow list.\n"
+        "   <code>/autofollowmode off</code> slow fast\n"
+        f"   <code>/autofollowinterval {auto_follow_interval_minutes[0]}-{auto_follow_interval_minutes[1]}</code> - interval (Slow Mode)\n"
+        "   /cancelfastfollow\n"
+        "   /autofollowstatus\n"
+        "   /clearfollowlist\n"
         "  \n"
-        "🔻 👍    Like / Repost    🔄\n"
-        "   /like <tweet_url>  - Likes a tweet\n"
-        "   /repost <tweet_url>  - Reposts a tweet\n"
+        "👍    Like / Repost    🔄\n"
+        "   <code>/like tweet_url</code>\n"
+        "   <code>/repost tweet_url</code>\n"
         "  \n"
-        "▫️ 🔑    Keywords    🔑\n"
-        "   /keywords  - Shows the keyword list\n"
-        "   /addkeyword <word1,word2...>  - Adds keywords\n"
-        "   /removekeyword <word1,word2...>  - Removes keywords\n"
+        "🔑    Keywords    🔑\n"
+        "   /keywords  - Shows list\n"
+        "   <code>/addkeyword word1</code>,word2...\n"
+        "   <code>/removekeyword word1</code>,word2...\n"
         "  \n"
-        "🔸 🥷    Accounts    🥷\n"
-        "   /account  - Shows the active account\n"
-        "   /switchaccount [number] \n" # Square brackets are OK
-        "         └ Switches to account [number]\n" 
+        "🥷    Accounts    🥷\n"
+        "   /account  - Show active account\n"
+        f"   <code>/switchaccount {next_account_display_val}</code> \n"
+        "      └ Switches to acc [nmbr]\n"
         "  \n"
-        "🔺 🔍    Search Mode    🔍\n"
-        "   /mode  - Shows the current search mode\n"
+        "🔍    Search Mode    🔍\n"
+        "   /mode  - current search mode\n"
         "   /modefull  - Sets mode to CA + Keywords\n"
         "   /modeca  - Sets mode to CA Only\n"
         "   /searchtickers\n"
-        "         └ Toggles searching for $Tickers ON/OFF\n" 
-        "   /setmaxage <minutes>\n"
-        "         └ Sets max post age (default: 15)\n"
+        "      └ scan for $Tickers on|off\n"
+        f"   <code>/setmaxage {max_tweet_age_minutes}</code>\n"
+        "      └ Sets max post age(min) (default: 15)\n"
         "  \n"
-        "🔹 ⏯️    Control    ⏯️\n"
-        "   /pause  - Pauses post searching ⏸️\n"
-        "   /resume  - Resumes searching ▶️\n"
+        "⏯️    Control    ⏯️\n"
+        "   /pause\n"
+        "   /resume\n"
         "  \n"
-        "🔸 ⏰    Schedule    ⏰\n"
-        "   /schedule  - Shows the current schedule\n"
-        "   /scheduleon  - Activates the schedule\n"
-        "   /scheduleoff  - Deactivates the schedule\n"
-        "   /scheduletime <HH:MM-HH:MM>  - Sets the pause time\n" 
+        "🗓️    All Schedules    🗓️\n"
+        "   /allschedules - Shows status of all schedules\n\n"
+        "   ▫️ Main Bot Pause Schedule:\n"
+        "     /schedule  - current main schedule\n"
+        "     /scheduleon | /scheduleoff\n"
+        f"     <code>/scheduletime {schedule_pause_start}-{schedule_pause_end}</code>\n\n"
+        "   ▫️ Scheduled Sync:\n"
+        "     /schedulesync on|off\n"
+        f"     <code>/schedulesynctime {schedule_sync_start_time}-{schedule_sync_end_time}</code>\n\n"        "   ▫️ Scheduled Follow List:\n"
+        "     /schedulefollowlist on|off\n"
+        f"     <code>/schedulefollowlisttime {schedule_follow_list_start_time}-{schedule_follow_list_end_time}</code>\n"
+        "  \n"        "  \n"
+        "📊    Statistics & Status    📊\n"
+        "   /status\n\n"
+        "   /stats\n"
+        "   /rates  - collected ratings\n"
+        "   /globallistinfo  - global follower list\n"
+        "   /ping  - test\n"
         "  \n"
-        "▫️ 📊    Statistics & Status    📊\n"
-        "   /status  - Shows the current operational status 📊\n\n"
-        "   /stats  or  /count  - Shows post statistics 📈\n"
-        "   /rates  - Shows the collected source ratings ⭐️\n"
-        "   /globallistinfo  - Shows status of the global follower list 🌍\n"
-        "   /ping  - Checks if the bot is responding 🏓\n"
-        "  \n"
-        "🔸 💾  Following DB & Management  💾\n"
-        "   /scrapefollowing <username>\n"
-        "         └ Scans following of <username> & saves to DB\n"
-        "   /addfromdb [f:NUM] [s:NUM] [k:WORD..]\n"
-        "         └ Adds users from DB (Filter: f=followers, s=seen, k=keywords)\n"
+        "💾  Following DB & Management  💾\n"
+        "   <code>/scrapefollowing username</code>\n"
+        "         └ Scans following of [username] & saves to DB\n"
+        "   <code>/addfromdb </code> f:50k s:3 k:WORD1 WORD2..\n"
+        "         └ Adds from DB. Filters:\n"
+        "           f[ollowers]: Min. follower count (e.g., `f:10k` or `followers:10000`)\n"
+        "           s[een]: Min. times seen in scans (e.g., `s:3`)\n"
+        "           k[eywords]: Keywords in bio (e.g., `k:btc eth` or `keywords:solana nft`)\n"
         "   /backupfollowers  - Saves snapshot of the active account\n"
         "   /syncfollows  - Synchronizes active account with global list\n"
         "   /buildglobalfrombackups \n"
@@ -4765,10 +5165,11 @@ async def show_help_message(update: Update):
         "  \n"
         "   /toggleheadless \n"
         "         └ Toggles Headless mode ON/OFF (Restart required!)\n",
-        reply_markup=reply_markup
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.HTML # Wichtig, damit <code> funktioniert
     )
     # Important: This function must call resume at the end, as the calling handler paused
-    await resume_scraping()
+    # await resume_scraping()
 
 async def add_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Adds usernames to the current account's list, checks against global followed list."""
@@ -5145,23 +5546,46 @@ async def sync_followers_logic(update: Update, account_username: str, backup_fil
     # Access global variables/flags
     global driver, is_scraping_paused, pause_event
     global is_sync_running, cancel_sync_flag
-    # Access global set (only read here, not modified)
-    global global_followed_users_set
+    global global_followed_users_set # Access global set (only read here, not modified)
+    global is_any_scheduled_browser_task_running # New global flag
 
-    if is_sync_running:
-        await update.message.reply_text("⚠️ A sync process is already running.")
+    # Determine if this is a scheduled run (update is None)
+    is_scheduled_run = update is None
+
+    # Prevent starting if another scheduled browser task is running (only for scheduled runs)
+    if is_scheduled_run and is_any_scheduled_browser_task_running:
+        logger.warning(f"[Sync @{account_username}] Scheduled run skipped: another scheduled browser task is active.")
+        # Silently skip for scheduler, or send a message if manually triggered with update=None (less likely)
         return
 
+    if is_sync_running: # Check if this specific sync task type is already running
+        if update and hasattr(update, 'message') and update.message: # Manual trigger
+            await update.message.reply_text("⚠️ A sync process (manual or scheduled) is already running.")
+        else: # Scheduled trigger, but another sync (maybe manual) is already on
+            logger.warning(f"[Sync @{account_username}] Attempted to start scheduled sync, but another sync is already running.")
+        return
+
+    main_loop_was_initially_paused = is_scraping_paused
+
     # ===== Task Start Marker =====
+    # Set specific flag first
     is_sync_running = True
-    cancel_sync_flag = False
+    cancel_sync_flag = False # Reset for this run
+    # Then set the general flag if this is a scheduled run that uses the browser
+    if is_scheduled_run:
+        is_any_scheduled_browser_task_running = True
     # ================================
 
     logger.info(f"[Sync @{account_username}] Starting synchronization process...")
-    await update.message.reply_text(f"⏳ Starting sync for @{account_username}...\n"
-                                     f"   To cancel: `/cancelsync`")
+    # Send message only if manually triggered (update object exists)
+    if update and hasattr(update, 'message') and update.message:
+        await update.message.reply_text(f"⏳ Starting sync for @{account_username}...\n"
+                                         f"   To cancel: `/cancelsync`")
+    # else: # If called by scheduler, a message is already sent by the run() loop
 
-    await pause_scraping() # Pause main scraping for the duration of the sync
+    # Pause main scraping only if it was running
+    if not main_loop_was_initially_paused:
+        await pause_scraping()
 
     # --- Initialize counters ---
     users_followed_in_sync = 0
@@ -5199,10 +5623,18 @@ async def sync_followers_logic(update: Update, account_username: str, backup_fil
         logger.info(f"[Sync @{account_username}] Global (passed): {len(global_set_for_sync)} | Backup (Start): {initial_backup_size} | To Add: {total_to_add} | To Remove: {total_to_remove}")
 
         if not users_to_add and not users_to_remove:
-            await update.message.reply_text(f"✅ Account @{account_username} is already synchronized.")
+            msg_sync_already_done = f"✅ Account @{account_username} is already synchronized."
+            if update and hasattr(update, 'message') and update.message:
+                await update.message.reply_text(msg_sync_already_done)
+            else:
+                await send_telegram_message(msg_sync_already_done)
             # Jump directly to finally
         else:
-            await update.message.reply_text(f"⏳ Synchronizing @{account_username}: +{total_to_add} Users / -{total_to_remove} Users...")
+            msg_sync_starting_details = f"⏳ Synchronizing @{account_username}: +{total_to_add} Users / -{total_to_remove} Users..."
+            if update and hasattr(update, 'message') and update.message:
+                await update.message.reply_text(msg_sync_starting_details)
+            else:
+                await send_telegram_message(msg_sync_starting_details)
 
             # === PHASE 1: Adding ===
             if users_to_add:
@@ -5245,7 +5677,11 @@ async def sync_followers_logic(update: Update, account_username: str, backup_fil
 
                 if cancelled_early:
                     logger.warning("[Sync] Cancellation signal received during ADD phase.")
-                    await update.message.reply_text("🟡 Sync is being cancelled (during adding)...")
+                    msg_sync_cancelled_adding = "🟡 Sync is being cancelled (during adding)..."
+                    if update and hasattr(update, 'message') and update.message:
+                        await update.message.reply_text(msg_sync_cancelled_adding)
+                    else:
+                        await send_telegram_message(msg_sync_cancelled_adding)
                     # Jump out of sync logic (finally will be executed)
 
 
@@ -5300,25 +5736,32 @@ async def sync_followers_logic(update: Update, account_username: str, backup_fil
 
                 if cancelled_early:
                     logger.warning("[Sync] Cancellation signal received during REMOVE phase.")
-                    await update.message.reply_text("🟡 Sync is being cancelled (during removing)...")
+                    msg_sync_cancelled_removing = "🟡 Sync is being cancelled (during removing)..."
+                    if update and hasattr(update, 'message') and update.message:
+                        await update.message.reply_text(msg_sync_cancelled_removing)
+                    else:
+                        await send_telegram_message(msg_sync_cancelled_removing)
                     # Jump out of sync logic (finally will be executed)
 
             # === After both phases (or cancellation) ===
             if cancelled_early:
-                 logger.info(f"[Sync @{account_username}] Process cancelled after {users_processed_add_count}/{total_to_add} adds and {users_processed_remove_count}/{total_to_remove} removes attempted.")
-                 summary = (f"🛑 Sync for @{account_username} cancelled!\n"
-                            f"------------------------------------\n"
-                            f" Additions attempted: {users_processed_add_count}/{total_to_add}\n"
-                            f"   - Successful: {users_followed_in_sync}\n"
-                            f"   - Already followed: {users_already_followed_checked}\n"
-                            f"   - Errors: {users_failed_to_follow}\n"
-                            f" Removals attempted: {users_processed_remove_count}/{total_to_remove}\n"
-                            f"   - Successful: {users_unfollowed_in_sync}\n"
-                            f"   - Not followed: {users_already_unfollowed_checked}\n"
-                            f"   - Errors: {users_failed_to_unfollow}\n"
-                            f"------------------------------------\n"
-                            f" Changes to backup were saved up to cancellation.")
+                logger.info(f"[Sync @{account_username}] Process cancelled after {users_processed_add_count}/{total_to_add} adds and {users_processed_remove_count}/{total_to_remove} removes attempted.")
+                summary = (f"🛑 Sync for @{account_username} cancelled!\n"
+                        f"------------------------------------\n"
+                        f" Additions attempted: {users_processed_add_count}/{total_to_add}\n"
+                        f"   - Successful: {users_followed_in_sync}\n"
+                        f"   - Already followed: {users_already_followed_checked}\n"
+                        f"   - Errors: {users_failed_to_follow}\n"
+                        f" Removals attempted: {users_processed_remove_count}/{total_to_remove}\n"
+                        f"   - Successful: {users_unfollowed_in_sync}\n"
+                        f"   - Not followed: {users_already_unfollowed_checked}\n"
+                        f"   - Errors: {users_failed_to_unfollow}\n"
+                        f"------------------------------------\n"
+                        f" Changes to backup were saved up to cancellation.")
+                if update and hasattr(update, 'message') and update.message:
                  await update.message.reply_text(summary)
+                else:
+                 await send_telegram_message(summary)
             else:
                 # Normal end - report final result
                 final_backup_size = len(account_backup_set)
@@ -5337,8 +5780,24 @@ async def sync_followers_logic(update: Update, account_username: str, backup_fil
                            f"   - Not followed (Check): {users_already_unfollowed_checked}\n"
                            f"   - Errors unfollowing: {users_failed_to_unfollow}\n"
                            f"------------------------------------")
-                await update.message.reply_text(summary)
-                logger.info(f"[Sync @{account_username}] Synchronization completed.")
+                if update and hasattr(update, 'message') and update.message:
+                    await update.message.reply_text(summary)
+                else:
+                    await send_telegram_message(summary)
+                    logger.info(f"[Sync @{account_username}] Synchronization completed.")
+
+                # Update schedule date if called by scheduler (update is None) and not cancelled
+                if update is None and not cancelled_early: # Check if it's a scheduled run
+                    global last_sync_schedule_run_date, schedule_sync_enabled, USER_CONFIGURED_TIMEZONE # Ensure globals
+                    if schedule_sync_enabled: # Only if still enabled
+                        try:
+                            local_tz_for_date = USER_CONFIGURED_TIMEZONE if USER_CONFIGURED_TIMEZONE else timezone.utc
+                            today_for_sched_update = datetime.now(local_tz_for_date).date()
+                            last_sync_schedule_run_date = today_for_sched_update
+                            save_schedule()
+                            logger.info(f"[Sync @{account_username}] Scheduled run completed. Updated last_sync_schedule_run_date to {today_for_sched_update}.")
+                        except Exception as e_save_sched:
+                            logger.error(f"[Sync @{account_username}] Error updating schedule after successful run: {e_save_sched}")
 
             # === Save backup (only if modified) ===
             # Save the updated backup set *after* all operations
@@ -5369,14 +5828,18 @@ async def sync_followers_logic(update: Update, account_username: str, backup_fil
         except Exception as nav_err:
             logger.error(f"[Sync] Error navigating back to home timeline: {nav_err}", exc_info=True)
 
-        # Resume main scraping
-        logger.info(f"[Sync @{account_username}] Resuming main scraping process.")
-        await resume_scraping()
+        # --- Restore original pause state ---
+        if not main_loop_was_initially_paused: # Only resume if we paused it
+            await resume_scraping()
+        logger.info(f"[Sync @{account_username}] Main scraping state restored (was_paused={main_loop_was_initially_paused}).")
+        # ---
 
         # ===== Task End Marker =====
         is_sync_running = False
         cancel_sync_flag = False # Ensure flag is false for the next run
-        logger.info("[Sync] Status flags reset.")
+        if is_scheduled_run: # Clear the global flag only if this task set it
+            is_any_scheduled_browser_task_running = False
+        logger.info(f"[Sync @{account_username}] Status flags reset (is_any_scheduled_browser_task_running: {is_any_scheduled_browser_task_running}).")
         # =============================
 
 async def fast_follow_logic(update: Update):
@@ -5563,6 +6026,172 @@ async def fast_follow_logic(update: Update):
             save_settings()
             await send_telegram_message(f"ℹ️ Fast-Follow for @{account_username} completed. Mode set to 'OFF'.")
 
+async def process_follow_list_schedule_logic(update: Update = None):
+    """
+    Scheduled task to process the current account's follow list.
+    Follows users sequentially with a short delay.
+    Manages pause/resume of main scraping internally.
+    """
+    global driver, is_scraping_paused, pause_event
+    global current_account_usernames_to_follow, global_followed_users_set
+    global is_any_scheduled_browser_task_running, is_scheduled_follow_list_running, cancel_scheduled_follow_list_flag
+
+    account_username = get_current_account_username()
+    if not account_username:
+        logger.error("[Sched FollowList] Cannot determine account username. Aborting.")
+        return
+
+    # Prevent starting if another scheduled browser task is running
+    if is_any_scheduled_browser_task_running:
+        logger.warning(f"[Sched FollowList @{account_username}] Skipped: another scheduled browser task is active.")
+        # Silently skip for scheduler. If manually triggered (update exists), inform.
+        if update: await update.message.reply_text("⚠️ Cannot start: another scheduled browser task is active.")
+        return
+    
+    if is_scheduled_follow_list_running: # Check if this specific task type is already running
+        logger.warning(f"[Sched FollowList @{account_username}] Skipped: A Follow List task is already running.")
+        if update: await update.message.reply_text("⚠️ Cannot start: A Follow List task is already running.")
+        return
+
+    # ===== Task Start Marker =====
+    # Set specific flag first
+    is_scheduled_follow_list_running = True
+    cancel_scheduled_follow_list_flag = False # Reset for this run
+    # Then set the general flag (this task always uses the browser and is scheduled)
+    is_any_scheduled_browser_task_running = True
+    # ================================
+
+    logger.info(f"[Sched FollowList @{account_username}] Starting scheduled follow list processing...")
+    start_message = (f"⏰ Starting Scheduled Follow List Processing for @{account_username}...\n"
+                     f"   Users in list: {len(current_account_usernames_to_follow)}\n"
+                     f"   To cancel (if running long): `/canceldbscrape` (uses same flag for now, or implement specific cancel)") # Temporary cancel note
+    if update: await update.message.reply_text(start_message)
+    else: await send_telegram_message(start_message)
+
+    main_loop_was_initially_paused = is_scraping_paused
+    if not main_loop_was_initially_paused:
+        await pause_scraping()
+
+    users_followed_in_task = 0
+    users_already_followed_checked = 0
+    users_failed_to_follow = 0
+    list_modified = False
+
+    list_to_process = current_account_usernames_to_follow[:] # Process a copy
+    total_to_process = len(list_to_process)
+
+    try:
+        if not list_to_process:
+            logger.info(f"[Sched FollowList @{account_username}] List is empty. Nothing to do.")
+            if update: await update.message.reply_text(f"ℹ️ Follow list for @{account_username} is empty.")
+            else: await send_telegram_message(f"ℹ️ Follow list for @{account_username} is empty for scheduled run.")
+        else:
+            logger.info(f"[Sched FollowList @{account_username}] Processing {total_to_process} users...")
+
+            for i, username in enumerate(list_to_process):
+                if cancel_scheduled_follow_list_flag:
+                    logger.info(f"[Sched FollowList @{account_username}] Cancellation requested. Stopping.")
+                    if update: await update.message.reply_text("🟡 Follow List processing cancelled.")
+                    else: await send_telegram_message(f"🟡 Scheduled Follow List for @{account_username} cancelled.")
+                    break # Exit the loop
+                logger.debug(f"[Sched FollowList @{account_username}] Attempt {i+1}/{total_to_process}: Following @{username}...")
+                wait_follow = random.uniform(4, 7)
+                logger.debug(f"    -> Waiting {wait_follow:.1f}s")
+                await asyncio.sleep(wait_follow)
+
+                follow_result = await follow_user(username) # follow_user navigates back to /home
+
+                if follow_result is True:
+                    logger.debug(f"  -> Success!")
+                    users_followed_in_task += 1
+                    if username in current_account_usernames_to_follow:
+                        current_account_usernames_to_follow.remove(username)
+                        list_modified = True
+                    if username not in global_followed_users_set:
+                        global_followed_users_set.add(username)
+                        add_to_set_file({username}, GLOBAL_FOLLOWED_FILE)
+                    backup_filepath = get_current_backup_file_path()
+                    if backup_filepath: add_to_set_file({username}, backup_filepath)
+
+                elif follow_result == "already_following":
+                    logger.debug(f"  -> Already following.")
+                    users_already_followed_checked += 1
+                    if username in current_account_usernames_to_follow:
+                        current_account_usernames_to_follow.remove(username)
+                        list_modified = True
+                    if username not in global_followed_users_set:
+                        global_followed_users_set.add(username)
+                        add_to_set_file({username}, GLOBAL_FOLLOWED_FILE)
+                    backup_filepath = get_current_backup_file_path()
+                    if backup_filepath: add_to_set_file({username}, backup_filepath)
+                else: # Error
+                    logger.warning(f"  -> Failed to follow @{username}! Remains in list.")
+                    users_failed_to_follow += 1
+
+                if (i + 1) % 10 == 0 or (i + 1) == total_to_process:
+                     progress_msg = f"[Sched FollowList @{account_username}] Progress: {i+1}/{total_to_process} attempted..."
+                     await send_telegram_message(progress_msg)
+
+            if list_modified:
+                logger.info(f"[Sched FollowList @{account_username}] Saving updated follow list...")
+                save_current_account_follow_list()
+
+            final_list_size = len(current_account_usernames_to_follow)
+            summary = (f"✅ Scheduled Follow List Processing for @{account_username} completed:\n"
+                       f"------------------------------------\n"
+                       f" Processed: {total_to_process}\n"
+                       f"   - Successfully followed: {users_followed_in_task}\n"
+                       f"   - Already followed: {users_already_followed_checked}\n"
+                       f"   - Errors: {users_failed_to_follow}\n"
+                       f"------------------------------------\n"
+                       f" Remaining users in list: {final_list_size}")
+            if update: await update.message.reply_text(summary)
+            else: await send_telegram_message(summary)
+            logger.info(f"[Sched FollowList @{account_username}] Process completed.")
+
+            # Update schedule date if called by scheduler (update is None)
+            if update is None: # Indicates a scheduled run
+                global last_follow_list_schedule_run_date, schedule_follow_list_enabled, USER_CONFIGURED_TIMEZONE # Ensure globals
+                if schedule_follow_list_enabled: # Only if still enabled
+                    try:
+                        local_tz_for_date = USER_CONFIGURED_TIMEZONE if USER_CONFIGURED_TIMEZONE else timezone.utc
+                        today_for_sched_update = datetime.now(local_tz_for_date).date()
+                        last_follow_list_schedule_run_date = today_for_sched_update
+                        save_schedule()
+                        logger.info(f"[Sched FollowList @{account_username}] Scheduled run completed. Updated last_follow_list_schedule_run_date to {today_for_sched_update}.")
+                    except Exception as e_save_sched:
+                        logger.error(f"[Sched FollowList @{account_username}] Error updating schedule after successful run: {e_save_sched}")
+
+    except Exception as e:
+        error_message = f"💥 Critical error during Scheduled Follow List for @{account_username}: {e}"
+        if update: await update.message.reply_text(error_message)
+        else: await send_telegram_message(error_message)
+        logger.error(f"Critical error during scheduled follow list for @{account_username}: {e}", exc_info=True)
+        if list_modified:
+            logger.info(f"[Sched FollowList @{account_username}] Saving list state despite error...")
+            save_current_account_follow_list()
+    finally:
+        logger.debug(f"[Sched FollowList @{account_username}] Entering finally block.")
+        try:
+            if driver and "x.com" in driver.current_url and driver.current_url != "https://x.com/home":
+                 driver.get("https://x.com/home")
+                 await asyncio.sleep(random.uniform(3, 5))
+            await switch_to_following_tab()
+        except Exception as nav_err:
+            logger.error(f"[Sched FollowList] Error navigating back to home timeline: {nav_err}", exc_info=True)
+
+        # --- Restore original pause state ---
+        if not main_loop_was_initially_paused: # Only resume if we paused it
+            await resume_scraping()
+        logger.info(f"[Sched FollowList @{account_username}] Main scraping state restored (was_paused={main_loop_was_initially_paused}).")
+        
+        # ===== Task End Marker =====
+        is_scheduled_follow_list_running = False
+        is_any_scheduled_browser_task_running = False # This task was the one using it
+        cancel_scheduled_follow_list_flag = False # Reset for next potential run
+        logger.info(f"[Sched FollowList @{account_username}] Status flags reset.")
+        # =============================
+
 async def cancel_backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Requests cancellation of the ongoing backup process."""
     global is_backup_running, cancel_backup_flag
@@ -5596,11 +6225,10 @@ async def global_list_info_command(update: Update, context: ContextTypes.DEFAULT
         if os.path.exists(file_path):
             # Get last modification time
             mod_timestamp = os.path.getmtime(file_path)
-            # Get timezone (like in format_time)
-            try:
-                local_tz = ZoneInfo("Europe/Berlin")
-            except Exception:
-                local_tz = timezone(timedelta(hours=2)) # Fallback
+            # Get timezone
+            local_tz = USER_CONFIGURED_TIMEZONE
+            if local_tz is None: local_tz = timezone.utc # Fallback
+            
             mod_datetime_local = datetime.fromtimestamp(mod_timestamp, tz=local_tz)
             mod_time_str = mod_datetime_local.strftime('%Y-%m-%d %H:%M:%S %Z%z')
 
@@ -5810,7 +6438,7 @@ async def clear_follow_list_command(update: Update, context: ContextTypes.DEFAUL
 async def show_mode(update: Update):
     """Displays the current search mode"""
     global search_mode
-    mode_text = "CA + Keywords" if search_mode == "full" else "CA Only"
+    mode_text = "Keywords" if search_mode == "full" else "CA Only"
     await update.message.reply_text(f"🔍 Search mode: {mode_text}")
     await resume_scraping()
 
@@ -5854,13 +6482,19 @@ async def show_schedule(update: Update):
     global schedule_enabled, schedule_pause_start, schedule_pause_end
     status = "ENABLED ✅" if schedule_enabled else "DISABLED ❌"
 
-    # Get current time to help debug timezone issues
-    current_time = datetime.now().strftime("%H:%M")
+    # Use the globally configured timezone
+    local_tz = USER_CONFIGURED_TIMEZONE
+    if local_tz is None: local_tz = timezone.utc # Fallback
+    
+    # Get current time in local timezone
+    now_local = datetime.now(local_tz)
+    current_time_str = now_local.strftime("%H:%M") # String for display
+    tz_name_display = USER_TIMEZONE_STR # Display the configured (or fallen-back-to) name
 
     message = (
         f"📅 Schedule: {status}\n"
         f"⏰ Pause period: {schedule_pause_start} - {schedule_pause_end}\n"
-        f"🕒 Current system time: {current_time}\n\n"
+        f"🕒 Current bot time: {current_time_str} ({tz_name_display})\n\n"
     )
 
     # Add schedule status
@@ -5868,11 +6502,11 @@ async def show_schedule(update: Update):
         # Check if we're currently in the pause period
         global is_schedule_pause
         is_schedule_pause = True # Assume paused if schedule is on and we are checking
-        now = datetime.now()
-        today = now.date()
-        current_dt = datetime.strptime(f"{today} {current_time}", "%Y-%m-%d %H:%M")
-        start_time = datetime.strptime(f"{today} {schedule_pause_start}", "%Y-%m-%d %H:%M")
-        end_time = datetime.strptime(f"{today} {schedule_pause_end}", "%Y-%m-%d %H:%M")
+        # now_local is already defined above and is timezone-aware
+        today_local = now_local.date()
+        current_dt = now_local # Use the already timezone-aware datetime
+        start_time = datetime.strptime(f"{today_local} {schedule_pause_start}", "%Y-%m-%d %H:%M").replace(tzinfo=local_tz)
+        end_time = datetime.strptime(f"{today_local} {schedule_pause_end}", "%Y-%m-%d %H:%M").replace(tzinfo=local_tz)
 
         # Handle overnight periods
         if end_time < start_time:
@@ -5925,15 +6559,19 @@ async def set_schedule_enabled(update: Update, enabled: bool):
     save_schedule()
 
     if enabled:
-        # Get current time to help with scheduling info
-        now = datetime.now()
-        current_time = now.strftime("%H:%M")
-        today = now.date()
+        # Use the globally configured timezone
+        local_tz = USER_CONFIGURED_TIMEZONE
+        if local_tz is None: local_tz = timezone.utc # Fallback
 
-        # Create datetime objects for comparison
-        current_dt = datetime.strptime(f"{today} {current_time}", "%Y-%m-%d %H:%M")
-        start_time = datetime.strptime(f"{today} {schedule_pause_start}", "%Y-%m-%d %H:%M")
-        end_time = datetime.strptime(f"{today} {schedule_pause_end}", "%Y-%m-%d %H:%M")
+        # Get current time in local timezone
+        now_local = datetime.now(local_tz)
+        current_time_str = now_local.strftime("%H:%M") # String for display
+        today_local = now_local.date()
+
+        # Create datetime objects for comparison (all timezone-aware)
+        current_dt = now_local # Already tz-aware
+        start_time = datetime.strptime(f"{today_local} {schedule_pause_start}", "%Y-%m-%d %H:%M").replace(tzinfo=local_tz)
+        end_time = datetime.strptime(f"{today_local} {schedule_pause_end}", "%Y-%m-%d %H:%M").replace(tzinfo=local_tz)
 
         # Handle overnight periods
         in_pause = False
@@ -5949,7 +6587,7 @@ async def set_schedule_enabled(update: Update, enabled: bool):
             status_msg = (
                 f"✅ Schedule ENABLED\n"
                 f"⏰ Pause period: {schedule_pause_start} - {schedule_pause_end}\n"
-                f"⚠️ Current time ({current_time}) is within pause period!\n"
+                f"⚠️ Current time ({current_time_str}) is within pause period!\n"
                 f"⏸️ Bot will pause now until {schedule_pause_end}"
             )
             # Trigger pause immediately
@@ -6020,6 +6658,307 @@ async def set_schedule_time(update: Update, time_str: str):
     schedule_pause_end = end_time
     save_schedule()
     await update.message.reply_text(f"✅ Schedule pause period set to {start_time} - {end_time}")
+    await resume_scraping()
+
+async def schedule_sync_toggle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggles the scheduled sync ON or OFF."""
+    global schedule_sync_enabled
+    schedule_sync_enabled = not schedule_sync_enabled
+    save_schedule()
+    status = "ENABLED 🟢" if schedule_sync_enabled else "DISABLED 🔴"
+    await update.message.reply_text(f"⏰ Scheduled Sync is now {status}.")
+    logger.info(f"Scheduled Sync toggled to {status} by user {update.message.from_user.id}")
+    await resume_scraping() # Command handler should resume
+
+async def schedule_sync_time_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sets the time window for scheduled sync."""
+    global schedule_sync_start_time, schedule_sync_end_time
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text(
+            f"ℹ️ Please provide the time window in HH:MM-HH:MM format.\n"
+            f"Current Sync Window: {schedule_sync_start_time}-{schedule_sync_end_time}\n\n"
+            f"Format: `/schedulesynctime HH:MM-HH:MM`\n\n"
+            f"Example: `/schedulesynctime {schedule_sync_start_time}-{schedule_sync_end_time}`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        await resume_scraping()
+        return
+
+    time_range_str = context.args[0].strip()
+    time_parts = [t.strip() for t in time_range_str.split('-')]
+
+    if len(time_parts) != 2:
+        await update.message.reply_text("❌ Invalid time format. Please use HH:MM-HH:MM.")
+        await resume_scraping()
+        return
+
+    start_str, end_str = time_parts[0], time_parts[1]
+
+    if not re.match(r'^([01]\d|2[0-3]):([0-5]\d)$', start_str) or \
+       not re.match(r'^([01]\d|2[0-3]):([0-5]\d)$', end_str):
+        await update.message.reply_text("❌ Invalid time format in window. Please use HH:MM for both start and end.")
+        await resume_scraping()
+        return
+
+    # Optional: Check if end_time is after start_time if they are on the same day.
+    # For simplicity, we'll allow overnight windows like 23:00-01:00.
+    # The run loop logic will handle this.
+
+    # Check for overlap with Follow List schedule if it's enabled
+    if schedule_follow_list_enabled:
+        # Define a helper function for checking overlap (can be defined globally or locally if preferred)
+        def _check_overlap(s1_str, e1_str, s2_str, e2_str):
+            try:
+                s1 = datetime.strptime(s1_str, "%H:%M").time()
+                e1 = datetime.strptime(e1_str, "%H:%M").time()
+                s2 = datetime.strptime(s2_str, "%H:%M").time()
+                e2 = datetime.strptime(e2_str, "%H:%M").time()
+
+                # Convert to minutes from midnight for easier comparison
+                s1_mins = s1.hour * 60 + s1.minute
+                e1_mins = e1.hour * 60 + e1.minute
+                s2_mins = s2.hour * 60 + s2.minute
+                e2_mins = e2.hour * 60 + e2.minute
+
+                # Create lists of (start, end) intervals, handling overnight
+                intervals1 = []
+                if e1_mins <= s1_mins: # Overnight for interval 1
+                    intervals1.append((s1_mins, 24 * 60)) # s1 to midnight
+                    intervals1.append((0, e1_mins))       # midnight to e1
+                else:
+                    intervals1.append((s1_mins, e1_mins))
+
+                intervals2 = []
+                if e2_mins <= s2_mins: # Overnight for interval 2
+                    intervals2.append((s2_mins, 24 * 60))
+                    intervals2.append((0, e2_mins))
+                else:
+                    intervals2.append((s2_mins, e2_mins))
+
+                for i1_s, i1_e in intervals1:
+                    for i2_s, i2_e in intervals2:
+                        # Check for overlap: max_start < min_end
+                        if max(i1_s, i2_s) < min(i1_e, i2_e):
+                            return True # Overlap found
+                return False # No overlap
+            except ValueError: # Should not happen if times are validated
+                return False 
+
+        if _check_overlap(start_str, end_str, schedule_follow_list_start_time, schedule_follow_list_end_time):
+            await update.message.reply_text(
+                f"❌ Overlap Detected! The new Sync window ({start_str}-{end_str}) "
+                f"overlaps with the enabled Follow List window ({schedule_follow_list_start_time}-{schedule_follow_list_end_time}).\n"
+                f"Please adjust the times or disable one of the schedules."
+            )
+            await resume_scraping()
+            return
+
+    global last_sync_schedule_run_date # Add this global
+    schedule_sync_start_time = start_str
+    schedule_sync_end_time = end_str
+    
+    # If the schedule is enabled and times are changing, reset the last run date
+    # to allow it to run again today if the new window is met.
+    if schedule_sync_enabled:
+        last_sync_schedule_run_date = None # Resetting to None forces re-evaluation
+        logger.info(f"Scheduled Sync time changed. Resetting last_sync_schedule_run_date to allow re-trigger today if new window is met.")
+        
+    save_schedule()
+    await update.message.reply_text(f"✅ Scheduled Sync window set to {schedule_sync_start_time}-{schedule_sync_end_time}.")
+    logger.info(f"Scheduled Sync window set to {schedule_sync_start_time}-{schedule_sync_end_time} by user {update.message.from_user.id}")
+    await resume_scraping()
+
+async def schedule_follow_list_toggle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggles the scheduled follow list processing ON or OFF."""
+    global schedule_follow_list_enabled
+    schedule_follow_list_enabled = not schedule_follow_list_enabled
+    save_schedule()
+    status = "ENABLED 🟢" if schedule_follow_list_enabled else "DISABLED 🔴"
+    await update.message.reply_text(f"🚶‍♂️‍➡️ Scheduled Follow List Processing is now {status}.")
+    logger.info(f"Scheduled Follow List Processing toggled to {status} by user {update.message.from_user.id}")
+    await resume_scraping()
+
+async def schedule_follow_list_time_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sets the time window for scheduled follow list processing."""
+    global schedule_follow_list_start_time, schedule_follow_list_end_time
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text(
+            f"ℹ️ Please provide the time window in HH:MM-HH:MM format.\n"
+            f"Current Follow List Window: {schedule_follow_list_start_time}-{schedule_follow_list_end_time}\n\n"
+            f"Format: `/schedulefollowlisttime HH:MM-HH:MM`\n\n"
+            f"Example: `/schedulefollowlisttime {schedule_follow_list_start_time}-{schedule_follow_list_end_time}`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        await resume_scraping()
+        return
+
+    time_range_str = context.args[0].strip()
+    time_parts = [t.strip() for t in time_range_str.split('-')]
+
+    if len(time_parts) != 2:
+        await update.message.reply_text("❌ Invalid time format. Please use HH:MM-HH:MM.")
+        await resume_scraping()
+        return
+
+    start_str, end_str = time_parts[0], time_parts[1]
+
+    if not re.match(r'^([01]\d|2[0-3]):([0-5]\d)$', start_str) or \
+       not re.match(r'^([01]\d|2[0-3]):([0-5]\d)$', end_str):
+        await update.message.reply_text("❌ Invalid time format in window. Please use HH:MM for both start and end.")
+        await resume_scraping()
+        return
+
+    # Check for overlap with Sync schedule if it's enabled
+    if schedule_sync_enabled:
+        # Define a helper function for checking overlap (can be defined globally or locally if preferred)
+        def _check_overlap(s1_str, e1_str, s2_str, e2_str):
+            try:
+                s1 = datetime.strptime(s1_str, "%H:%M").time()
+                e1 = datetime.strptime(e1_str, "%H:%M").time()
+                s2 = datetime.strptime(s2_str, "%H:%M").time()
+                e2 = datetime.strptime(e2_str, "%H:%M").time()
+
+                s1_mins = s1.hour * 60 + s1.minute
+                e1_mins = e1.hour * 60 + e1.minute
+                s2_mins = s2.hour * 60 + s2.minute
+                e2_mins = e2.hour * 60 + e2.minute
+
+                intervals1 = []
+                if e1_mins <= s1_mins: 
+                    intervals1.append((s1_mins, 24 * 60))
+                    intervals1.append((0, e1_mins))      
+                else:
+                    intervals1.append((s1_mins, e1_mins))
+
+                intervals2 = []
+                if e2_mins <= s2_mins: 
+                    intervals2.append((s2_mins, 24 * 60))
+                    intervals2.append((0, e2_mins))
+                else:
+                    intervals2.append((s2_mins, e2_mins))
+
+                for i1_s, i1_e in intervals1:
+                    for i2_s, i2_e in intervals2:
+                        if max(i1_s, i2_s) < min(i1_e, i2_e):
+                            return True 
+                return False 
+            except ValueError: 
+                return False
+
+        if _check_overlap(start_str, end_str, schedule_sync_start_time, schedule_sync_end_time):
+            await update.message.reply_text(
+                f"❌ Overlap Detected! The new Follow List window ({start_str}-{end_str}) "
+                f"overlaps with the enabled Sync window ({schedule_sync_start_time}-{schedule_sync_end_time}).\n"
+                f"Please adjust the times or disable one of the schedules."
+            )
+            await resume_scraping()
+            return
+
+    global last_follow_list_schedule_run_date # Add this global
+    schedule_follow_list_start_time = start_str
+    schedule_follow_list_end_time = end_str
+
+    # If the schedule is enabled and times are changing, reset the last run date
+    if schedule_follow_list_enabled:
+        last_follow_list_schedule_run_date = None # Resetting to None forces re-evaluation
+        logger.info(f"Scheduled Follow List time changed. Resetting last_follow_list_schedule_run_date to allow re-trigger today if new window is met.")
+
+    save_schedule()
+    await update.message.reply_text(f"✅ Scheduled Follow List Processing window set to {schedule_follow_list_start_time}-{schedule_follow_list_end_time}.")
+    logger.info(f"Scheduled Follow List Processing window set to {schedule_follow_list_start_time}-{schedule_follow_list_end_time} by user {update.message.from_user.id}")
+    await resume_scraping()
+
+async def show_detailed_schedules_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays the status of all schedules."""
+    global schedule_enabled, schedule_pause_start, schedule_pause_end
+    global schedule_sync_enabled, schedule_sync_time, last_sync_schedule_run_date
+    global schedule_follow_list_enabled, schedule_follow_list_time, last_follow_list_schedule_run_date
+    global USER_CONFIGURED_TIMEZONE, USER_TIMEZONE_STR
+
+    local_tz = USER_CONFIGURED_TIMEZONE if USER_CONFIGURED_TIMEZONE else timezone.utc
+    now_local = datetime.now(local_tz)
+    today_date_local = now_local.date()
+
+    main_sched_status = "ENABLED 🟢" if schedule_enabled else "DISABLED 🔴"
+    sync_sched_status = "ENABLED 🟢" if schedule_sync_enabled else "DISABLED 🔴"
+    follow_list_sched_status = "ENABLED 🟢" if schedule_follow_list_enabled else "DISABLED 🔴"
+
+    main_sched_next_run = ""
+    if schedule_enabled:
+        # This logic is simplified from your check_schedule, focusing on next action
+        start_dt_naive = datetime.strptime(schedule_pause_start, "%H:%M").time()
+        end_dt_naive = datetime.strptime(schedule_pause_end, "%H:%M").time()
+        current_time_naive = now_local.time()
+        if end_dt_naive <= start_dt_naive: # Overnight
+            if start_dt_naive <= current_time_naive or current_time_naive < end_dt_naive: # Currently in pause
+                main_sched_next_run = f"(Active Pause until {schedule_pause_end})"
+            else: # Not in pause, next pause is start_dt
+                main_sched_next_run = f"(Next Pause at {schedule_pause_start})"
+        else: # Same day
+            if start_dt_naive <= current_time_naive < end_dt_naive: # Currently in pause
+                main_sched_next_run = f"(Active Pause until {schedule_pause_end})"
+            else: # Not in pause
+                if current_time_naive < start_dt_naive:
+                    main_sched_next_run = f"(Next Pause at {schedule_pause_start})"
+                else: # Pause for today passed, next is tomorrow
+                    main_sched_next_run = f"(Next Pause tomorrow at {schedule_pause_start})"
+
+
+    sync_run_status_text = ""
+    if schedule_sync_enabled:
+        start_sync_t = datetime.strptime(schedule_sync_start_time, "%H:%M").time()
+        end_sync_t = datetime.strptime(schedule_sync_end_time, "%H:%M").time()
+        current_t = now_local.time()
+        ran_today_sync = last_sync_schedule_run_date == today_date_local
+
+        if end_sync_t <= start_sync_t: # Overnight
+            if (start_sync_t <= current_t or current_t < end_sync_t) and not ran_today_sync:
+                sync_run_status_text = "(Active Window - Pending)"
+            elif ran_today_sync:
+                sync_run_status_text = "(Ran Today)"
+            else:
+                sync_run_status_text = "(Scheduled)"
+        else: # Same day
+            if start_sync_t <= current_t < end_sync_t and not ran_today_sync:
+                sync_run_status_text = "(Active Window - Pending)"
+            elif ran_today_sync:
+                sync_run_status_text = "(Ran Today)"
+            else:
+                sync_run_status_text = "(Scheduled)"
+    
+    follow_list_run_status_text = ""
+    if schedule_follow_list_enabled:
+        start_fl_t = datetime.strptime(schedule_follow_list_start_time, "%H:%M").time()
+        end_fl_t = datetime.strptime(schedule_follow_list_end_time, "%H:%M").time()
+        current_t = now_local.time()
+        ran_today_fl = last_follow_list_schedule_run_date == today_date_local
+
+        if end_fl_t <= start_fl_t: # Overnight
+            if (start_fl_t <= current_t or current_t < end_fl_t) and not ran_today_fl:
+                follow_list_run_status_text = "(Active Window - Pending)"
+            elif ran_today_fl:
+                follow_list_run_status_text = "(Ran Today)"
+            else:
+                follow_list_run_status_text = "(Scheduled)"
+        else: # Same day
+            if start_fl_t <= current_t < end_fl_t and not ran_today_fl:
+                follow_list_run_status_text = "(Active Window - Pending)"
+            elif ran_today_fl:
+                follow_list_run_status_text = "(Ran Today)"
+            else:
+                follow_list_run_status_text = "(Scheduled)"
+
+    message = (
+        f"🗓️ **All Schedule Statuses** ({USER_TIMEZONE_STR}) 🗓️\n\n"
+        f"⏸️ **Main Bot Pause Schedule:** {main_sched_status}\n"
+        f"   └ Time: {schedule_pause_start} - {schedule_pause_end} {main_sched_next_run}\n\n"
+        f"🔄 **Scheduled Sync:** {sync_sched_status}\n"
+        f"   └ Window: {schedule_sync_start_time} - {schedule_sync_end_time} {sync_run_status_text}\n\n"
+        f"🚶‍♂️‍➡️ **Scheduled Follow List:** {follow_list_sched_status}\n"
+        f"   └ Window: {schedule_follow_list_start_time} - {schedule_follow_list_end_time} {follow_list_run_status_text}\n\n"
+        f"🕒 Current Bot Time: {now_local.strftime('%H:%M:%S')}"
+    )
+    await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
     await resume_scraping()
 
 async def switch_account_request(update: Update, account_num=None):
@@ -6199,7 +7138,7 @@ async def _send_long_message(application, chat_id, text, reply_markup, tweet_url
     Sends text messages, splitting them if necessary (> 4096 chars)
     and handles errors. Adds buttons only at the end.
     """
-    global last_tweet_urls # Access global variable for tweet URLs
+    global last_tweet_urls # Access global variable for post URLs
 
     message_limit = 4096
     try:
@@ -6360,69 +7299,76 @@ def get_contract_links(contract, chain):
     return ''.join(links)
 
 def format_time(datetime_str):
-    global max_tweet_age_minutes # Access the global setting
-    # --- DEBUG LOGGING ---
-    print(f"DEBUG format_time: Using max_tweet_age_minutes = {max_tweet_age_minutes}")
-    # --- END DEBUG LOGGING ---
+    global max_tweet_age_minutes, USER_CONFIGURED_TIMEZONE, USER_TIMEZONE_STR # Access global settings
     is_recent = False # Default: Not recent
     formatted_string = "📅 Time invalid"
-    try:
-        # Attempt to use the configured timezone
-        local_tz = ZoneInfo("Europe/Berlin")
-    except Exception:
-        # Fallback to a fixed offset if timezone info is unavailable
-        print("WARNING: Could not load 'Europe/Berlin' timezone. Using UTC+2 fallback.")
-        local_tz = timezone(timedelta(hours=2), "UTC+02:00_Fallback")
+
+    # Use the globally configured timezone
+    local_tz = USER_CONFIGURED_TIMEZONE
+    if local_tz is None: # Should not happen if load_user_timezone() was called
+        print("CRITICAL ERROR: USER_CONFIGURED_TIMEZONE is None in format_time. Defaulting to UTC.")
+        local_tz = timezone.utc
 
     try:
         # Parse the UTC time from the post
         tweet_time_utc = datetime.fromisoformat(datetime_str.replace('Z', '+00:00')).replace(tzinfo=timezone.utc)
-        # Convert to the local timezone
+        # Convert to the user's local timezone
         tweet_time_local = tweet_time_utc.astimezone(local_tz)
-        # Get the current time in the same local timezone
+        # Get the current time in the user's local timezone
         current_time_local = datetime.now(local_tz)
         # Calculate the difference
         time_diff = current_time_local - tweet_time_local
         seconds_ago = time_diff.total_seconds()
 
-        # --- Determine if the post is recent (using configured max age) ---
-        max_age_seconds = max_tweet_age_minutes * 60 # Calculate max age in seconds
-        # --- DEBUG LOGGING ---
-        print(f"DEBUG format_time: seconds_ago={seconds_ago:.1f}, max_age_seconds={max_age_seconds} (from {max_tweet_age_minutes} min)")
-        # --- END DEBUG LOGGING ---
-        if 0 <= seconds_ago < max_age_seconds: # Use the calculated value
+        # Determine if the post is recent (using configured max age)
+        max_age_seconds = max_tweet_age_minutes * 60
+        if 0 <= seconds_ago < max_age_seconds:
             is_recent = True
-            # --- DEBUG LOGGING ---
-            print(f"DEBUG format_time: Post IS recent.")
-            # --- END DEBUG LOGGING ---
-        else:
-            # --- DEBUG LOGGING ---
-            print(f"DEBUG format_time: Post IS NOT recent.")
-            # --- END DEBUG LOGGING ---
-        # --- End recent check ---
+        # else: # Optional: Debug log if not recent
+            # print(f"DEBUG format_time: Post IS NOT recent. Age: {seconds_ago/60:.1f} min (Max: {max_tweet_age_minutes} min)")
 
-        # --- Format the display string based on age ---
+        # Determine date format based on the user's timezone string
+        if USER_TIMEZONE_STR.startswith("Europe/"):
+            # Format: DD.MM.YY HH:MM
+            base_date_format = "%d.%m.%y"
+        elif USER_TIMEZONE_STR.startswith("America/") or USER_TIMEZONE_STR.startswith("US/"):
+            # Format: MM/DD/YY HH:MM
+            base_date_format = "%m/%d/%y"
+        else:
+            # Default/Fallback format: YYYY-MM-DD HH:MM
+            base_date_format = "%d.%m.%y"
+
+        # current_display_format wird hier nicht mehr direkt für die Ausgabe verwendet,
+        # aber base_date_format wird noch für den Datumsteil gebraucht.
+        
+        time_str_part = tweet_time_local.strftime('%H:%M')
+        date_str_part = tweet_time_local.strftime(base_date_format)
+        relative_str_part = ""
+
         if seconds_ago < 0:
-            # post is from the future (clock skew?)
-            formatted_string = f"📅 {tweet_time_local.strftime('%H:%M %d.%m.%y')} (Future?)"
-        elif seconds_ago < 180: # NEW: Under 3 minutes -> Show seconds
-            formatted_string = f"📅 {tweet_time_local.strftime('%H:%M %d.%m.%y')} ({seconds_ago:.1f} sec)"
-        elif seconds_ago < 3600: # Under 1 hour (but >= 60 seconds)
-            minutes_ago = int(seconds_ago // 180)
-            formatted_string = f"📅 {tweet_time_local.strftime('%H:%M %d.%m.%y')} ({minutes_ago} min)"
+            relative_str_part = "(Future?)"
+        elif seconds_ago < 180: # Under 3 minutes
+            relative_str_part = f"({int(seconds_ago)}s)"
+        elif seconds_ago < 3600: # Under 1 hour
+            minutes_ago = int(seconds_ago // 60)
+            relative_str_part = f"({minutes_ago}m)"
         elif seconds_ago < 86400: # Under 1 day
             hours_ago = int(seconds_ago // 3600)
-            formatted_string = f"📅 {tweet_time_local.strftime('%H:%M %d.%m.%y')} ({hours_ago} hrs)"
+            relative_str_part = f"({hours_ago}h)"
         else: # Older than 1 day
-            formatted_string = f"📅 {tweet_time_local.strftime('%d.%m.%y %H:%M')}"
-        # --- End string formatting ---
+            days_ago = int(seconds_ago // 86400)
+            relative_str_part = f"({days_ago}d)"
+        
+        formatted_string = f"📅 {time_str_part}  {relative_str_part} {date_str_part}"
+        
+        # The explicit timezone name is no longer appended here.
+
 
     except ValueError:
-        # Error parsing the datetime string, keep default "invalid" message
-        pass
+        # Error parsing the datetime string
+        pass # Keep default "invalid" message
     except Exception as e:
-        # Log other unexpected errors during time formatting
-        print(f"ERROR in format_time: {e}")
+        print(f"ERROR in format_time for '{datetime_str}': {e}")
         # Keep default "invalid" message
 
     return formatted_string, is_recent
@@ -6514,7 +7460,7 @@ def format_token_info(tweet_text):
 # def format_token_info(post_text):
 #     """
 #     Extracts and formats Tickers ($) and Contract Addresses (CA)
-#     from a tweet text. Filters out pure currency amounts and amounts
+#     from a post text. Filters out pure currency amounts and amounts
 #     with K/M/B/T suffixes from tickers.
 #     """
 
@@ -6657,7 +7603,7 @@ async def process_tweets():
                     # and then set the flag to break the outer loop afterwards.
                     if processed_since_button_click == target_new_button_tweets:
                         print(f"Target of {target_new_button_tweets} will be met after processing this post.")
-                        # We don't break here yet, process this tweet first.
+                        # We don't break here yet, process this post first.
                         # The flag will be checked after the inner loop.
                         target_met_flag = True # Set flag to break outer loop *after* this inner loop finishes
 
@@ -6857,21 +7803,44 @@ async def process_tweets():
                     except StaleElementReferenceException: pass
 
                     # --- Relevance Check and Sending ---
-                    ticker_section, contract_section, ticker_found = format_token_info(tweet_content)
-                    contains_keyword = any(keyword.lower() in tweet_content.lower() for keyword in KEYWORDS)
-                    contains_token = bool(contract_section)
-                    # Determine relevance: CA found OR Ticker found (if enabled) OR (Keyword found AND mode is full)
-                    contains_token = bool(contract_section) # Check if CA section has content
-                    is_relevant = contains_token or ticker_found or (search_mode == "full" and contains_keyword)
+                    # format_token_info now returns: ticker_section, contract_section, ticker_actually_found_and_enabled
+                    # ticker_found from format_token_info already considers if search_tickers_enabled is True
+                    ticker_section, contract_section, ticker_found_and_enabled = format_token_info(tweet_content)
+                    
+                    contains_keyword_match = any(keyword.lower() in tweet_content.lower() for keyword in KEYWORDS)
+                    contains_ca_match = bool(contract_section) # True if a CA was found and formatted
+
+                    is_relevant = False
+                    reasons = []
+
+                    if search_keywords_enabled and contains_keyword_match:
+                        is_relevant = True
+                        # Add specific found keywords to reasons
+                        found_kws_in_post = [kw for kw in KEYWORDS if kw.lower() in tweet_content.lower()]
+                        if found_kws_in_post: reasons.extend(found_kws_in_post)
+                    
+                    if search_ca_enabled and contains_ca_match:
+                        is_relevant = True
+                        reasons.append("CA") # Generic "CA" reason if CA search is on and a CA is present
+                        
+                    # ticker_found_and_enabled is already true if search_tickers_enabled AND a ticker was found
+                    if ticker_found_and_enabled: 
+                        is_relevant = True
+                        reasons.append("Ticker")
 
                     if is_relevant:
-                        reasons = []
-                        if contains_token: reasons.append("CA")
-                        if search_mode == "full" and contains_keyword:
-                            found_kws = [kw for kw in KEYWORDS if kw.lower() in tweet_content.lower()]
-                            if found_kws: reasons.extend(found_kws)
-                        print(f"    post {tweet_id} relevant due to: {', '.join(sorted(list(set(reasons))))}") # Translated
-                        if ticker_found: reasons.append("Ticker") # Add "Ticker" as a reason if found                        
+                        # reasons list is already built above
+                        
+                        reasons = sorted(list(set(reasons))) # Final list of reasons for display
+                        
+                        # Log the reasons
+                        if reasons:
+                            print(f"    post {tweet_id} relevant due to: {', '.join(sorted(list(set(reasons))))}")
+                        else:
+                            # This case should ideally not happen if is_relevant is True,
+                            # but as a fallback or for debugging:
+                            print(f"    post {tweet_id} marked relevant, but no specific reason (CA/Keyword/Ticker) captured for logging. Check logic.")
+                        
                         increment_found_count()
 
                         # --- Build message (corrected version) ---
@@ -6938,8 +7907,8 @@ async def process_tweets():
                         final_reply_markup = None
                         combined_keyboard = []  # Initialize this once, at the beginning
 
-                        # Rating Buttons (only if token/CA present)
-                        if contains_token:
+                        # Rating Buttons (only if CA search enabled AND CA present)
+                        if search_ca_enabled and contains_ca_match:
                             source_key = author_handle
                             try:
                                 author_name_str = str(author_name) if author_name else source_key
@@ -6959,7 +7928,7 @@ async def process_tweets():
 
                             # Add "Show Full Text" button if needed
                             if show_full_text_needed:
-                                print(f"    Adding 'Show Full Text' button for Tweet {tweet_id}") # Translated
+                                print(f"    Adding 'Show Full Text' button forpost{tweet_id}") # Translated
                                 action_buttons.append(InlineKeyboardButton("📄 Full Text", callback_data=f"full:{tweet_id}")) # Translated
 
                         # Important: Add the action buttons anyway if they exist
@@ -6974,7 +7943,7 @@ async def process_tweets():
                         # This block is empty in your code. If you had logic here,
                         # it needs to be correctly indented. If it should remain empty,
                         # 'pass' is good practice.
-                        if contains_token:
+                        if search_ca_enabled and contains_ca_match:
                             pass # Add 'pass' if the block is intentionally empty
 
                         # --- Send (ALWAYS if is_relevant) ---
@@ -7015,7 +7984,7 @@ async def process_tweets():
                     newly_processed_count += 1
 
                 # === TARGET CHECK ===
-                # Increment the counter *only* if the tweet was identified as new in this round
+                # Increment the counter *only* if the post was identified as new in this round
                 # (i.e., not skipped by the initial ID check)
                 # AND check if the target has been reached.
                 # This check happens *after* processing/skipping the current tweet.
@@ -7023,7 +7992,7 @@ async def process_tweets():
                     # Increment counter for tweets processed towards the target
                     # Note: We increment 'processed_since_button_click' here, AFTER potentially skipping old/ad tweets
                     # This ensures we count towards the target only potentially relevant new tweets.
-                    # If you want to count *every* single new tweet encountered, move this increment
+                    # If you want to count *every* single new post encountered, move this increment
                     # right after the "if tweet_id in processed_tweets..." check.
                     # Let's stick to counting potentially relevant ones for now:
                     # processed_since_button_click += 1 # Moved this counter logic earlier
@@ -7265,7 +8234,7 @@ async def _send_long_message(application, chat_id, text, reply_markup, tweet_url
                 disable_web_page_preview=True,
                 reply_markup=reply_markup
             )
-             # Store tweet URL if buttons were present
+             # Store post URL if buttons were present
             if reply_markup and tweet_url:
                 last_tweet_urls[chat_id] = tweet_url
 
@@ -7338,7 +8307,7 @@ async def send_telegram_message(text, images=None, tweet_url=None, reply_markup=
                         parse_mode=ParseMode.HTML,
                         reply_markup=final_reply_markup
                     )
-                    # Store tweet URL since image was sent and buttons might be present
+                    # Store post URL since image was sent and buttons might be present
                     if tweet_url:
                         last_tweet_urls[CHANNEL_ID] = tweet_url
                 except Exception as send_photo_error:
@@ -7414,7 +8383,7 @@ def get_contract_links(contract, chain):
 #         time_diff = current_time_local - tweet_time_local
 #         seconds_ago = time_diff.total_seconds()
 
-#         # --- Determine if the tweet is recent (within 15 minutes) ---
+#         # --- Determine if the post is recent (within 15 minutes) ---
 #         # 900 seconds = 15 minutes
 #         if 0 <= seconds_ago < 900:
 #             is_recent = True
@@ -7422,7 +8391,7 @@ def get_contract_links(contract, chain):
 
 #         # --- Format the display string based on age ---
 #         if seconds_ago < 0:
-#             # Tweet is from the future (clock skew?)
+#             # post is from the future (clock skew?)
 #             formatted_string = f"📅 {tweet_time_local.strftime('%H:%M %d.%m.%y')} (Future?)"
 #         elif seconds_ago < 3600: # Under 1 hour (includes the <15 min case)
 #             minutes_ago = int(seconds_ago // 60)
@@ -7446,7 +8415,7 @@ def get_contract_links(contract, chain):
 
 
 async def process_full_text_request(query, context, tweet_url): # Added context
-    """Processes the request to get full tweet text and update the message."""
+    """Processes the request to get full post text and update the message."""
     try:
         # Notify user that we're processing
         await query.answer("Fetching full text...")
@@ -7539,10 +8508,29 @@ async def handle_callback_query(update, context):
         await query.answer()
     except Exception as e:
         logger.error(f"Failed to answer callback query for data {data}: {e}")
-        # Decide if you want to return here or try processing anyway
-        # return
+        # If answering fails, we might not be able to proceed gracefully.
+        return
 
-    logger.info(f"Callback received: {data}")
+    # +++ ADMIN CHECK FOR ALL CALLBACK QUERIES +++
+    if not query.from_user:
+        logger.warning(f"Callback query from unknown user for data: {data}")
+        return # Cannot check admin status
+
+    user_id = query.from_user.id
+    if not is_user_admin(user_id):
+        logger.warning(f"Unauthorized callback query access by non-admin user {user_id} for data: {data}")
+        try:
+            # Inform the user via an alert on the button press
+            await query.answer("❌ Access Denied. Admin only.", show_alert=True)
+        except Exception as e_ans:
+            logger.error(f"Failed to send 'Access Denied' answer for callback query to non-admin {user_id}: {e_ans}")
+        # Optionally, edit the message to indicate denial if possible and appropriate.
+        # However, editing might be intrusive or fail if the message is old.
+        # For now, just the alert is sufficient.
+        return # Stop further processing for non-admins
+    # +++ END ADMIN CHECK +++
+
+    logger.info(f"Callback received from admin {user_id}: {data}") # Log now confirms admin
 
     # Split data safely
     parts = data.split(":", 1)
@@ -7676,12 +8664,7 @@ async def handle_callback_query(update, context):
             target_username = decision_parts[1] if len(decision_parts) > 1 else None
 
             if decision == "yes":
-                if not is_user_admin(query.from_user.id):
-                    logger.warning(f"User {query.from_user.id} tried to disable headless via follow prompt without admin rights.")
-                    await query.answer("❌ Access denied (Admin required).", show_alert=True)
-                    try: await query.edit_message_text("❌ Action cancelled (No admin rights).")
-                    except: pass
-                    return
+                # Admin check is already done by handle_callback_query
 
                 global is_headless_enabled
                 is_headless_enabled = False
@@ -7720,15 +8703,7 @@ async def handle_callback_query(update, context):
             decision = parts[1] # Should be 'yes' or 'no'
 
             if decision == "yes":
-                # --- Admin Check ---
-                if not is_user_admin(query.from_user.id):
-                    logger.warning(f"User {query.from_user.id} tried to disable headless via scrape prompt without admin rights.")
-                    await query.answer("❌ Access denied (Admin required).", show_alert=True)
-                    try: await query.edit_message_text("❌ Action cancelled (No admin rights).")
-                    except: pass
-                    # No resume here, original command handler resumes on denial
-                    return
-                # --- End Admin Check ---
+                # Admin check is already done by handle_callback_query
 
                 is_headless_enabled = False
                 save_settings()
@@ -8092,11 +9067,17 @@ async def run():
     global last_follow_attempt_time, current_account_usernames_to_follow, is_periodic_follow_active
     global schedule_pause_start, schedule_pause_end # Access for messages
     global search_mode, current_account # For start message
+    global schedule_sync_enabled, schedule_sync_start_time, schedule_sync_end_time, last_sync_schedule_run_date
+    global schedule_follow_list_enabled, schedule_follow_list_start_time, schedule_follow_list_end_time, last_follow_list_schedule_run_date
+    global cancel_sync_flag, cancel_scheduled_follow_list_flag # Declare these as global
 
     network_error_count = 0
     last_error_time = time.time()
 
     try:
+        # --- Ensure all base data files exist (call this early) ---
+        ensure_data_files_exist() # New function call
+
         # --- Initialization (Telegram Bot, Settings, Lists etc.) ---
         print("Initializing Telegram Bot...")
         global ACTIVE_BOT_TOKEN
@@ -8137,16 +9118,14 @@ async def run():
         add_admin_command_handler(application, "like", like_command)
         add_admin_command_handler(application, "repost", repost_command)
         add_admin_command_handler(application, "account", account_command) # Maybe leave account public?
-        # Keep help public!
-        application.add_handler(CommandHandler("help", help_command))
+        add_admin_command_handler(application, "help", help_command)
         add_admin_command_handler(application, "status", status_command)
         add_admin_command_handler(application, "stats", stats_command) # Maybe leave stats public?
         add_admin_command_handler(application, "count", stats_command) # Alias for stats
-        # Keep ping public!
-        application.add_handler(CommandHandler("ping", ping_command))
-        add_admin_command_handler(application, "mode", mode_command) # Maybe leave mode public?
-        add_admin_command_handler(application, "modefull", mode_full_command)
-        add_admin_command_handler(application, "modeca", mode_ca_command)
+        add_admin_command_handler(application, "ping", ping_command)
+        #add_admin_command_handler(application, "mode", mode_command) # Maybe leave mode public?
+        #add_admin_command_handler(application, "modefull", mode_full_command)
+        #add_admin_command_handler(application, "modeca", mode_ca_command)
         add_admin_command_handler(application, "pause", pause_command)
         add_admin_command_handler(application, "resume", resume_command)
         add_admin_command_handler(application, "schedule", schedule_command) # Maybe leave schedule public?
@@ -8154,6 +9133,11 @@ async def run():
         add_admin_command_handler(application, "scheduleoff", schedule_off_command)
         add_admin_command_handler(application, "scheduletime", schedule_time_command)
         add_admin_command_handler(application, "switchaccount", switch_account_command)
+        add_admin_command_handler(application, "schedulesync", schedule_sync_toggle_command) # Toggles on/off
+        add_admin_command_handler(application, "schedulesynctime", schedule_sync_time_command)
+        add_admin_command_handler(application, "schedulefollowlist", schedule_follow_list_toggle_command) # Toggles on/off
+        add_admin_command_handler(application, "schedulefollowlisttime", schedule_follow_list_time_command)
+        add_admin_command_handler(application, "allschedules", show_detailed_schedules_command) # Shows status of all
 
         # Admin Management Commands (now also registered via the helper)
         # IMPORTANT: The functions themselves NO LONGER need the @admin_required decorator!
@@ -8245,7 +9229,6 @@ async def run():
         # The main loop will handle the resume case correctly.
 
         running_status = "⏸️ PAUSED 🟡 (Schedule)" if is_scraping_paused and is_schedule_pause else ("⏸️ PAUSED 🟡 (Manual)" if is_scraping_paused else "▶️ RUNNING 🟢")
-        mode_text = "Full 💯 (CA + Keywords)" if search_mode == "full" else "📝 CA ONLY"
         schedule_status = "ON 🟢" if schedule_enabled else "OFF ❌"
         current_username_welcome = get_current_account_username() or "N/A"
         autofollow_mode_display = auto_follow_mode.upper()
@@ -8260,11 +9243,13 @@ async def run():
             f"👉 Acc {current_account+1} (@{current_username_welcome})\n\n"
             f"📊 ▫️STATUS▫️\n"
             f"{running_status}\n"
-            f"🔍 Search mode: {mode_text}\n"
-            f"💲 Ticker Search: {ticker_status_welcome}\n"
+            f"🔑 Keyword 🔎: {'ON 🟢' if search_keywords_enabled else 'OFF 🔴'}\n"
+            f"📝 CA 🔎: {'ON 🟢' if search_ca_enabled else 'OFF 🔴'}\n"
+            f"💲 Ticker 🔎: {ticker_status_welcome}\n"
             f"👻 Headless Mode: {headless_status_welcome}\n" # New line for Headless status
             f"⏰ Schedule: {schedule_status} ({schedule_pause_start} - {schedule_pause_end})\n"
             f"🏃🏼‍♂️‍➡️ Auto-Follow: {autofollow_mode_display}\n"
+            f"🌍 Timezone: {USER_TIMEZONE_STR}\n"
         )
 
 
@@ -8304,7 +9289,149 @@ async def run():
         print("Starting main loop...")
         while True:
             try:
-                # 1. Schedule Check (as before)
+                # --- New Scheduled Task Checks (Sync & Follow List) ---
+                # These run regardless of the main bot's pause state.
+                # They will internally manage pausing/resuming the main scraping if they use the browser.
+                if USER_CONFIGURED_TIMEZONE: # Ensure timezone is loaded
+                    now_local_dt_for_sched = datetime.now(USER_CONFIGURED_TIMEZONE)
+                    today_date_for_sched = now_local_dt_for_sched.date()
+                    current_time_str_for_sched = now_local_dt_for_sched.strftime("%H:%M")
+
+                    # Check Scheduled Sync
+                    if schedule_sync_enabled and \
+                       (last_sync_schedule_run_date is None or last_sync_schedule_run_date != today_date_for_sched):
+                        
+                        start_sync_dt_obj = datetime.strptime(schedule_sync_start_time, "%H:%M").time()
+                        end_sync_dt_obj = datetime.strptime(schedule_sync_end_time, "%H:%M").time()
+                        
+                        is_within_sync_window = False
+                        current_time_obj = now_local_dt_for_sched.time()
+
+                        if end_sync_dt_obj <= start_sync_dt_obj: # Overnight window
+                            if current_time_obj >= start_sync_dt_obj or current_time_obj < end_sync_dt_obj:
+                                is_within_sync_window = True
+                        else: # Same day window
+                            if start_sync_dt_obj <= current_time_obj < end_sync_dt_obj:
+                                is_within_sync_window = True
+                        
+                        if is_within_sync_window:
+                            logger.debug(f"[Scheduler Check SYNC] Within window. Last run: {last_sync_schedule_run_date}, Today: {today_date_for_sched}")
+                            active_account_username = get_current_account_username() or "N/A"
+                            task_blocked = False
+                            # Check if another TYPE of scheduled task is running, or if THIS task type is already running.
+                            if is_scheduled_follow_list_running: # Check if the *other* type is running
+                                logger.warning(f"[Scheduler] Scheduled Sync for @{active_account_username} BLOCKED: Scheduled Follow List task is active.")
+                                await send_telegram_message(f"⚠️ Scheduled Sync for @{active_account_username} skipped: Follow List task is active.")
+                                task_blocked = True
+                            elif is_sync_running: # Check if an instance of THIS task type is already running
+                                logger.warning(f"[Scheduler] Scheduled Sync for @{active_account_username} BLOCKED: Another Sync task is already running.")
+                                await send_telegram_message(f"⚠️ Scheduled Sync for @{active_account_username} skipped: another sync task is already running.")
+                                task_blocked = True
+                            
+                            if task_blocked:
+                                # If blocked, but it's the first time today we've hit this window,
+                                # mark it as "attempted" for today to prevent re-logging/re-messaging.
+                                last_sync_schedule_run_date = today_date_for_sched 
+                                save_schedule()
+                                logger.info(f"[Scheduler] Updated last_sync_schedule_run_date to {today_date_for_sched} because task was blocked but due.")
+                            else:
+                                # Conditions met to actually start the task
+                                logger.info(f"[Scheduler] Current time is within Scheduled Sync window ({schedule_sync_start_time}-{schedule_sync_end_time}). Starting task for @{active_account_username}.")
+                                await send_telegram_message(f"⏰ Starting Scheduled Sync for @{active_account_username} (Window: {schedule_sync_start_time}-{schedule_sync_end_time})...")
+                                asyncio.create_task(sync_followers_logic(
+                                    update=None, 
+                                    account_username=active_account_username,
+                                    backup_filepath=get_current_backup_file_path(),
+                                    global_set_for_sync=load_set_from_file(GLOBAL_FOLLOWED_FILE)
+                                ))
+                                # The sync_followers_logic itself will update last_sync_schedule_run_date upon *successful completion*.
+                                # If it fails or is cancelled, it won't update, allowing a retry on a subsequent day if the window is hit again.
+
+                    # Check Scheduled Follow List Processing
+                    if schedule_follow_list_enabled and \
+                       (last_follow_list_schedule_run_date is None or last_follow_list_schedule_run_date != today_date_for_sched):
+
+                        start_fl_dt_obj = datetime.strptime(schedule_follow_list_start_time, "%H:%M").time()
+                        end_fl_dt_obj = datetime.strptime(schedule_follow_list_end_time, "%H:%M").time()
+                        current_time_obj = now_local_dt_for_sched.time()
+
+                        is_within_fl_window = False
+                        if end_fl_dt_obj <= start_fl_dt_obj: # Overnight window
+                            if current_time_obj >= start_fl_dt_obj or current_time_obj < end_fl_dt_obj:
+                                is_within_fl_window = True
+                        else: # Same day window
+                            if start_fl_dt_obj <= current_time_obj < end_fl_dt_obj:
+                                is_within_fl_window = True
+
+                        if is_within_fl_window:
+                            logger.debug(f"[Scheduler Check FOLLOW_LIST] Within window. Last run: {last_follow_list_schedule_run_date}, Today: {today_date_for_sched}")
+                            active_account_username = get_current_account_username() or "N/A"
+                            task_blocked = False
+                            # Check if another TYPE of scheduled task is running, or if THIS task type is already running.
+                            if is_sync_running: # Check if the *other* type is running
+                                logger.warning(f"[Scheduler] Scheduled Follow List for @{active_account_username} BLOCKED: Scheduled Sync task is active.")
+                                await send_telegram_message(f"⚠️ Scheduled Follow List for @{active_account_username} skipped: Sync task is active.")
+                                task_blocked = True
+                            elif is_scheduled_follow_list_running: # Check if an instance of THIS task type is already running
+                                logger.warning(f"[Scheduler] Scheduled Follow List for @{active_account_username} BLOCKED: Another Follow List task is already running.")
+                                await send_telegram_message(f"⚠️ Scheduled Follow List for @{active_account_username} skipped: another Follow List task is already running.")
+                                task_blocked = True
+                            
+                            if task_blocked:
+                                last_follow_list_schedule_run_date = today_date_for_sched
+                                save_schedule()
+                                logger.info(f"[Scheduler] Updated last_follow_list_schedule_run_date to {today_date_for_sched} because task was blocked but due.")
+                            else:
+                                logger.info(f"[Scheduler] Current time is within Scheduled Follow List window ({schedule_follow_list_start_time}-{schedule_follow_list_end_time}). Starting task for @{active_account_username}.")
+                                await send_telegram_message(f"⏰ Starting Scheduled Follow List Processing for @{active_account_username} (Window: {schedule_follow_list_start_time}-{schedule_follow_list_end_time})...")
+                                asyncio.create_task(process_follow_list_schedule_logic(None))
+                                # The process_follow_list_schedule_logic itself will update last_follow_list_schedule_run_date upon *successful completion*.
+                else:
+                    logger.warning("[Scheduler] USER_CONFIGURED_TIMEZONE not set, cannot run new scheduled tasks.")
+                # --- End New Scheduled Task Checks ---
+
+                # --- Check and Stop Overdue Scheduled Tasks ---
+                if USER_CONFIGURED_TIMEZONE: # Ensure timezone is loaded
+                    now_for_stop_check = datetime.now(USER_CONFIGURED_TIMEZONE)
+                    
+                    # Check Sync Task
+                    if is_sync_running and schedule_sync_enabled and not cancel_sync_flag:
+                        # Determine the date the current/last sync task was supposed to run or start
+                        # If last_sync_schedule_run_date is today, it means it started today or is due today.
+                        # If it's yesterday, it might be an overnight task that started yesterday.
+                        task_run_date_for_end_check = last_sync_schedule_run_date if last_sync_schedule_run_date else now_for_stop_check.date()
+
+                        s_time_obj = datetime.strptime(schedule_sync_start_time, "%H:%M").time()
+                        e_time_obj = datetime.strptime(schedule_sync_end_time, "%H:%M").time()
+                        
+                        # Determine the actual datetime the task should have ended
+                        task_end_dt_on_schedule = datetime.combine(task_run_date_for_end_check, e_time_obj, tzinfo=USER_CONFIGURED_TIMEZONE)
+                        if e_time_obj <= s_time_obj: # Overnight task, so end time is on the next day relative to task_run_date_for_end_check
+                            task_end_dt_on_schedule += timedelta(days=1)
+                        
+                        if now_for_stop_check > task_end_dt_on_schedule:
+                            logger.warning(f"[Scheduler] Sync task for @{get_current_account_username()} is running past its scheduled end time ({schedule_sync_end_time}). Requesting cancellation.")
+                            await send_telegram_message(f"⏰ Scheduled Sync task for @{get_current_account_username()} is running past its end time ({schedule_sync_end_time}). Attempting to stop.")
+                            cancel_sync_flag = True # Signal the task to stop
+
+                    # Check Follow List Task
+                    if is_scheduled_follow_list_running and schedule_follow_list_enabled and not cancel_scheduled_follow_list_flag:
+                        task_run_date_fl_for_end_check = last_follow_list_schedule_run_date if last_follow_list_schedule_run_date else now_for_stop_check.date()
+
+                        s_time_obj_fl = datetime.strptime(schedule_follow_list_start_time, "%H:%M").time()
+                        e_time_obj_fl = datetime.strptime(schedule_follow_list_end_time, "%H:%M").time()
+
+                        task_end_dt_fl_on_schedule = datetime.combine(task_run_date_fl_for_end_check, e_time_obj_fl, tzinfo=USER_CONFIGURED_TIMEZONE)
+                        if e_time_obj_fl <= s_time_obj_fl: # Overnight
+                            task_end_dt_fl_on_schedule += timedelta(days=1)
+
+                        if now_for_stop_check > task_end_dt_fl_on_schedule:
+                            logger.warning(f"[Scheduler] Follow List task for @{get_current_account_username()} running past scheduled end time ({schedule_follow_list_end_time}). Requesting cancellation.")
+                            await send_telegram_message(f"⏰ Scheduled Follow List task for @{get_current_account_username()} running past end time ({schedule_follow_list_end_time}). Attempting to stop.")
+                            cancel_scheduled_follow_list_flag = True
+                # --- End Check and Stop Overdue ---
+
+                # 1. Schedule Check (for main bot pause/resume)
                 schedule_action = check_schedule()
                 if schedule_action == "resume":
                     if is_scraping_paused and is_schedule_pause:
@@ -8317,21 +9444,24 @@ async def run():
                         print("[Run Loop] Schedule starting pause...")
                         # --- Message about pause start (logic for time calculation remains) ---
                         try:
-                            try: local_tz = ZoneInfo("Europe/Berlin")
-                            except: local_tz = ZoneInfo(None) # Fallback
-                            now = datetime.now(local_tz); today = now.date()
-                            start_dt = datetime.strptime(f"{today} {schedule_pause_start}", "%Y-%m-%d %H:%M").replace(tzinfo=local_tz)
-                            end_dt = datetime.strptime(f"{today} {schedule_pause_end}", "%Y-%m-%d %H:%M").replace(tzinfo=local_tz)
+                            local_tz = USER_CONFIGURED_TIMEZONE # Use global
+                            if local_tz is None: local_tz = timezone.utc # Fallback
+                            
+                            now_local = datetime.now(local_tz)
+                            today_local = now_local.date()
+                            start_dt = datetime.strptime(f"{today_local} {schedule_pause_start}", "%Y-%m-%d %H:%M").replace(tzinfo=local_tz)
+                            end_dt = datetime.strptime(f"{today_local} {schedule_pause_end}", "%Y-%m-%d %H:%M").replace(tzinfo=local_tz)
                             next_end_dt = end_dt
                             is_overnight = end_dt <= start_dt
                             # Determine the *next* end time correctly
+                            # Determine the *next* end time correctly
                             if is_overnight: # If overnight
-                                if now >= end_dt: # If today's end time has already passed
+                                if now_local >= end_dt: # Use now_local
                                      next_end_dt = end_dt + timedelta(days=1) # Take tomorrow's
-                            elif now >= end_dt: # If same day, but end time has already passed
+                            elif now_local >= end_dt: # Use now_local
                                  next_end_dt = end_dt + timedelta(days=1) # Take tomorrow's
 
-                            remaining_time = next_end_dt - now
+                            remaining_time = next_end_dt - now_local
                             remaining_seconds = max(0, remaining_time.total_seconds())
                             total_minutes = int(remaining_seconds // 60)
                             hours = total_minutes // 60
@@ -8471,7 +9601,7 @@ async def run():
 
                 # --- End Auto-Follow Check ---
 
-                # --- Queue Check 1: Before Tweet Processing ---
+                # --- Queue Check 1: Before post Processing ---
                 action_was_processed = await check_and_process_queue(application)
                 if action_was_processed:
                     continue # Start next loop iteration immediately after button action
@@ -8491,7 +9621,7 @@ async def run():
                 # --- Main Scraping Logic ---
                 await process_tweets()
 
-                # --- Queue Check 2: After Tweet Processing ---
+                # --- Queue Check 2: After post Processing ---
                 action_was_processed = await check_and_process_queue(application)
                 if action_was_processed:
                     continue # Start next loop iteration immediately after button action
@@ -8787,15 +9917,15 @@ async def set_max_age_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         if new_age >= 1: # Must be at least 1 minute
             max_tweet_age_minutes = new_age
             save_settings()
-            await update.message.reply_text(f"✅ Maximum tweet age set to {new_age} minutes.")
-            logger.info(f"Maximum tweet age set to {new_age} minutes by user {update.message.from_user.id}")
+            await update.message.reply_text(f"✅ Maximum post age set to {new_age} minutes.")
+            logger.info(f"Maximum post age set to {new_age} minutes by user {update.message.from_user.id}")
         else:
             await update.message.reply_text("❌ Age must be at least 1 minute.")
     except ValueError:
         await update.message.reply_text("❌ Invalid input. Please provide a whole number (minutes).")
     except Exception as e:
         await update.message.reply_text(f"❌ Error setting max age: {e}")
-        logger.error(f"Error setting max tweet age to '{context.args[0]}': {e}", exc_info=True)
+        logger.error(f"Error setting max post age to '{context.args[0]}': {e}", exc_info=True)
 
 # --- Headless Mode Toggle Command ---
 async def toggle_headless_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
