@@ -1,3 +1,8 @@
+"""
+raw-bot-X
+Version: 0.1.0
+"""
+
 import sys
 import nest_asyncio
 nest_asyncio.apply()

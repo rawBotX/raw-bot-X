@@ -205,7 +205,7 @@ removeadmin - Remove bot admin (e.g., /removeadmin 987654321)
 listadmins - List current bot admins
 ```
 
-## 🔐 File Permissions (Linux/macOS)
+## 🔐 File Permissions (Linux)
 Run this after you’ve started the bot for the first time.
 Make sure you're in the bot’s project directory (raw-bot-X/):
 ```bash
@@ -221,7 +221,6 @@ chmod 600 *.txt global_followed_users.txt
 
 - Raspberry Pi (tested on Pi 4, 2GB, Pi OS Lite + LXQt, headless mode)
 - Linux (Debian/Ubuntu)
-- Windows (via CMD or WSL)
 
 ---
 
