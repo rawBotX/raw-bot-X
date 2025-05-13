@@ -5127,8 +5127,8 @@ async def show_help_message(update: Update):
         [separator_button],
         [ # Backup / Sync / Build
             InlineKeyboardButton("💾 1 Backup", callback_data="help:backup_followers"),
-            InlineKeyboardButton("🏗️ 2 Build Global", callback_data="help:build_global")
-            InlineKeyboardButton("🔄 3 Sync", callback_data="help:sync_follows"), # This is manual sync
+            InlineKeyboardButton("🏗️ 2 Build Global", callback_data="help:build_global"),
+            InlineKeyboardButton("🔄 3 Sync", callback_data="help:sync_follows")
         ],
         [separator_button],
         [ # Stats / Rates
