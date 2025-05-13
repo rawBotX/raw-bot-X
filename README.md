@@ -6,6 +6,8 @@ A Telegram-based account and post manager for X, primarily developed for monitor
 
 ---
 
+**Installation time: approximately 15 minutes to 1 hour** 
+
 ## ⚙️ Features
 
 ### 🔐 Login
@@ -55,6 +57,10 @@ Sends results to your Telegram group with:
 ### ⏱️ Schedule
 - Pause/resume bot at defined times
 - `/schedule 22:00-12:00`
+
+#X##XXXX##XXXX##XXXX##XXXX##XXXX##XXXX##XXXX##XXXX##XXX
+**XXXhier kommt noch sync und followlist abarbeiten**
+#X##XXXX##XXXX##XXXX##XXXX##XXXX##XXXX##XXXX##XXXX##XXX
 
 ### 📊 Statistics
 - Uptime
