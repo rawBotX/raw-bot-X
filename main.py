@@ -1,6 +1,6 @@
 """
 raw-bot-X
-Version: 0.1.0
+Version: 0.1.1
 """
 
 import sys
@@ -2022,11 +2022,13 @@ async def scrape_target_following(update: Update, target_username: str):
 
     # Clean the target username
     target_username = target_username.strip().lstrip('@')
-    if not re.match(r'^[A-Za-z0-9_]{1,15}$', target_username):
-        logger.error(f"[DB Scrape Internal] Invalid target username received: {target_username}")
-    if update and hasattr(update, 'message') and update.message:
-        await update.message.reply_text(f"❌ Invalid target username: {target_username}")
-        return # End early
+    if not re.match(r'^[A-Za-z0-9_]{1,15}$', target_username): # Check 1
+        logger.error(f"[DB Scrape Internal] Invalid target username received: '{target_username}'") # Log it
+        # Always send message if update is available, then always return if invalid.
+        if update and hasattr(update, 'message') and update.message: # Check 2
+            await update.message.reply_text(f"❌ Invalid target username: {target_username}")
+        # Crucially, return here regardless of 'update' object, if username is invalid.
+        return # End early if username is invalid
 
     # Check if a scrape is already running (important for standalone calls)
     if is_db_scrape_running:
@@ -2972,17 +2974,28 @@ async def scrape_following_command(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text(f"⚠️ Invalid usernames skipped: {', '.join(invalid_usernames)}")
     # --- End Argument Parsing ---
 
-    # Check if a scrape is already running (still needed here)
-    # Use a short wait/retry loop in case the flag is briefly True from a previous run ending
-    for _ in range(3): # Try up to 3 times
-        if is_db_scrape_running:
-            logger.warning("[Scrape Command] DB scrape seems to be running, waiting briefly...")
-            await asyncio.sleep(2)
-        else:
-            break # Flag is False, proceed
-    else: # Loop finished without break
-        await update.message.reply_text("⚠️ A database scrape process is still running after waiting. Please wait or use `/canceldbscrape`.")
-        return # Wrapper handles resume
+    # Check if a scrape is already running
+    if is_db_scrape_running:
+        logger.info(f"[Scrape Command] DB scrape is currently running. Adding {len(target_usernames)} requested username(s) to the queue.")
+        queued_count = 0
+        failed_to_queue_count = 0
+        for username_to_queue in target_usernames:
+            if add_username_to_scrape_queue(username_to_queue):
+                queued_count += 1
+            else:
+                failed_to_queue_count += 1
+        
+        queue_message = f"⏳ A database scrape is already in progress. {queued_count} username(s) have been added to the queue."
+        if failed_to_queue_count > 0:
+            queue_message += f" ({failed_to_queue_count} failed to add - check logs)."
+        if queued_count == 0 and failed_to_queue_count == 0: # Should not happen if target_usernames was not empty
+            queue_message = "ℹ️ A database scrape is already in progress. No valid usernames were provided to queue."
+            
+        await update.message.reply_text(queue_message)
+        # Do not proceed with headless check or starting a new scrape task.
+        # The wrapper for admin commands does not automatically resume scraping,
+        # and since we are not pausing here, the bot's state remains as is.
+        return # Exit the command handler
 
 
     # --- Headless Mode Handling ---
@@ -3123,6 +3136,36 @@ async def process_multiple_scrapes_sequentially(update: Update, usernames: list)
         if is_scraping_paused:
             logger.warning("[Multi Scrape Task] Scraping was paused at the end. Resuming.")
             await resume_scraping()
+
+        # --- Check and process queue AFTER this sequence is done ---
+        # This allows for continuous processing if new items were added to queue
+        # while this sequence was running.
+        # Only do this if the current run was NOT cancelled.
+        if not cancelled:
+            logger.info("[Multi Scrape Task] Sequence finished. Checking scrape queue for more users...")
+            queued_usernames_after_run = read_and_clear_scrape_queue()
+            if queued_usernames_after_run:
+                logger.info(f"[Multi Scrape Task] Found {len(queued_usernames_after_run)} more usernames in queue. Starting new processing task.")
+                # Send a message to Telegram that new queued items are being processed
+                # We need the 'update' object here. If it's not available (e.g. if this task was
+                # started without one), we might need to send to a default channel or log.
+                # For now, assume 'update' is available from the initial command.
+                if update and hasattr(update, 'message') and update.message:
+                    await update.message.reply_text(
+                        f"✅ Previous scrape sequence complete. Now processing {len(queued_usernames_after_run)} users from the queue: {', '.join(queued_usernames_after_run)}"
+                    )
+                else: # Fallback if no update object (e.g. started from initial bot queue check)
+                    await send_telegram_message(
+                        f"✅ Previous scrape sequence complete. Now processing {len(queued_usernames_after_run)} users from the queue: {', '.join(queued_usernames_after_run)}"
+                    )
+
+                # Start a new task for the queued usernames.
+                # This creates a new, independent processing flow.
+                asyncio.create_task(process_multiple_scrapes_sequentially(update, queued_usernames_after_run))
+            else:
+                logger.info("[Multi Scrape Task] Scrape queue is empty after sequence.")
+        else:
+            logger.info("[Multi Scrape Task] Sequence was cancelled, not checking queue for further processing.")
 
 async def add_from_db_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -3697,12 +3740,25 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                 return 
 
             elif payload == "toggle_schedule_follow_list": 
-                global schedule_follow_list_enabled
+                global schedule_follow_list_enabled, is_scheduled_follow_list_running, cancel_scheduled_follow_list_flag
+                
+                # Toggle the enabled state
                 schedule_follow_list_enabled = not schedule_follow_list_enabled
                 save_schedule()
                 status_text = "ENABLED 🟢" if schedule_follow_list_enabled else "DISABLED 🔴"
                 logger.info(f"Scheduled Follow List toggled to {status_text} via help button by user {query.from_user.id}")
-                await query.answer(f"Scheduled Follow List: {status_text}")
+                
+                # If disabling AND the task is currently running, set the cancel flag
+                if not schedule_follow_list_enabled and is_scheduled_follow_list_running:
+                    cancel_scheduled_follow_list_flag = True
+                    logger.info(f"Scheduled Follow List was disabled while running. Setting cancel_scheduled_follow_list_flag to True.")
+                    await query.answer(f"Sched. Follow: {status_text}. Stopping active task...", show_alert=False) # Slightly different message
+                    # Optionally send a message to the chat as well
+                    await query.message.reply_text(f"🚶‍♂️‍➡️ Scheduled Follow List: {status_text}.\nAttempting to stop the currently running task. It may take a moment.")
+                else:
+                    await query.answer(f"Scheduled Follow List: {status_text}")
+
+                # Update the button text
                 try:
                     original_markup = query.message.reply_markup
                     if original_markup:
@@ -3717,7 +3773,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                             new_keyboard.append(new_row)
                         await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_keyboard))
                 except Exception as e: logger.error(f"Error updating help button for Sched. Follow: {e}")
-                return 
+                return
 
             elif payload == "toggle_keywords":
                 # global search_keywords_enabled # REMOVE THIS LINE
@@ -3734,7 +3790,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                             new_row = []
                             for button in row:
                                 if button.callback_data == "help:toggle_keywords":
-                                    new_button_text = f"🔑 Keywords {'🟢' if search_keywords_enabled else '🔴'}"
+                                    new_button_text = f"🔑 Words {'🟢' if search_keywords_enabled else '🔴'}"
                                     new_row.append(InlineKeyboardButton(new_button_text, callback_data="help:toggle_keywords"))
                                 elif button.callback_data == "help:toggle_ca": # Keep other buttons in row updated
                                     new_button_text = f"📝 CA {'🟢' if search_ca_enabled else '🔴'}"
@@ -5070,14 +5126,14 @@ async def show_help_message(update: Update):
         ],
         [separator_button],
         [ # Backup / Sync / Build
-            InlineKeyboardButton("💾 Backup", callback_data="help:backup_followers"),
-            InlineKeyboardButton("🔄 Sync", callback_data="help:sync_follows"), # This is manual sync
-            InlineKeyboardButton("🏗️ Build Global", callback_data="help:build_global")
+            InlineKeyboardButton("💾 1 Backup", callback_data="help:backup_followers"),
+            InlineKeyboardButton("🏗️ 2 Build Global", callback_data="help:build_global")
+            InlineKeyboardButton("🔄 3 Sync", callback_data="help:sync_follows"), # This is manual sync
         ],
         [separator_button],
         [ # Stats / Rates
             InlineKeyboardButton("📊 Stats", callback_data="help:stats"),
-            InlineKeyboardButton("⭐️ Rates", callback_data="help:show_rates"),
+            InlineKeyboardButton("💎 Rates", callback_data="help:show_rates"),
             InlineKeyboardButton("🌍 Global Info", callback_data="help:global_info"),
             InlineKeyboardButton("🏓 Ping", callback_data="help:ping")
         ],
@@ -5560,8 +5616,13 @@ async def sync_followers_logic(update: Update, account_username: str, backup_fil
     # Prevent starting if another scheduled browser task is running (only for scheduled runs)
     if is_scheduled_run and is_any_scheduled_browser_task_running:
         logger.warning(f"[Sync @{account_username}] Scheduled run skipped: another scheduled browser task is active.")
-        # Silently skip for scheduler, or send a message if manually triggered with update=None (less likely)
+        # Silently skip for scheduler.
         return
+
+    # For manual runs (is_scheduled_run is False), we don't check is_any_scheduled_browser_task_running here,
+    # as a manual command should generally be allowed to proceed if the user explicitly requests it,
+    # even if another *different* scheduled task is running.
+    # The check for is_sync_running (below) will still prevent multiple *sync* tasks from running concurrently.
 
     if is_sync_running: # Check if this specific sync task type is already running
         if update and hasattr(update, 'message') and update.message: # Manual trigger
@@ -7867,7 +7928,7 @@ async def process_tweets():
                                     except ValueError: continue
                                 if total_ratings > 0:
                                     average_rating = weighted_sum / total_ratings
-                                    rating_display = f" {average_rating:.1f}⭐({total_ratings})" # Space at the beginning
+                                    rating_display = f" {average_rating:.1f}💎({total_ratings})" # Space at the beginning
                         # --- End rating info ---
 
                         user_info_line = f"👤 <b><a href=\"https://x.com/{html.escape(author_handle.lstrip('@'))}\">{html.escape(author_name)}</a></b> (<code><i>{html.escape(author_handle)}</i></code>){rating_display}" # Rating appended here
@@ -7922,7 +7983,7 @@ async def process_tweets():
                                 logger.warning(f"Name encoding failed for {source_key}: {enc_err}. Using key.")
                                 encoded_name = base64.urlsafe_b64encode(source_key.encode()).decode()
                             # Rating Buttons
-                            rating_buttons_row = [InlineKeyboardButton(str(i)+"⭐", callback_data=f"rate:{i}:{source_key}:{encoded_name}") for i in range(1, 6)]
+                            rating_buttons_row = [InlineKeyboardButton(str(i)+"💎", callback_data=f"rate:{i}:{source_key}:{encoded_name}") for i in range(1, 6)]
                             combined_keyboard.append(rating_buttons_row)
 
                         # Like/Repost/FullText Buttons
@@ -8109,33 +8170,33 @@ async def account_request(update: Update):
     await update.message.reply_text(f"🥷 Current Account: {current_account+1}")
     await resume_scraping()
 
-async def reboot_request(update: Update):
-    """Process reboot requests centrally"""
-    await update.message.reply_text(f"♻️ R E B O O T")
-    try:
-        # Save counts before rebooting
-        save_posts_count()
-        # Wait a moment to ensure the message is sent
-        await asyncio.sleep(5)
-        # Execute system reboot command
-        os.system("sudo reboot")
-    except Exception as reboot_error:
-        await send_telegram_message(f"❌ Error during reboot: {str(reboot_error)}")
-    await resume_scraping()
+# async def reboot_request(update: Update):
+#     """Process reboot requests centrally"""
+#     await update.message.reply_text(f"♻️ R E B O O T")
+#     try:
+#         # Save counts before rebooting
+#         save_posts_count()
+#         # Wait a moment to ensure the message is sent
+#         await asyncio.sleep(5)
+#         # Execute system reboot command
+#         os.system("sudo reboot")
+#     except Exception as reboot_error:
+#         await send_telegram_message(f"❌ Error during reboot: {str(reboot_error)}")
+#     await resume_scraping()
 
-async def shutdown_request(update: Update):
-    """Process shutdown requests centrally"""
-    await update.message.reply_text(f"😴 SHUTDOWN")
-    try:
-        # Save counts before shutdown
-        save_posts_count()
-        # Wait a moment to ensure the message is sent
-        await asyncio.sleep(5)
-        # Execute system shutdown command
-        os.system("sudo shutdown now")
-    except Exception as shutdown_error:
-        await send_telegram_message(f"❌ Error during shutdown: {str(shutdown_error)}")
-    await resume_scraping()
+# async def shutdown_request(update: Update):
+#     """Process shutdown requests centrally"""
+#     await update.message.reply_text(f"😴 SHUTDOWN")
+#     try:
+#         # Save counts before shutdown
+#         save_posts_count()
+#         # Wait a moment to ensure the message is sent
+#         await asyncio.sleep(5)
+#         # Execute system shutdown command
+#         os.system("sudo shutdown now")
+#     except Exception as shutdown_error:
+#         await send_telegram_message(f"❌ Error during shutdown: {str(shutdown_error)}")
+#     await resume_scraping()
 
 async def show_keywords(update: Update):
     """Displays the current keywords"""
@@ -9336,21 +9397,30 @@ async def run():
                             if task_blocked:
                                 # If blocked, but it's the first time today we've hit this window,
                                 # mark it as "attempted" for today to prevent re-logging/re-messaging.
-                                last_sync_schedule_run_date = today_date_for_sched 
-                                save_schedule()
-                                logger.info(f"[Scheduler] Updated last_sync_schedule_run_date to {today_date_for_sched} because task was blocked but due.")
+                                # Only update if it's not already set to today (e.g. by a previous block attempt)
+                                if last_sync_schedule_run_date != today_date_for_sched:
+                                    last_sync_schedule_run_date = today_date_for_sched
+                                    save_schedule()
+                                    logger.info(f"[Scheduler] Updated last_sync_schedule_run_date to {today_date_for_sched} because task was blocked but due.")
                             else:
                                 # Conditions met to actually start the task
                                 logger.info(f"[Scheduler] Current time is within Scheduled Sync window ({schedule_sync_start_time}-{schedule_sync_end_time}). Starting task for @{active_account_username}.")
                                 await send_telegram_message(f"⏰ Starting Scheduled Sync for @{active_account_username} (Window: {schedule_sync_start_time}-{schedule_sync_end_time})...")
+                                # Create and run the task
+                                # The task itself will handle setting last_sync_schedule_run_date on completion
                                 asyncio.create_task(sync_followers_logic(
-                                    update=None, 
+                                    update=None, # Indicates a scheduled run
                                     account_username=active_account_username,
                                     backup_filepath=get_current_backup_file_path(),
                                     global_set_for_sync=load_set_from_file(GLOBAL_FOLLOWED_FILE)
                                 ))
-                                # The sync_followers_logic itself will update last_sync_schedule_run_date upon *successful completion*.
-                                # If it fails or is cancelled, it won't update, allowing a retry on a subsequent day if the window is hit again.
+                                # Mark as "attempted" for today immediately after launching the task
+                                # to prevent re-launching within the same day if the task is quick or fails early.
+                                # The task itself will update this again on *successful completion* for the *next* day's check.
+                                if last_sync_schedule_run_date != today_date_for_sched:
+                                    last_sync_schedule_run_date = today_date_for_sched
+                                    save_schedule()
+                                    logger.info(f"[Scheduler] Task launched. Updated last_sync_schedule_run_date to {today_date_for_sched} to prevent re-launch today.")
 
                     # Check Scheduled Follow List Processing
                     if schedule_follow_list_enabled and \
@@ -9639,14 +9709,15 @@ async def run():
                 if action_was_processed:
                     continue # Start next loop iteration immediately after button action
 
-                # Decide if scrolling happens in this iteration (ONLY if not paused)
-                if pause_event.is_set(): # Check if the pause event is NOT set (i.e., bot is running)
-                    if random.random() < 1: # Scrolls in 80% of cases WHEN RUNNING
+                # Decide if scrolling happens in this iteration
+                # Scroll ONLY if the bot is NOT paused by any mechanism (manual, schedule, OR by a sub-task like backup/sync)
+                if not is_scraping_paused: # is_scraping_paused is True if any task like backup/sync is running
+                    if random.random() < 0.8: # Scrolls in 80% of cases WHEN ACTIVELY SCRAPING (not paused by sub-task)
                         try:
                             # Random scroll distance
                             scroll_percentage = random.uniform(0.9, 3.5)
                             scroll_command = f"window.scrollBy(0, window.innerHeight * {scroll_percentage});"
-                            print(f"[Run Loop] Scrolling down by {scroll_percentage:.2f} * viewport height...") # Console output
+                            # print(f"[Run Loop] Scrolling down by {scroll_percentage:.2f} * viewport height...") # Console output (can be noisy)
                             driver.execute_script(scroll_command)
 
                             # Random wait time after scrolling
@@ -9655,11 +9726,12 @@ async def run():
                         except Exception as scroll_err:
                             print(f"Error scrolling in run loop: {scroll_err}")
                     else:
-                        # print("[Run Loop] Skipping scroll this iteration.") # Optional: Keep or remove log
+                        # print("[Run Loop] Skipping scroll this iteration (random chance or paused).") # Optional: Keep or remove log
                         await asyncio.sleep(random.uniform(0.5, 1.5)) # Still wait even if not scrolling
                 else:
-                    # If paused, just wait briefly instead of scrolling
-                    # print("[Run Loop] Paused, skipping scroll.") # Optional log
+                    # If paused (e.g., by backup_followers_logic), just wait briefly instead of scrolling.
+                    # This prevents the run loop from interfering with the backup's scrolling.
+                    # print("[Run Loop] Paused (likely by a sub-task), skipping run loop's scroll.") # Optional log
                     await asyncio.sleep(1.0) # Wait 1 second if paused
 
                 # --- Queue Check 4: After Scrolling / Pause Wait ---
@@ -9767,13 +9839,13 @@ async def show_ratings_command(update: Update, context: ContextTypes.DEFAULT_TYP
         top_3_output += "<i>(No sources with ratings yet)</i>\n"
     else:
         # Define medal emojis
-        medals = ["🥇", "🥈", "🥉"]
+        medals = ["🐶", "🐸", "🐱"]
         for i, item in enumerate(sorted_averages[:3]):
             # Get the corresponding medal, default to empty string if index out of bounds (shouldn't happen with [:3])
             medal = medals[i] if i < len(medals) else ""
             # Show Name and Handle (Key) with medal
             top_3_output += (f"{medal} {html.escape(item['name'])} ({html.escape(item['key'])}) "
-                             f"~ {item['average']:.2f} ⭐ ({item['total_ratings']} Ratings)\n")
+                             f"~ {item['average']:.2f} 💎 ({item['total_ratings']} Ratings)\n")
     top_3_output += "     ⚜️⚜️⚜️\n"
     current_message += top_3_output
     # === END Top 3 Section ===
@@ -9799,15 +9871,15 @@ async def show_ratings_command(update: Update, context: ContextTypes.DEFAULT_TYP
         for star in range(1, 6):
             star_str = str(star)
             count = rating_counts.get(star_str, 0)
-            details += f"{star} ⭐ - {count}\n"
+            details += f"{star} 💎 - {count}\n"
             total_ratings += count
             weighted_sum += star * count
 
         if total_ratings > 0:
             average = weighted_sum / total_ratings
-            avg_str = f"⭐ ~ {average:.2f}"
+            avg_str = f"💎 ~ {average:.2f}"
         else:
-            avg_str = "⭐ ~ N/A"
+            avg_str = "💎 ~ N/A"
 
         source_output += details + avg_str
 

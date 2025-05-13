@@ -9,9 +9,8 @@ A Telegram-based account and post manager for X, primarily developed for monitor
 ## ⚙️ Features
 
 ### 🔐 Login
-- Automatic login using cookies.
-- Fallback to automatic email/password login if cookies fail (`config.env`).
-- Authentication codes sent via Telegram.
+- Automatic login using email/password/username and cookies.(`config.env`)
+- Authentication codes can be sent via Telegram.
 - Automatic account switch on failure (not fully tested).
 - Supports long-term usage with automated Selenium driver restarts.
 
@@ -22,14 +21,13 @@ Scans your timeline for:
 - Ticker symbols
 
 **Scan modes** (combinable):
-- Ticker-only
-- CA-only
-- Keywords + CA
-- All combined
+- Ticker
+- Contract adress
+- Keywords
 
 Sends results to your Telegram group with:
-- Post image (if available)
-- Post time & time since posting (central european timezone, now on todo list.)
+- Post imagen (only 1)
+- Post time & time since posting
 - Direct link to the post
 - Post text
 - Ticker & CA copy buttons
@@ -226,7 +224,7 @@ chmod 600 *.txt global_followed_users.txt
 
 ## 📦 Version
 
-Current version: **v0.1.0**
+Current version: **v0.1.1**
 
 See all releases and changelogs here: [Releases](https://github.com/rawBotX/raw-bot-X/releases)
 
