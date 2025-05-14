@@ -1,6 +1,6 @@
 """
 raw-bot-X
-Version: 0.1.1
+Version: 0.1.2
 """
 
 import sys
@@ -911,6 +911,30 @@ def ensure_data_files_exist():
 
     print("INFO: Data file existence check complete.")
 
+def find_chrome_on_windows():
+    """Attempts to find the Google Chrome executable on Windows."""
+    # Common paths for Chrome on Windows
+    possible_paths = []
+    
+    # Program Files
+    program_files = os.environ.get("ProgramFiles", "C:\\Program Files")
+    program_files_x86 = os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")
+    
+    possible_paths.extend([
+        os.path.join(program_files, "Google\\Chrome\\Application\\chrome.exe"),
+        os.path.join(program_files_x86, "Google\\Chrome\\Application\\chrome.exe")
+    ])
+    
+    # Local AppData
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        possible_paths.append(os.path.join(local_app_data, "Google\\Chrome\\Application\\chrome.exe"))
+        
+    for path in possible_paths:
+        if os.path.exists(path):
+            return path
+    return None
+
 def create_driver():
     options = webdriver.ChromeOptions()
     global is_headless_enabled # Access the global setting
@@ -954,13 +978,56 @@ def create_driver():
     ]
     options.add_argument(f'user-agent={random.choice(user_agents)}')
 
-    # Check if we are on Raspberry Pi or another system
-    if is_raspberry_pi:
-        options.binary_location = '/usr/bin/chromium-browser'
-    else:
-        options.binary_location = '/usr/bin/chromium'
+    # OS-dependent path logic for browser and driver
+    is_windows = platform.system() == "Windows"
+    
+    if is_windows:
+        chrome_path_on_win = find_chrome_on_windows() # Helper function defined above
+        if chrome_path_on_win:
+            options.binary_location = chrome_path_on_win
+            print(f"INFO: Using Chrome from (Windows): {chrome_path_on_win}")
+        else:
+            print("WARNING: Chrome executable not found in common Windows locations. Selenium will try to find it in PATH or rely on ChromeDriver's capabilities to find a compatible browser.")
 
-    service = Service(executable_path='/usr/bin/chromedriver')
+        # ChromeDriver path for Windows
+        chromedriver_exe_path = "chromedriver.exe" # Default to PATH lookup
+        
+        # Attempt to find chromedriver.exe in script's directory or CWD
+        try:
+            # __file__ might not be defined if run in certain contexts (e.g. interactive REPL)
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            local_chromedriver = os.path.join(script_dir, "chromedriver.exe")
+            if os.path.exists(local_chromedriver):
+                chromedriver_exe_path = local_chromedriver
+                print(f"INFO: Using ChromeDriver from script directory: {chromedriver_exe_path}")
+            else:
+                # If not in script_dir, check Current Working Directory
+                cwd_chromedriver = os.path.join(os.getcwd(), "chromedriver.exe")
+                if os.path.exists(cwd_chromedriver):
+                    chromedriver_exe_path = cwd_chromedriver
+                    print(f"INFO: Using ChromeDriver from CWD: {chromedriver_exe_path}")
+                else:
+                    print("INFO: ChromeDriver.exe not found in script directory or CWD. Assuming it's in system PATH.")
+        except NameError: # __file__ is not defined
+            # Fallback to checking only CWD if script path is unavailable
+            cwd_chromedriver = os.path.join(os.getcwd(), "chromedriver.exe")
+            if os.path.exists(cwd_chromedriver):
+                chromedriver_exe_path = cwd_chromedriver
+                print(f"INFO: Using ChromeDriver from CWD (__file__ was not defined): {chromedriver_exe_path}")
+            else:
+                print("INFO: ChromeDriver.exe not found in CWD (__file__ was not defined). Assuming it's in system PATH.")
+        
+        service = Service(executable_path=chromedriver_exe_path)
+        print(f"INFO: Initializing ChromeDriver service for Windows with executable: {chromedriver_exe_path}")
+
+    elif is_raspberry_pi: # Original RPi logic (is_raspberry_pi is defined earlier in your function)
+        options.binary_location = '/usr/bin/chromium-browser'
+        service = Service(executable_path='/usr/bin/chromedriver')
+        print("INFO: Using Raspberry Pi specific paths for browser and driver.")
+    else: # Original Linux (non-RPi) logic
+        options.binary_location = '/usr/bin/chromium' # Default for other Linux
+        service = Service(executable_path='/usr/bin/chromedriver')
+        print("INFO: Using default Linux paths for browser and driver.")
 
     try:
         driver = webdriver.Chrome(service=service, options=options)

@@ -41,11 +41,11 @@ Sends results to your Telegram group with:
 ### ➕ Add Followers
 - Add via Telegram commands: `/follow [username]`, `/unfollow [username]`
 - Restore from backups
-- Sync from other accounts (global follow list)
-- Scan follow list from another account (only ~50 Accounts showing): `/scrapefollowing [username]`
+- Sync from side accounts (global follow list)
+- Scan follow list from another user account (only ~50 Accounts showing): `/scrapefollowing [username]`
 - Stores scraped users (with follower count, bio) in Database
 - Add from Database to followlist using filters:
-  - `/addfromdb followers:5000 seen:2 keywords:web3,CEO,facebook` (seen=how often this account has been seen in scanned accounts)
+  - `/addfromdb followers:5000 seen:2 keywords:ape,degenCEO,facebook` (seen=how often this account has been seen in scanned accounts)
   - `/addfromdb followers:30k keywords:meme`
   - `/addfromdb followers:1M`
 
@@ -57,16 +57,14 @@ Sends results to your Telegram group with:
 ### ⏱️ Schedule
 - Pause/resume bot at defined times
 - `/schedule 22:00-12:00`
-
-#X##XXXX##XXXX##XXXX##XXXX##XXXX##XXXX##XXXX##XXXX##XXX
-**XXXhier kommt noch sync und followlist abarbeiten**
-#X##XXXX##XXXX##XXXX##XXXX##XXXX##XXXX##XXXX##XXXX##XXX
+- Schedule of syncing the global userlist
+- Schedule processing of the follow list
 
 ### 📊 Statistics
 - Uptime
 - Posts found (today & total)
 - Posts scanned (today & total)
-- Total ads found (not working now)
+- Total ads found (not working at moment)
 - Average posts by weekday
 
 ### 💻 Headless Mode
@@ -80,17 +78,19 @@ Sends results to your Telegram group with:
 
 ---
 
-## 🚀 Installation
+## 🚀 Installation Linux
 
 ### 1. Choose a target folder and navigate into it
 ```bash
-mkdir -p ~/bots  # or any path you prefer
-cd ~/bots
+mkdir -p ~/rawbotx  # or any path you prefer
+cd ~/rawbotx
 ```
 ### 2. Clone the repository
 ```bash
 git clone https://github.com/rawBotX/raw-bot-X.git
 cd raw-bot-X
+
+Or download zip file and extract in your ~/rawbotx folder 
 ```
 
 ### 3. Install Dependencies
@@ -230,7 +230,7 @@ chmod 600 *.txt global_followed_users.txt
 
 ## 📦 Version
 
-Current version: **v0.1.1**
+Current version: **v0.1.2**
 
 See all releases and changelogs here: [Releases](https://github.com/rawBotX/raw-bot-X/releases)
 
