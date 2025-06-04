@@ -1,6 +1,6 @@
 """
 raw-bot-X
-Version: 0.1.2
+Version: 0.2.0
 """
 
 import sys
@@ -20,18 +20,33 @@ import html
 import base64
 import logging
 import traceback
+import getpass
+import io
+from typing import Union
 from telegram.constants import ParseMode
 from urllib.parse import urlparse
 from collections import deque
 from datetime import datetime, timezone, timedelta
 
+import tzlocal # Assuming tzlocal is now a requirement
+
 try:
     from zoneinfo import ZoneInfo
     print("INFO: Using 'zoneinfo' (Python 3.9+) for timezones.")
+    try:
+        import tzdata
+        print("INFO: Successfully imported 'tzdata' package. ZoneInfo should use its data.")
+    except ImportError:
+        print("INFO: 'tzdata' package not found or not used by zoneinfo. ZoneInfo will rely on system's or its own tzdata.")
 except ImportError:
     try:
         import pytz
         print("INFO: 'zoneinfo' not found, using 'pytz' as fallback.")
+        try:
+            import tzdata
+            print("INFO: Successfully imported 'tzdata' package. Pytz might use its data.")
+        except ImportError:
+            print("INFO: 'tzdata' package not found. Pytz will rely on its own bundled tzdata.")
         # Define a pytz-based ZoneInfo class for compatibility
         class ZoneInfo(pytz.tzinfo.BaseTzInfo):
             def __init__(self, zone):
@@ -61,50 +76,39 @@ USER_CONFIGURED_TIMEZONE = None # Will be set by load_user_timezone
 USER_TIMEZONE_STR = "" # Will be set to the name of the timezone being used
 
 def get_system_timezone_name():
-    """Attempts to get the system's IANA timezone name."""
+    """Attempts to get the system's IANA timezone name using tzlocal."""
     try:
-        # datetime.now().astimezone().tzname() can be unreliable for IANA names.
-        # It often returns abbreviations (PST, CET) or fixed offsets.
-        # A more robust method for system timezone is using the 'tzlocal' library,
-        # but we aim for a solution without new mandatory dependencies.
+        # tzlocal is now a requirement, so we can use it directly.
+        tz_name = tzlocal.get_localzone_name()
+        if tz_name:
+            try:
+                ZoneInfo(tz_name) # Validate that the name is usable by our ZoneInfo implementation
+                print(f"DEBUG: System timezone from tzlocal: '{tz_name}' (validated)")
+                return tz_name
+            except Exception as e_validate:
+                print(f"DEBUG: tzlocal returned '{tz_name}', but ZoneInfo validation failed: {e_validate}")
+        else:
+            print("DEBUG: tzlocal.get_localzone_name() returned None or empty string.")
+    except Exception as e_tzlocal:
+        print(f"DEBUG: Error using tzlocal.get_localzone_name(): {e_tzlocal}")
 
-        # On Linux, try reading /etc/timezone or /etc/localtime symlink
-        if platform.system() == "Linux":
-            try:
-                with open("/etc/timezone", "r") as f:
-                    tz_name = f.read().strip()
-                    ZoneInfo(tz_name) # Validate it's a known IANA name
-                    return tz_name
-            except Exception:
-                pass # File not found or invalid content
-            try:
-                # /etc/localtime is often a symlink to /usr/share/zoneinfo/Region/City
-                localtime_path = os.path.realpath("/etc/localtime")
-                if localtime_path.startswith("/usr/share/zoneinfo/"):
-                    # Extract like "Region/City"
-                    tz_name = localtime_path[len("/usr/share/zoneinfo/"):]
-                    ZoneInfo(tz_name) # Validate
-                    return tz_name
-            except Exception:
-                pass # Symlink not as expected or invalid
-        
-        # If not Linux or above methods failed, try a more general approach
-        # This is less reliable for getting a direct IANA name usable by ZoneInfo
-        # but can give a hint.
+    # Fallback: If tzlocal fails catastrophically or returns an unusable name,
+    # try the less reliable datetime.now().astimezone().tzname()
+    print("DEBUG: tzlocal failed to provide a usable timezone. Attempting datetime.astimezone().tzname().")
+    try:
         system_tz_offset_name = datetime.now().astimezone().tzname()
         if system_tz_offset_name:
             try:
-                # Check if the system name is directly usable by ZoneInfo
                 ZoneInfo(system_tz_offset_name)
+                print(f"DEBUG: System timezone from datetime.astimezone().tzname(): '{system_tz_offset_name}' (validated)")
                 return system_tz_offset_name
             except:
-                # If not directly usable, it's likely an abbreviation or offset.
-                # We can't reliably convert this to an IANA name without more tools.
                 print(f"DEBUG: System tzname() returned '{system_tz_offset_name}', which is not a direct IANA name for ZoneInfo.")
                 pass
-
     except Exception as e_sys_detect:
-        print(f"DEBUG: Error during system timezone detection: {e_sys_detect}")
+        print(f"DEBUG: Error during system timezone detection (datetime.astimezone().tzname()): {e_sys_detect}")
+    
+    print("DEBUG: Could not determine a valid system timezone name through any method.")
     return None
 
 def load_user_timezone():
@@ -151,35 +155,56 @@ def load_user_timezone():
 
     # Fallback to default (e.g., "Europe/Berlin")
     try:
+        # Attempt to load the default fallback timezone string
         USER_CONFIGURED_TIMEZONE = ZoneInfo(DEFAULT_FALLBACK_TIMEZONE_STR)
         USER_TIMEZONE_STR = DEFAULT_FALLBACK_TIMEZONE_STR
         print(f"INFO: Successfully loaded default fallback timezone: '{USER_TIMEZONE_STR}'")
     except Exception as e_fb_tz:
         print(f"ERROR: Could not load default fallback timezone '{DEFAULT_FALLBACK_TIMEZONE_STR}': {e_fb_tz}.")
-        print(f"       Using a fixed UTC offset or pure UTC as last resort.")
-        # Last resort: Use the FixedOffsetZone (if zoneinfo/pytz are missing) or UTC
+        print(f"       This often means the system's tzdata is missing or inaccessible by Python's zoneinfo/pytz.")
+        print(f"       Attempting to use UTC as a more robust fallback.")
+
+        # --- More robust UTC fallback ---
+        utc_loaded_successfully = False
         try:
-            USER_CONFIGURED_TIMEZONE = ZoneInfo(None) # This will use FixedOffsetZone if zoneinfo/pytz are missing
-            
-            # Determine the name of the fallback timezone object
-            if hasattr(USER_CONFIGURED_TIMEZONE, '_name') and USER_CONFIGURED_TIMEZONE._name: # Our FixedOffsetZone
-                USER_TIMEZONE_STR = USER_CONFIGURED_TIMEZONE._name
-            elif hasattr(USER_CONFIGURED_TIMEZONE, 'zone') and USER_CONFIGURED_TIMEZONE.zone: # pytz wrapper for ZoneInfo
-                USER_TIMEZONE_STR = USER_CONFIGURED_TIMEZONE.zone
-            elif isinstance(USER_CONFIGURED_TIMEZONE, timezone) and USER_CONFIGURED_TIMEZONE.utcoffset(None) == timedelta(0):
+            # First, try ZoneInfo("UTC"). This should work if zoneinfo or pytz is functional,
+            # and tzdata package is installed.
+            USER_CONFIGURED_TIMEZONE = ZoneInfo("UTC")
+            USER_TIMEZONE_STR = "UTC" 
+            print(f"INFO: Successfully loaded 'UTC' using the ZoneInfo provider (likely via tzdata package).")
+            utc_loaded_successfully = True
+        except Exception as e_utc_provider:
+            print(f"WARNING: Could not load 'UTC' using the ZoneInfo provider: {e_utc_provider}.")
+            # This path is taken if ZoneInfo itself is problematic or "UTC" is somehow not found by it,
+            # even with tzdata package (which would be unusual).
+        
+        if not utc_loaded_successfully:
+            # If ZoneInfo("UTC") failed, it implies a deeper issue.
+            # Fall back to the FixedOffsetZone (if defined and ZoneInfo points to it) or absolute datetime.timezone.utc.
+            try:
+                # Check if ZoneInfo is our lambda for FixedOffsetZone (meaning zoneinfo/pytz are missing)
+                if ZoneInfo.__name__ == "<lambda>" and 'FixedOffsetZone' in globals():
+                    # Instantiate FixedOffsetZone for UTC (0 offset)
+                    USER_CONFIGURED_TIMEZONE = FixedOffsetZone(offset_hours=0, name="UTC_FixedOffset_Fallback")
+                    USER_TIMEZONE_STR = USER_CONFIGURED_TIMEZONE._name 
+                    print(f"INFO: Using '{USER_TIMEZONE_STR}' via FixedOffsetZone as UTC fallback.")
+                else:
+                    # If ZoneInfo is not our lambda, or FixedOffsetZone is not available,
+                    # or if we got here despite zoneinfo/pytz being present (e.g. ZoneInfo("UTC") failed unexpectedly),
+                    # use the most basic Python UTC.
+                    raise RuntimeError("Not using FixedOffsetZone lambda or it's unavailable, or ZoneInfo('UTC') failed unexpectedly.")
+            except Exception: 
+                print(f"INFO: Using absolute 'datetime.timezone.utc' as final fallback.")
+                USER_CONFIGURED_TIMEZONE = timezone.utc
                 USER_TIMEZONE_STR = "UTC"
-            else: # Fallback for other tzinfo objects or if name is not descriptive
-                offset = USER_CONFIGURED_TIMEZONE.utcoffset(datetime.now())
-                if offset is not None:
-                    offset_hours = offset.total_seconds() / 3600
-                    USER_TIMEZONE_STR = f"UTC{offset_hours:+03.0f}:00_Fallback"
-                else: # Should not happen with our FixedOffsetZone or UTC
-                    USER_TIMEZONE_STR = "Unknown_Offset_Fallback"
-            print(f"INFO: Using '{USER_TIMEZONE_STR}' as final fallback timezone.")
-        except Exception as e_final_fb:
-            USER_CONFIGURED_TIMEZONE = timezone.utc # Absolute last resort
-            USER_TIMEZONE_STR = "UTC"
-            print(f"CRITICAL ERROR: All timezone loading failed catastrophically: {e_final_fb}. Using UTC as absolute fallback.")
+        
+        print(f"INFO: Final fallback timezone set to: '{USER_TIMEZONE_STR}'")
+
+    # Final check to ensure USER_CONFIGURED_TIMEZONE is not None
+    if USER_CONFIGURED_TIMEZONE is None:
+        print(f"CRITICAL ERROR: USER_CONFIGURED_TIMEZONE is still None after all fallbacks. This should not happen. Defaulting to datetime.timezone.utc.")
+        USER_CONFIGURED_TIMEZONE = timezone.utc
+        USER_TIMEZONE_STR = "UTC"
 
 load_user_timezone()
 # --- End Timezone Configuration ---
@@ -193,7 +218,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import NoSuchElementException, TimeoutException, StaleElementReferenceException
+from selenium.common.exceptions import NoSuchElementException, TimeoutException, StaleElementReferenceException, ElementClickInterceptedException
 from selenium.webdriver.chrome.service import Service
 from telegram import InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CallbackQueryHandler
@@ -223,6 +248,12 @@ r"                     ////        \\\   \\\                 ",
 r"                   ////            \\\   \\\               ",
 r"                 ////                \\\   \\\             ",
 r"               ////                    \\\\\\\\\           ",
+r"                                                           ",
+r"                                                           ",
+r"                                                           ",
+r"                                                           ",
+r"                                                           ",
+r"                                                           ",
 r"                                                           ",
 r"                                                           ",
 r"                                                           "
@@ -266,26 +297,90 @@ TOKEN_PATTERN = r"(?<![/\"'=&?])(?:\b[A-Za-z0-9]{32,}\b)(?![/\"'&?])"
 AUTH_CODE = None
 WAITING_FOR_AUTH = False
 
-# Load .env file
+# Load .env file (encrypted or plain)
+encrypted_config_filename = "config.env.gpg"
+plain_config_filename = "config.env"
+loaded = False # Flag to track if .env was successfully loaded
+
 try:
-    # Optional: Use explicit path relative to the script
-    # script_dir = os.path.dirname(__file__)
-    # dotenv_path = os.path.join(script_dir, 'config.env')
-    # print(f"DEBUG: Trying to load .env from: {dotenv_path}")
-    # loaded = load_dotenv(dotenv_path=dotenv_path, verbose=True)
+    if os.path.exists(encrypted_config_filename):
+        print(f"INFO: Encrypted config file '{encrypted_config_filename}' found.")
+        gpg_available = False
+        try:
+            # Check if GPG is available
+            gpg_check_process = subprocess.run(['gpg', '--version'], check=False, capture_output=True, text=True)
+            if gpg_check_process.returncode == 0:
+                gpg_available = True
+            else:
+                print("ERROR: 'gpg --version' command failed. GPG might not be properly installed or configured.")
+                print(f"GPG --version stderr: {gpg_check_process.stderr.strip()}")
+        except FileNotFoundError:
+            print("ERROR: 'gpg' command not found. Cannot decrypt config.env.gpg. Please install GnuPG.")
+            # If encrypted file exists but GPG is not found, this is a critical issue.
+            # We might not want to fall back to a plain config.env in this case.
+            # For now, we'll raise an error that will be caught by the outer exception handler.
+            raise Exception(f"GPG not found, but encrypted config '{encrypted_config_filename}' exists.")
+        
+        if gpg_available:
+            try:
+                passphrase = getpass.getpass(prompt=f"Enter passphrase for {encrypted_config_filename}: ")
+                if not passphrase:
+                    print("WARNING: No passphrase entered. Skipping decryption of encrypted config.")
+                else:
+                    # Decrypt
+                    decrypt_process = subprocess.run(
+                        ['gpg', '--decrypt', '--quiet', '--batch', '--passphrase-fd', '0', encrypted_config_filename],
+                        input=passphrase + '\n', # GPG expects a newline
+                        capture_output=True,
+                        text=True,
+                        check=False # Manually check returncode
+                    )
 
-    # Or stick to the relative path to the working directory
-    config_path_load = os.path.abspath("config.env") # Get path for the message
-    print(f"DEBUG: Trying to load .env from: {config_path_load}")
-    loaded = load_dotenv("config.env", verbose=True) # verbose=True for more info
+                    if decrypt_process.returncode == 0:
+                        decrypted_content = decrypt_process.stdout
+                        if decrypted_content:
+                            print(f"INFO: Successfully decrypted '{encrypted_config_filename}'. Loading variables...")
+                            decrypted_stream = io.StringIO(decrypted_content)
+                            loaded = load_dotenv(stream=decrypted_stream, verbose=True)
+                            if loaded:
+                                print(f"DEBUG: load_dotenv from decrypted stream successful? {loaded}")
+                            else:
+                                print(f"WARNING: load_dotenv from decrypted stream reports that the stream was not loaded or was empty.")
+                        else:
+                            print(f"WARNING: Decryption of '{encrypted_config_filename}' produced empty output. This might indicate an issue with the file or GPG.")
+                    else:
+                        print(f"ERROR: Failed to decrypt '{encrypted_config_filename}'. GPG exit code: {decrypt_process.returncode}")
+                        if decrypt_process.stderr:
+                            print(f"GPG Stderr: {decrypt_process.stderr.strip()}")
+                        print("       Check passphrase or GPG setup. Will attempt to load plain 'config.env' if it exists as a fallback.")
+            except Exception as e_decrypt_inner:
+                print(f"ERROR: An error occurred during the decryption process for '{encrypted_config_filename}': {e_decrypt_inner}")
+                print("       Will attempt to load plain 'config.env' if it exists as a fallback.")
 
-    print(f"DEBUG: load_dotenv successful? {loaded}")
+    # Fallback or primary load of plain config.env
     if not loaded:
-         print("WARNING: load_dotenv reports that the file was not loaded or was empty.")
-except Exception as e_dotenv:
-    print(f"FATAL: Error executing load_dotenv: {e_dotenv}")
+        if os.path.exists(plain_config_filename):
+            if os.path.exists(encrypted_config_filename) and loaded is False: # Message if decryption was attempted but failed
+                print(f"INFO: Decryption of '{encrypted_config_filename}' was not successful or skipped. Attempting to load plain '{plain_config_filename}'.")
+            
+            config_path_load = os.path.abspath(plain_config_filename)
+            print(f"DEBUG: Attempting to load plain .env file from: {config_path_load}")
+            loaded = load_dotenv(plain_config_filename, verbose=True)
+            print(f"DEBUG: load_dotenv from plain file successful? {loaded}")
+            if not loaded:
+                print(f"WARNING: load_dotenv from plain file '{plain_config_filename}' reports that the file was not loaded or was empty.")
+        elif not os.path.exists(encrypted_config_filename): # Only print this if encrypted also didn't exist
+            print(f"INFO: Neither '{encrypted_config_filename}' nor '{plain_config_filename}' found. Environment variables might not be set from a .env file.")
+
+    # Final check if anything was loaded from any source
+    if not loaded:
+        print("WARNING: No .env variables were loaded. The script will rely on system environment variables if any are set.")
+
+except Exception as e_dotenv_main: # Catch-all for the entire .env loading block
+    print(f"FATAL: A critical error occurred during the .env loading process: {e_dotenv_main}")
     import traceback
     traceback.print_exc()
+    # Depending on how critical .env variables are, you might want to sys.exit(1) here.
 
 # Check directly afterwards what os.getenv delivers:
 check_admin_id = os.getenv("ADMIN_USER_ID")
@@ -320,20 +415,41 @@ while True:
 
     password = os.getenv(f"ACCOUNT_{account_index}_PASSWORD")
     username = os.getenv(f"ACCOUNT_{account_index}_USERNAME")
-    # --- CHANGED: Cookie file handling ---
+    # --- CHANGED: Cookie file handling (Security Enhanced) ---
     cookies_file_env = os.getenv(f"ACCOUNT_{account_index}_COOKIES")
-    # Fallback to default name if not in .env or empty
+    
+    # Determine a base directory for cookies (e.g., script's directory or a subfolder)
+    # For this example, we'll use the script's directory.
+    try:
+        base_cookie_dir = os.path.dirname(os.path.abspath(__file__))
+    except NameError: 
+        # Fallback if __file__ is not defined (e.g., interactive interpreter)
+        base_cookie_dir = os.getcwd()
+
     if not cookies_file_env:
+        # Default filename if not specified in .env
         safe_username_for_file = re.sub(r'[\\/*?:"<>|]', "_", username) if username else f"account_{account_index}"
-        cookies_file = f"{safe_username_for_file}_cookies.cookies.json" # Default filename with .cookies.json
-        print(f"WARNING: ACCOUNT_{account_index}_COOKIES not found/empty in .env. Using default: {cookies_file}")
+        filename_part = f"{safe_username_for_file}_cookies.cookies.json"
+        cookies_file = os.path.join(base_cookie_dir, filename_part)
+        print(f"WARNING: ACCOUNT_{account_index}_COOKIES not found/empty in .env. Using default relative to script dir: {cookies_file}")
     else:
-        cookies_file = cookies_file_env
-        # Ensure the extension is correct (optional, but good for consistency)
-        if not cookies_file.endswith(".cookies.json"):
-             print(f"WARNING: Cookie file '{cookies_file}' for account {account_index} does not end with '.cookies.json'. Using recommended extension.")
-             # Optional: Force extension (could rename existing files)
-             # cookies_file = os.path.splitext(cookies_file)[0] + ".cookies.json"
+        # If specified in .env, treat it as a filename only.
+        # os.path.basename() will strip any directory components, preventing traversal.
+        filename_part_from_env = os.path.basename(cookies_file_env)
+        
+        # Further sanitize the filename part itself to remove potentially problematic characters
+        # This re.sub is similar to the one for safe_username_for_file
+        filename_part_from_env = re.sub(r'[\\/*?:"<>|]', "_", filename_part_from_env)
+
+        # Ensure the extension is correct
+        if not filename_part_from_env.endswith(".cookies.json"):
+             print(f"WARNING: Cookie filename '{filename_part_from_env}' for account {account_index} (from .env) does not end with '.cookies.json'. Appending recommended extension.")
+             # Force the correct extension
+             filename_part_from_env = os.path.splitext(filename_part_from_env)[0] + ".cookies.json"
+        
+        # Join with the base directory to ensure it's stored locally and safely.
+        cookies_file = os.path.join(base_cookie_dir, filename_part_from_env)
+        print(f"INFO: Using cookie file path for account {account_index} (from .env, sanitized and based in script dir): {cookies_file}")
     # --- END CHANGE ---
 
     ACCOUNTS.append({
@@ -420,10 +536,40 @@ is_db_scrape_running = False # Flag for concurrency
 cancel_db_scrape_flag = False # Flag for cancellation
 # ===> END Following Database <===
 
+ADHOC_LOGIN_SESSION_ACTIVE = False
+adhoc_login_confirmed = False # New global flag
+adhoc_scraped_username = None # Stores the username scraped after adhoc login confirmation
+bot_should_exit = False
+
 is_any_scheduled_browser_task_running = False # True if Sync or FollowList schedule is active
 is_scheduled_follow_list_running = False    # True if process_follow_list_schedule_logic is active
 cancel_scheduled_follow_list_flag = False # To cancel the scheduled follow list task
 
+# --- Update Check ---
+UPDATE_NOTIFICATION_SENT_VERSION = None # Tracks if notification for a specific version was already sent
+LATEST_VERSION_INFO = None # Will store {'version': 'x.y.z', 'url': '...'} if update found
+SCRIPT_VERSION = "0.0.0" # Will be parsed from docstring
+# --- End Update Check ---
+
+# === Link Display Configuration ===
+LINK_DISPLAY_SETTINGS_FILE = "link_display_settings.json" # Separate Datei für diese Einstellungen
+# Standardmäßig sind alle Link-Typen aktiviert.
+# Die Schlüssel müssen eindeutig sein und werden in den Befehlen verwendet.
+DEFAULT_LINK_DISPLAY_CONFIG = {
+    "sol_bullx": True,
+    "sol_rugcheck": True,
+    "sol_dexs": True,
+    "sol_pumpfun": True,
+    "sol_solscan": True,
+    "sol_axiom": True, # Für den Axiom-Link
+    "bsc_dexs": True,
+    "bsc_gmgn": True,
+    "bsc_fourmeme": True,
+    "bsc_pancake": True,
+    "bsc_scan": True,
+}
+link_display_config = DEFAULT_LINK_DISPLAY_CONFIG.copy() # Aktuelle Konfiguration
+# === END Link Display Configuration ===
 
 # ===> Scrape Queue (for headless restart) <===
 SCRAPE_QUEUE_FILE = "scrape_queue.txt"
@@ -523,8 +669,22 @@ RATINGS_FILE = "ratings.json"
 ratings_data = {} # Loaded on startup
 # ===> END Rating System <===
 
+# ===> Button Toggles <===
+like_repost_buttons_enabled = True # Default: Enabled
+rating_buttons_enabled = True      # Default: Enabled
+# ===> END Button Toggles <===
+
+# ===> Rating Filter Settings <===
+show_posts_from_unrated_enabled = True # Default: Show posts from unrated users
+min_average_rating_for_posts = 0.0     # Default: Show posts with any rating (0.0 effectively means no minimum)
+# ===> END Rating Filter Settings <===
+
 # Stores post URLs for the last messages
 last_tweet_urls = {}
+
+# Flag to indicate if the bot is in a special manual login session
+MANUAL_LOGIN_SESSION_ACTIVE = False
+ADHOC_LOGIN_SESSION_ACTIVE = False # New flag for ad-hoc login
 
 rate_limit_patterns = [
     '//span[contains(text(), "unlock more posts by subscribing")]',
@@ -548,6 +708,8 @@ def load_settings():
     global search_keywords_enabled, search_ca_enabled, search_tickers_enabled
     global is_headless_enabled
     global max_tweet_age_minutes
+    global like_repost_buttons_enabled, rating_buttons_enabled # Added
+    global show_posts_from_unrated_enabled, min_average_rating_for_posts # Added for rating filters
 
     # --- Define default values ---
     default_scraping_paused = True
@@ -558,6 +720,10 @@ def load_settings():
     default_search_tickers_enabled = True
     default_headless_enabled = False
     default_max_tweet_age = 15
+    default_like_repost_buttons_enabled = True
+    default_rating_buttons_enabled = True
+    default_show_unrated_enabled = True
+    default_min_avg_rating = 0.0
 
     try:
         if os.path.exists(SETTINGS_FILE):
@@ -583,6 +749,15 @@ def load_settings():
                     print(f"WARNING: Invalid max_tweet_age_minutes ('{loaded_max_age}') in {SETTINGS_FILE}. Using default: {default_max_tweet_age}")
                     max_tweet_age_minutes = default_max_tweet_age
 
+                like_repost_buttons_enabled = settings.get("like_repost_buttons_enabled", default_like_repost_buttons_enabled)
+                rating_buttons_enabled = settings.get("rating_buttons_enabled", default_rating_buttons_enabled)
+                show_posts_from_unrated_enabled = settings.get("show_posts_from_unrated_enabled", default_show_unrated_enabled)
+                loaded_min_avg_rating = settings.get("min_average_rating_for_posts", default_min_avg_rating)
+                if isinstance(loaded_min_avg_rating, (float, int)) and 0.0 <= loaded_min_avg_rating <= 5.0:
+                    min_average_rating_for_posts = float(loaded_min_avg_rating)
+                else:
+                    print(f"WARNING: Invalid min_average_rating_for_posts ('{loaded_min_avg_rating}') in {SETTINGS_FILE}. Using default: {default_min_avg_rating}")
+                    min_average_rating_for_posts = default_min_avg_rating                
                 print(f"Settings loaded:")
                 print(f"  - Scraping: {'PAUSED' if is_scraping_paused else 'ACTIVE'}")
                 print(f"  - Auto-Follow Mode: {auto_follow_mode.upper()}")
@@ -591,6 +766,10 @@ def load_settings():
                 print(f"  - Keyword Search: {'ENABLED' if search_keywords_enabled else 'DISABLED'}")
                 print(f"  - CA Search: {'ENABLED' if search_ca_enabled else 'DISABLED'}")
                 print(f"  - Ticker Search: {'ENABLED' if search_tickers_enabled else 'DISABLED'}")
+                print(f"  - Like/Repost Buttons: {'ENABLED' if like_repost_buttons_enabled else 'DISABLED'}")
+                print(f"  - Rating Buttons: {'ENABLED' if rating_buttons_enabled else 'DISABLED'}")
+                print(f"  - Show Unrated Posts: {'ENABLED' if show_posts_from_unrated_enabled else 'DISABLED'}")
+                print(f"  - Min Avg Rating for Posts: {min_average_rating_for_posts:.1f}")                
                 print(f"  - Headless Mode: {'ENABLED' if is_headless_enabled else 'DISABLED'}")
                 print(f"  - Max post Age: {max_tweet_age_minutes} minutes")
 
@@ -604,6 +783,10 @@ def load_settings():
             search_tickers_enabled = default_search_tickers_enabled
             is_headless_enabled = default_headless_enabled
             max_tweet_age_minutes = default_max_tweet_age
+            like_repost_buttons_enabled = default_like_repost_buttons_enabled
+            rating_buttons_enabled = default_rating_buttons_enabled
+            show_posts_from_unrated_enabled = default_show_unrated_enabled
+            min_average_rating_for_posts = default_min_avg_rating            
             save_settings()
             print(f"Default settings file '{SETTINGS_FILE}' has been created.")
 
@@ -617,6 +800,10 @@ def load_settings():
         search_tickers_enabled = default_search_tickers_enabled
         is_headless_enabled = default_headless_enabled
         max_tweet_age_minutes = default_max_tweet_age
+        like_repost_buttons_enabled = default_like_repost_buttons_enabled
+        rating_buttons_enabled = default_rating_buttons_enabled
+        show_posts_from_unrated_enabled = default_show_unrated_enabled
+        min_average_rating_for_posts = default_min_avg_rating        
 
     # --- IMPORTANT: Set asyncio.Event based on loaded status ---
     if is_scraping_paused:
@@ -631,6 +818,8 @@ def save_settings():
     global search_keywords_enabled, search_ca_enabled, search_tickers_enabled
     global is_headless_enabled
     global max_tweet_age_minutes
+    global like_repost_buttons_enabled, rating_buttons_enabled # Added
+    global show_posts_from_unrated_enabled, min_average_rating_for_posts # Added for rating filters
     try:
         settings = {
             "is_scraping_paused": is_scraping_paused,
@@ -640,7 +829,11 @@ def save_settings():
             "search_ca_enabled": search_ca_enabled,
             "search_tickers_enabled": search_tickers_enabled,
             "is_headless_enabled": is_headless_enabled,
-            "max_tweet_age_minutes": max_tweet_age_minutes
+            "max_tweet_age_minutes": max_tweet_age_minutes,
+            "like_repost_buttons_enabled": like_repost_buttons_enabled,
+            "rating_buttons_enabled": rating_buttons_enabled,
+            "show_posts_from_unrated_enabled": show_posts_from_unrated_enabled,
+            "min_average_rating_for_posts": min_average_rating_for_posts,            
         }
         with open(SETTINGS_FILE, 'w') as f:
             json.dump(settings, f, indent=4)
@@ -827,9 +1020,43 @@ def add_to_set_file(data_set, filepath):
     except Exception as e:
          print(f"Error adding to set file {filepath}: {e}")
 
+def load_link_display_config():
+    """Loads link display configuration from file."""
+    global link_display_config, DEFAULT_LINK_DISPLAY_CONFIG
+    try:
+        if os.path.exists(LINK_DISPLAY_SETTINGS_FILE):
+            with open(LINK_DISPLAY_SETTINGS_FILE, 'r') as f:
+                loaded_config = json.load(f)
+                # Merge with defaults to ensure all keys are present
+                link_display_config = DEFAULT_LINK_DISPLAY_CONFIG.copy()
+                link_display_config.update(loaded_config) # Überschreibe Defaults mit geladenen Werten
+                print("Link display configuration loaded.")
+        else:
+            link_display_config = DEFAULT_LINK_DISPLAY_CONFIG.copy()
+            print(f"No {LINK_DISPLAY_SETTINGS_FILE} found, using default link display settings and creating the file.")
+            save_link_display_config()
+    except (json.JSONDecodeError, Exception) as e:
+        print(f"Error loading link display settings: {e}. Using default values.")
+        link_display_config = DEFAULT_LINK_DISPLAY_CONFIG.copy()
+        save_link_display_config()
+
+def save_link_display_config():
+    """Saves the current link display configuration to file."""
+    global link_display_config
+    try:
+        with open(LINK_DISPLAY_SETTINGS_FILE, 'w') as f:
+            json.dump(link_display_config, f, indent=4)
+    except Exception as e:
+        print(f"Error saving link display settings: {e}")
+
 def get_current_account_username():
-    """Returns the username of the currently active account."""
-    global current_account, ACCOUNTS
+    """Returns the username of the currently active account or indicates ad-hoc."""
+    global current_account, ACCOUNTS, ADHOC_LOGIN_SESSION_ACTIVE
+    if ADHOC_LOGIN_SESSION_ACTIVE:
+        # In adhoc mode, we don't have a pre-configured username.
+        # We could try to scrape it from the page if needed, or return a placeholder.
+        # For now, let's return a placeholder. The /confirmlogin tries to get it.
+        return "adhoc_user" # Placeholder
     if 0 <= current_account < len(ACCOUNTS):
         # Ensure the key exists and is not None
         username = ACCOUNTS[current_account].get("username")
@@ -846,9 +1073,17 @@ def get_current_follow_list_path():
     return None
 
 def get_current_backup_file_path():
-    """Returns the file path for the backup file of the current account."""
-    username = get_current_account_username()
-    if username:
+    """Returns the file path for the backup file of the current account or ad-hoc session."""
+    global ADHOC_LOGIN_SESSION_ACTIVE
+    username = get_current_account_username() # This will return "adhoc_user" if in that mode
+
+    if ADHOC_LOGIN_SESSION_ACTIVE:
+        # For adhoc, we might want a generic backup name or one based on the scraped username if available
+        # For simplicity, let's use a fixed name for adhoc backups.
+        # The actual logged-in username might be complex to get reliably here.
+        return FOLLOWER_BACKUP_TEMPLATE.format("adhoc_session_backup")
+    
+    if username: # For non-adhoc sessions
         safe_username = re.sub(r'[\\/*?:"<>|]', "_", username)
         return FOLLOWER_BACKUP_TEMPLATE.format(safe_username)
     return None
@@ -953,14 +1188,15 @@ def create_driver():
     # Memory optimizations for Raspberry Pi
     options.add_argument('--disable-dev-tools')
     options.add_argument('--no-zygote')
-    options.add_argument('--single-process')
+    # options.add_argument('--single-process') # Moved to RPi specific
     options.add_argument('--disable-features=VizDisplayCompositor')
 
     # Raspberry Pi specific options
     is_raspberry_pi = os.path.exists('/usr/bin/chromium-browser')
     if is_raspberry_pi:
         options.add_argument('--disable-gpu')
-        # Headless is now controlled by the global setting, not just RPi detection
+        options.add_argument('--single-process') 
+        # Headless is now controlled by the global setting
         # options.add_argument('--headless')
 
     # Add headless argument based on the global setting
@@ -978,57 +1214,82 @@ def create_driver():
     ]
     options.add_argument(f'user-agent={random.choice(user_agents)}')
 
-    # OS-dependent path logic for browser and driver
-    is_windows = platform.system() == "Windows"
+    # Determine script directory
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+    except NameError: 
+        script_dir = os.getcwd()
+        print(f"WARNING: __file__ not defined. Using CWD ({script_dir}) as base for local Chrome/Driver.")
+
+    # --- Define fixed relative paths for user-provided files ---
+    # User needs to create these folders and place the correct executables inside.
+    chrome_exe_relative_path = os.path.join("chrome-win64", "chrome.exe")
+    driver_exe_relative_path = os.path.join("chromedriver-win64", "chromedriver.exe")
     
-    if is_windows:
-        chrome_path_on_win = find_chrome_on_windows() # Helper function defined above
-        if chrome_path_on_win:
-            options.binary_location = chrome_path_on_win
-            print(f"INFO: Using Chrome from (Windows): {chrome_path_on_win}")
+    # For Linux/macOS, the executables usually don't have .exe
+    if platform.system() != "Windows":
+        chrome_exe_relative_path = os.path.join("chrome-linux64", "chrome")
+        driver_exe_relative_path = os.path.join("chromedriver-linux64", "chromedriver")
+
+    # Construct absolute paths
+    abs_chrome_exe_path = os.path.join(script_dir, chrome_exe_relative_path)
+    abs_driver_exe_path = os.path.join(script_dir, driver_exe_relative_path)
+
+    # --- Set Chrome Browser Location ---
+    if os.path.exists(abs_chrome_exe_path):
+        # Check for execute permissions on Linux/macOS
+        if platform.system() == "Windows" or os.access(abs_chrome_exe_path, os.X_OK):
+            options.binary_location = abs_chrome_exe_path
+            print(f"INFO: Using local Chrome from: {abs_chrome_exe_path}")
         else:
-            print("WARNING: Chrome executable not found in common Windows locations. Selenium will try to find it in PATH or rely on ChromeDriver's capabilities to find a compatible browser.")
+            print(f"WARNING: Local Chrome found at '{abs_chrome_exe_path}' but is not executable. Please check permissions. Relying on system Chrome.")
+    else:
+        print(f"INFO: Local Chrome not found in '{os.path.dirname(abs_chrome_exe_path)}'. Relying on system Chrome (if available via ChromeDriver).")
+        # If you want to force failure if local Chrome is not found:
+        # raise FileNotFoundError(f"Mandatory local Chrome not found at {abs_chrome_exe_path}. Please place it in the '{os.path.dirname(chrome_exe_relative_path)}' folder.")
 
-        # ChromeDriver path for Windows
-        chromedriver_exe_path = "chromedriver.exe" # Default to PATH lookup
+    # --- Set ChromeDriver Location ---
+    if os.path.exists(abs_driver_exe_path):
+         # Check for execute permissions on Linux/macOS
+        if platform.system() == "Windows" or os.access(abs_driver_exe_path, os.X_OK):
+            service = Service(executable_path=abs_driver_exe_path)
+            print(f"INFO: Using local ChromeDriver from: {abs_driver_exe_path}")
+        else:
+            service = Service() # Fallback to PATH
+            print(f"WARNING: Local ChromeDriver found at '{abs_driver_exe_path}' but is not executable. Please check permissions. Assuming ChromeDriver is in system PATH.")
+    else:
+        service = Service() # Fallback to PATH
+        print(f"INFO: Local ChromeDriver not found in '{os.path.dirname(abs_driver_exe_path)}'. Assuming ChromeDriver is in system PATH.")
+        # If you want to force failure if local ChromeDriver is not found:
+        # raise FileNotFoundError(f"Mandatory local ChromeDriver not found at {abs_driver_exe_path}. Please place it in the '{os.path.dirname(driver_exe_relative_path)}' folder.")
+
+    # --- Raspberry Pi Specific Overrides ---
+    # If Raspberry Pi is detected, these paths will be prioritized.
+    # The check for '/usr/bin/chromium-browser' is a common way to detect an RPi-like environment
+    # with Chromium pre-installed at that location.
+    is_raspberry_pi = os.path.exists('/usr/bin/chromium-browser') 
+    if is_raspberry_pi:
+        print("INFO: Raspberry Pi detected. Applying RPi-specific browser/driver paths.")
         
-        # Attempt to find chromedriver.exe in script's directory or CWD
-        try:
-            # __file__ might not be defined if run in certain contexts (e.g. interactive REPL)
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            local_chromedriver = os.path.join(script_dir, "chromedriver.exe")
-            if os.path.exists(local_chromedriver):
-                chromedriver_exe_path = local_chromedriver
-                print(f"INFO: Using ChromeDriver from script directory: {chromedriver_exe_path}")
-            else:
-                # If not in script_dir, check Current Working Directory
-                cwd_chromedriver = os.path.join(os.getcwd(), "chromedriver.exe")
-                if os.path.exists(cwd_chromedriver):
-                    chromedriver_exe_path = cwd_chromedriver
-                    print(f"INFO: Using ChromeDriver from CWD: {chromedriver_exe_path}")
-                else:
-                    print("INFO: ChromeDriver.exe not found in script directory or CWD. Assuming it's in system PATH.")
-        except NameError: # __file__ is not defined
-            # Fallback to checking only CWD if script path is unavailable
-            cwd_chromedriver = os.path.join(os.getcwd(), "chromedriver.exe")
-            if os.path.exists(cwd_chromedriver):
-                chromedriver_exe_path = cwd_chromedriver
-                print(f"INFO: Using ChromeDriver from CWD (__file__ was not defined): {chromedriver_exe_path}")
-            else:
-                print("INFO: ChromeDriver.exe not found in CWD (__file__ was not defined). Assuming it's in system PATH.")
-        
-        service = Service(executable_path=chromedriver_exe_path)
-        print(f"INFO: Initializing ChromeDriver service for Windows with executable: {chromedriver_exe_path}")
+        rpi_browser_path = '/usr/bin/chromium-browser'
+        # Check if the RPi browser path is valid and executable
+        if os.path.exists(rpi_browser_path) and os.access(rpi_browser_path, os.X_OK):
+            options.binary_location = rpi_browser_path
+            print(f"INFO: Set browser for Raspberry Pi: {rpi_browser_path}")
+        else:
+            # If the RPi browser isn't valid, a previous setting (e.g., from local files) might still be used,
+            # or Selenium will try its default search. This logs a warning.
+            print(f"WARNING: RPi browser at '{rpi_browser_path}' not found or not executable. Selenium might fail if no other browser is configured or found.")
 
-    elif is_raspberry_pi: # Original RPi logic (is_raspberry_pi is defined earlier in your function)
-        options.binary_location = '/usr/bin/chromium-browser'
-        service = Service(executable_path='/usr/bin/chromedriver')
-        print("INFO: Using Raspberry Pi specific paths for browser and driver.")
-    else: # Original Linux (non-RPi) logic
-        options.binary_location = '/usr/bin/chromium' # Default for other Linux
-        service = Service(executable_path='/usr/bin/chromedriver')
-        print("INFO: Using default Linux paths for browser and driver.")
-
+        rpi_driver_path = "/usr/bin/chromedriver" # Common path for RPi ChromeDriver
+        # Check if the RPi driver path is valid and executable
+        if os.path.exists(rpi_driver_path) and os.access(rpi_driver_path, os.X_OK):
+            service = Service(executable_path=rpi_driver_path)
+            print(f"INFO: Set ChromeDriver for Raspberry Pi: {rpi_driver_path}")
+        else:
+            # If the RPi driver isn't valid, a previous service setting (e.g., from local files) might still be used,
+            # or Selenium will try its default PATH search for the driver. This logs a warning.
+            print(f"WARNING: RPi ChromeDriver at '{rpi_driver_path}' not found or not executable. Selenium might fail if no other driver is configured or found in PATH.")
     try:
         driver = webdriver.Chrome(service=service, options=options)
 
@@ -1048,21 +1309,30 @@ def create_driver():
         print(f"Error creating driver: {e}")
         raise
 
-async def initialize():
-    """Initializes the WebDriver, logs in, and switches to the following tab."""
+async def initialize(save_cookies_for_session: bool): # Renamed parameter for clarity
+    """Initializes the WebDriver. For MANUAL_LOGIN_SESSION_ACTIVE, only opens browser to login page."""
     # The Telegram application is now initialized centrally in run().
-    global driver, application, current_account # 'application' is only referenced here, not recreated
+    global driver, application, current_account, MANUAL_LOGIN_SESSION_ACTIVE # 'application' is only referenced here, not recreated
     try:
         print("Initializing WebDriver...")
         driver = create_driver()
-        print("WebDriver initialized. Starting login...")
-        login_success = await login()
-        if login_success:
-            print("Login successful. Switching to 'Following' tab...")
-            await switch_to_following_tab()
-            print("'Following' tab reached.")
+        print("WebDriver initialized.")
+
+        if MANUAL_LOGIN_SESSION_ACTIVE:
+            print("MANUAL_LOGIN_SESSION_ACTIVE: Navigating to X login page for manual user login.")
+            driver.get("https://x.com/login")
+            # In this mode, we DO NOT attempt any automated login.
+            # The user will log in manually. We'll need a way for them to confirm.
         else:
-            print("WARNING: Login failed during initialization.")
+            # Normal operation: proceed with automated login
+            print("Starting automated login...")
+            login_success = await login(save_cookies_on_success=save_cookies_for_session) # Pass the flag
+            if login_success:
+                print("Login successful. Switching to 'Following' tab...")
+                await switch_to_following_tab()
+                print("'Following' tab reached.")
+            else:
+                print("WARNING: Automated login failed during initialization.")
 
         # Ensure the global 'application' from run() is available
         if application is None:
@@ -1081,27 +1351,57 @@ async def initialize():
 async def switch_to_following_tab():
     """Checks for ad relevance popup and ensures we're on the Following tab."""
     try:
-        # ---  Popup Check ---
+        # --- NEW POPUP CHECK (Mask + SheetDialog + App-Bar-Close) ---
+        # This popup seems to cover the whole screen.
+        mask_xpath_new = '//div[@data-testid="mask"]'
+        sheet_dialog_xpath_new = '//div[@data-testid="sheetDialog"]'
+        close_button_xpath_new_popup = '//button[@aria-label="Close" and @data-testid="app-bar-close"]'
+
+        try:
+            print("Checking for new full-screen mask popup (mask, sheetDialog, app-bar-close)...")
+            # Check for mask first, very short timeout
+            WebDriverWait(driver, 2).until(EC.presence_of_element_located((By.XPATH, mask_xpath_new)))
+            # If mask is found, then check for dialog (also short timeout, should be there if mask is)
+            WebDriverWait(driver, 1).until(EC.presence_of_element_located((By.XPATH, sheet_dialog_xpath_new)))
+
+            print("Full-screen mask and sheetDialog found. Attempting to click close button...")
+            # Now try to click the close button
+            close_button_new = WebDriverWait(driver, 5).until(
+                EC.element_to_be_clickable((By.XPATH, close_button_xpath_new_popup))
+            )
+            close_button_new.click()
+            await asyncio.sleep(random.uniform(1.5, 2.5)) # Pause after clicking
+            print("New full-screen popup (app-bar-close) close button clicked.")
+        except (TimeoutException, NoSuchElementException):
+            # This is the normal case when this specific new popup is not present
+            print("No new full-screen mask popup (mask, sheetDialog, app-bar-close) found.")
+            pass
+        except Exception as new_popup_err:
+            # Log error handling the new popup, but continue
+            print(f"WARNING: Error handling the new full-screen mask popup: {new_popup_err}")
+        # --- END NEW POPUP CHECK ---
+
+        # --- Existing "Keep less relevant ads" Popup Check ---
         # XPath looking for a button containing a span with the specific text
-        popup_button_xpath = "//button[.//span[contains(text(), 'Keep less relevant ads')]]"
+        popup_button_xpath_ads = "//button[.//span[contains(text(), 'Keep less relevant ads')]]"
         try:
             print("Checking for 'Keep less relevant ads' popup...")
             # Wait only briefly (e.g., 5 seconds), as the popup should appear quickly if present
-            popup_button = WebDriverWait(driver, 5).until(
-                EC.element_to_be_clickable((By.XPATH, popup_button_xpath))
+            popup_button_ads = WebDriverWait(driver, 5).until(
+                EC.element_to_be_clickable((By.XPATH, popup_button_xpath_ads))
             )
-            print("Popup found, clicking 'Keep less relevant ads'...")
-            popup_button.click()
+            print("'Keep less relevant ads' Popup found, clicking it...")
+            popup_button_ads.click()
             await asyncio.sleep(random.uniform(1, 2)) # Short pause after the click
-            print("Popup button clicked.")
+            print("'Keep less relevant ads' Popup button clicked.")
         except (TimeoutException, NoSuchElementException):
             # This is the normal case when the popup is not present
             print("No 'Keep less relevant ads' popup found.")
             pass
-        except Exception as popup_err:
+        except Exception as popup_err_ads:
             # Log error handling the popup, but continue
-            print(f"WARNING: Error handling the 'Keep ads' popup: {popup_err}")
-        # --- END Popup Check ---
+            print(f"WARNING: Error handling the 'Keep ads' popup: {popup_err_ads}")
+        # --- END "Keep less relevant ads" Popup Check ---
 
         # --- Existing logic for switching tabs ---
         print("Attempting to switch to the 'Following' tab...")
@@ -1124,7 +1424,7 @@ async def switch_to_following_tab():
         # General error in this function
         print(f"Error in switch_to_following_tab: {e}")
 
-async def login():
+async def login(save_cookies_on_success=True): # Added parameter
     """Main login method that tries different login approaches in sequence"""
     global current_account, login_attempts
     try:
@@ -1147,7 +1447,7 @@ async def login():
 
         # If cookie login fails, try manual login
         await send_telegram_message(f"🔑 Starting login for Account {current_account+1}...")
-        result = await manual_login()
+        result = await manual_login(save_cookies_on_success=save_cookies_on_success) # Pass parameter
 
         if result:
             login_attempts = 0
@@ -1259,7 +1559,7 @@ async def cookie_login():
         logger.error("Unexpected error in cookie_login", exc_info=True)
         return False
 
-async def manual_login():
+async def manual_login(save_cookies_on_success=True): # Added parameter
     """Perform manual login using email/username and password"""
     global current_account, driver, AUTH_CODE
     account = ACCOUNTS[current_account]
@@ -1379,21 +1679,24 @@ async def manual_login():
         # Verify successful login
         await asyncio.sleep(3)
         if "home" in driver.current_url:
-            cookie_filepath = account.get('cookies_file')
-            if cookie_filepath:
-                # --- CHANGED: Save cookies as JSON ---
-                try:
-                    print(f"Saving cookies as JSON to: {cookie_filepath}")
-                    cookies_to_save = driver.get_cookies()
-                    with open(cookie_filepath, "w", encoding='utf-8') as file:
-                        json.dump(cookies_to_save, file, indent=4) # indent=4 for readability
-                    print(f"{len(cookies_to_save)} cookies saved.")
-                except Exception as save_err:
-                    print(f"ERROR saving cookies to '{cookie_filepath}': {save_err}")
-                    logger.error(f"Failed to save cookies to {cookie_filepath}", exc_info=True)
-                # --- END CHANGE ---
+            if save_cookies_on_success: # Conditional cookie saving
+                cookie_filepath = account.get('cookies_file')
+                if cookie_filepath:
+                    # --- CHANGED: Save cookies as JSON ---
+                    try:
+                        print(f"Saving cookies as JSON to: {cookie_filepath}")
+                        cookies_to_save = driver.get_cookies()
+                        with open(cookie_filepath, "w", encoding='utf-8') as file:
+                            json.dump(cookies_to_save, file, indent=4) # indent=4 for readability
+                        print(f"{len(cookies_to_save)} cookies saved.")
+                    except Exception as save_err:
+                        print(f"ERROR saving cookies to '{cookie_filepath}': {save_err}")
+                        logger.error(f"Failed to save cookies to {cookie_filepath}", exc_info=True)
+                    # --- END CHANGE ---
+                else:
+                     print("WARNING: No cookie file path found to save for this account.")
             else:
-                 print("WARNING: No cookie file path found to save for this account.")
+                print("INFO: Cookie saving skipped for this session.")
 
             await send_telegram_message(f"✅ Login for Account {current_account+1} successful!")
             return True
@@ -1440,7 +1743,7 @@ async def wait_for_auth_code():
         if AUTH_CODE:
             code = AUTH_CODE
             AUTH_CODE = None  # Reset code
-            logger.info(f"[Auth Wait] Auth code '{code}' received!") # Log success with code
+            logger.info(f"[Auth Wait] Auth code received and processed.") # Log success without code
             return code
         await asyncio.sleep(1)
     # Reached only if the loop finishes without finding the code
@@ -1907,15 +2210,34 @@ async def backup_followers_logic(update: Update):
     global global_followed_users_set
     global is_backup_running, cancel_backup_flag # Import flags
 
-    account_username = get_current_account_username()
-    backup_filepath = get_current_backup_file_path()
+    global ADHOC_LOGIN_SESSION_ACTIVE, adhoc_scraped_username # Access globals
+
+    actual_username_for_url = None
+    display_username_for_messages = "adhoc_user" # Default display
+    
+    if ADHOC_LOGIN_SESSION_ACTIVE:
+        if adhoc_scraped_username:
+            actual_username_for_url = adhoc_scraped_username
+            display_username_for_messages = f"@{adhoc_scraped_username} (AdHoc)"
+        else:
+            # This case should ideally be rare if /confirmlogin worked.
+            # We can't navigate to the user's "following" page without a username.
+            await update.message.reply_text("❌ Error for AdHoc Backup: X Username not determined after login. Cannot proceed with backup.")
+            # Resume scraping if it was paused by the command handler
+            if is_scraping_paused: await resume_scraping()
+            return
+    else: # Normal mode (not adhoc)
+        actual_username_for_url = get_current_account_username()
+        display_username_for_messages = f"@{actual_username_for_url}" if actual_username_for_url else "N/A"
+
+    backup_filepath = get_current_backup_file_path() # This already handles adhoc filename
 
     if is_backup_running:
         await update.message.reply_text("⚠️ A backup process is already running.")
-        # IMPORTANT: Do not continue, but also do not pause/resume here
         return
-    if not account_username or not backup_filepath:
-        await update.message.reply_text("❌ Error: Account username or backup path could not be determined.")
+    if not actual_username_for_url or not backup_filepath: # Check the URL username
+        await update.message.reply_text("❌ Error: Account username for URL or backup path could not be determined.")
+        if is_scraping_paused: await resume_scraping()
         return
 
     # ===== Task Start Marker =====
@@ -1923,8 +2245,8 @@ async def backup_followers_logic(update: Update):
     cancel_backup_flag = False # Ensure flag is reset
     # ================================
 
-    print(f"[Backup] Starting follower backup for @{account_username} -> {backup_filepath}...")
-    await update.message.reply_text(f"⏳ Starting follower backup for @{account_username}...\n"
+    print(f"[Backup] Starting follower backup for {display_username_for_messages} -> {backup_filepath}...")
+    await update.message.reply_text(f"⏳ Starting follower backup for {display_username_for_messages}...\n"
                                      f"   To cancel: `/cancelbackup`") # Info about cancel command
 
     await pause_scraping() # Pause main scraping
@@ -1935,7 +2257,7 @@ async def backup_followers_logic(update: Update):
     cancelled_early = False # Flag for cancellation message
 
     try: # Main try block
-        following_url = f"https://x.com/{account_username}/following"
+        following_url = f"https://x.com/{actual_username_for_url}/following"
         print(f"[Backup] Navigating to: {following_url}")
         driver.get(following_url)
         await asyncio.sleep(random.uniform(8, 12))
@@ -2029,17 +2351,23 @@ async def backup_followers_logic(update: Update):
             if found_followers:
                 # Save ONLY the account-specific backup
                 save_set_to_file(found_followers, backup_filepath)
-                logger.info(f"[Backup] Account backup for @{account_username} saved to {os.path.basename(backup_filepath)} ({len(found_followers)} users).")
+                logger.info(f"[Backup] Account backup for {display_username_for_messages} saved to {os.path.basename(backup_filepath)} ({len(found_followers)} users).")
                 # Change the success message - NO global update anymore
-                success_message = (f"✅ Follower backup for @{account_username} ({len(found_followers)} users) "
+                success_message = (f"✅ Follower backup for {display_username_for_messages} ({len(found_followers)} users) "
                                    f"completed and saved to `{os.path.basename(backup_filepath)}`.\n"
                                    f"(Global list was NOT changed.)")
                 await update.message.reply_text(success_message)
+                await update.message.reply_text("💡 Tipp: You can now use `/buildglobalfrombackups` , to integrate your last follows to a globaly follow list")          
             else:
                 # Empty backup file if nothing was found
                 save_set_to_file(set(), backup_filepath)
                 await update.message.reply_text(f"ℹ️ No followers found for @{account_username} or backup file `{os.path.basename(backup_filepath)}` was emptied.")
                 logger.info(f"[Backup] No followers found for @{account_username} or backup file cleared.")
+                await update.message.reply_text(f"ℹ️ No followers found for {display_username_for_messages} or backup file `{os.path.basename(backup_filepath)}` was emptied.") # display_username_for_messages verwenden
+                logger.info(f"[Backup] No followers found for {display_username_for_messages} or backup file cleared.")
+                # NEUER HINWEIS (optional hier, da Backup leer):
+                # await update.message.reply_text("💡 Tipp: Wenn du Backups von anderen Accounts hast, kannst du `/buildglobalfrombackups` verwenden.")
+                await update.message.reply_text(success_message)       
 
     except TimeoutException:
          await update.message.reply_text("❌ Error: Loading the follower list for backup failed (Timeout).")
@@ -2121,6 +2449,8 @@ async def scrape_target_following(update: Update, target_username: str):
     navigation_successful = False
     db_changed = False # Flag to know if saving is needed
 
+
+
     # === Helper function for sending status messages ===
     async def _send_scrape_status(text):
         """Sends status either as reply or to main channel."""
@@ -2172,7 +2502,7 @@ async def scrape_target_following(update: Update, target_username: str):
 
         user_cell_button_xpath = '//button[@data-testid="UserCell"]'
         # Wait for the first appearance of UserCells
-        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.XPATH, user_cell_button_xpath)))
+        WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.XPATH, user_cell_button_xpath)))
         print(f"[DB Scrape @{target_username}] Found initial UserCell buttons.")
 
         scroll_attempts_without_new = 0
@@ -2290,7 +2620,7 @@ async def scrape_target_following(update: Update, target_username: str):
                                 finally:
                                     # --- Close HoverCard by scrolling ---
                                     try:
-                                        driver.execute_script("window.scrollBy(0, 1);") # Minimal scroll to close
+                                        driver.execute_script("window.scrollBy(0, 5);") # Minimal scroll to close
                                         await asyncio.sleep(random.uniform(0.2, 0.4))
                                     except Exception as close_err: print(f"  [DB Scrape @{target_username}] Warning (Cell {cell_index}): Error closing HoverCard for @{scraped_username}: {close_err}")
                         except TimeoutException as te_outer: print(f"  [DB Scrape @{target_username}] Warning (Cell {cell_index}): Timeout waiting for HoverCard for @{scraped_username}. {te_outer}")
@@ -2983,6 +3313,116 @@ def check_schedule():
         else:
             return False
 
+
+def parse_script_version():
+    """Parses the script version from the main docstring."""
+    global SCRIPT_VERSION
+    try:
+        # __doc__ is the docstring of the current module (main.py)
+        docstring = __doc__
+        if docstring:
+            match = re.search(r"Version:\s*([\d.]+)", docstring)
+            if match:
+                SCRIPT_VERSION = match.group(1)
+                print(f"INFO: Current script version parsed as: {SCRIPT_VERSION}")
+                return
+    except Exception as e:
+        print(f"WARNING: Could not parse script version from docstring: {e}")
+    print(f"WARNING: Script version could not be parsed. Defaulting to {SCRIPT_VERSION}. Update checks might be inaccurate.")
+
+async def check_github_for_updates():
+    """
+    Checks GitHub for new releases.
+    Returns:
+        dict: {'version': 'x.y.z', 'url': '...'} if a new update is found,
+        None: otherwise or on error.
+    """
+    global SCRIPT_VERSION
+    if SCRIPT_VERSION == "0.0.0":
+        # This case means parsing the script's own version failed.
+        print("INFO: Skipping update check as current script version is unknown.")
+        return None
+
+    github_api_url = "https://api.github.com/repos/rawBotX/raw-bot-X/releases/latest"
+    headers = {"Accept": "application/vnd.github.v3+json"}
+    print(f"INFO: Checking for updates from {github_api_url}...")
+
+    try:
+        # Run requests.get in a separate thread to avoid blocking asyncio loop
+        response = await asyncio.to_thread(requests.get, github_api_url, headers=headers, timeout=10)
+        response.raise_for_status() # Raises HTTPError for bad responses (4XX or 5XX)
+        release_data = response.json()
+        
+        latest_tag_name = release_data.get("tag_name", "")
+        # Remove 'v' prefix if present, e.g., v1.2.3 -> 1.2.3
+        if latest_tag_name.startswith('v'):
+            latest_tag_name = latest_tag_name[1:]
+            
+        release_url = release_data.get("html_url")
+
+        if not latest_tag_name or not release_url:
+            print("WARNING: Could not find tag_name or html_url in GitHub release data.")
+            return None
+
+        print(f"INFO: Latest version on GitHub: {latest_tag_name}")
+
+        # Simple version comparison (assumes semantic versioning like X.Y.Z)
+        current_v_parts = list(map(int, SCRIPT_VERSION.split('.')))
+        latest_v_parts = list(map(int, latest_tag_name.split('.')))
+
+        # Pad with zeros if version parts differ in length for comparison
+        max_len = max(len(current_v_parts), len(latest_v_parts))
+        current_v_parts.extend([0] * (max_len - len(current_v_parts)))
+        latest_v_parts.extend([0] * (max_len - len(latest_v_parts)))
+
+        if latest_v_parts > current_v_parts:
+            print(f"INFO: New version available! Current: {SCRIPT_VERSION}, Latest: {latest_tag_name}")
+            return {"version": latest_tag_name, "url": release_url}
+        else:
+            print(f"INFO: Script is up to date (Current: {SCRIPT_VERSION}, Latest: {latest_tag_name}).")
+            return None
+
+    except requests.exceptions.Timeout:
+        print("WARNING: Timeout while checking for updates.")
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 404:
+            print("INFO: No releases found on GitHub repository (or repo not found).")
+        elif e.response.status_code == 403: # Rate limit
+            print("WARNING: GitHub API rate limit hit while checking for updates. Try again later.")
+        else:
+            print(f"WARNING: HTTP error while checking for updates: {e}")
+    except Exception as e:
+        print(f"ERROR: An unexpected error occurred while checking for updates: {e}")
+    return None
+
+async def handle_update_notification():
+    """Checks for updates and sends a Telegram notification if a new, unnotified version is found."""
+    global LATEST_VERSION_INFO, UPDATE_NOTIFICATION_SENT_VERSION, SCRIPT_VERSION, application
+
+    if application is None: # Safety check
+        print("WARNING: Telegram application not ready, skipping update notification.")
+        return
+
+    new_update_info = await check_github_for_updates()
+    if new_update_info:
+        LATEST_VERSION_INFO = new_update_info # Store the latest info globally
+        # Only send notification if this version hasn't been notified yet
+        if LATEST_VERSION_INFO['version'] != UPDATE_NOTIFICATION_SENT_VERSION:
+            try:
+                await send_telegram_message(
+                    f"🎉 <b>New Update Available!</b> 🎉\n\n"
+                    f"Version: <b>{LATEST_VERSION_INFO['version']}</b>\n"
+                    f"Currently running: {SCRIPT_VERSION}\n\n"
+                    f"🔗 <a href='{LATEST_VERSION_INFO['url']}'>View Release Notes & Download</a>\n\n"
+                    f"Please consider updating your bot.",
+                    reply_markup=None # No buttons for this specific notification
+                )
+                UPDATE_NOTIFICATION_SENT_VERSION = LATEST_VERSION_INFO['version'] # Mark as notified
+            except Exception as e:
+                print(f"ERROR: Failed to send update notification message: {e}")
+    else:
+        LATEST_VERSION_INFO = None # No update or error
+
 # New functions for Pause/Resume
 async def pause_scraping():
     """Pauses post scraping"""
@@ -3441,11 +3881,17 @@ async def cancel_db_scrape_command(update: Update, context: ContextTypes.DEFAULT
 
 async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle callback queries with improved logging and robustness."""
+    # --- All global declarations at the very top ---
     global current_account_usernames_to_follow
-    global search_keywords_enabled, search_ca_enabled, search_tickers_enabled # Add these here
-    global schedule_enabled, schedule_sync_enabled, schedule_follow_list_enabled # For other toggles
-    global is_headless_enabled # For headless toggle
-    global auto_follow_mode, auto_follow_interval_minutes # For autofollow mode buttons
+    global search_keywords_enabled, search_ca_enabled, search_tickers_enabled
+    global schedule_enabled, schedule_sync_enabled, schedule_follow_list_enabled
+    global is_headless_enabled
+    global auto_follow_mode, auto_follow_interval_minutes
+    global ratings_data # Ensure ratings_data is declared globally here
+    global like_repost_buttons_enabled, rating_buttons_enabled # Added for toggles
+    global show_posts_from_unrated_enabled, min_average_rating_for_posts # Added for rating filters
+    # --- End global declarations ---
+
     query = update.callback_query
     # === 1. Answer IMMEDIATELY ===
     try:
@@ -3457,9 +3903,11 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
 
     # === 2. Main logic with comprehensive Try-Except ===
     try:
+        global ratings_data # Moved to the top of the try-block
         if not query.data:
             logger.warning("Received CallbackQuery with no data.")
             return
+
 
         parts = query.data.split(":", 1)
         action_type = parts[0]
@@ -3659,48 +4107,6 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                         await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_keyboard))
                 except Exception as e: logger.error(f"Error updating main schedule button: {e}")
                 return
-
-            # # --- ANGEPASSTER HANDLER: Mode Full ---
-            # elif payload == "mode_full":
-            #     logger.info("Processing mode_full help payload.")
-            #     await mode_full_command(emulated_update, None) 
-            #     try: 
-            #         original_markup = query.message.reply_markup
-            #         if original_markup:
-            #             new_keyboard = []
-            #             for row in original_markup.inline_keyboard:
-            #                 new_row = []
-            #                 for button_in_row in row:
-            #                     if button_in_row.callback_data == "help:mode_full":
-            #                         new_row.append(InlineKeyboardButton(f"🔍 FULL {'🟢' if search_mode == 'full' else '⚪'}", callback_data="help:mode_full"))
-            #                     elif button_in_row.callback_data == "help:mode_ca": 
-            #                         new_row.append(InlineKeyboardButton(f"🔍 CA {'🟢' if search_mode == 'ca_only' else '⚪'}", callback_data="help:mode_ca"))
-            #                     else: new_row.append(button_in_row)
-            #                 new_keyboard.append(new_row)
-            #             await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_keyboard))
-            #     except Exception as e: logger.error(f"Error updating mode buttons after mode_full: {e}")
-            #     return
-
-            # # --- ANGEPASSTER HANDLER: Mode CA ---
-            # elif payload == "mode_ca":
-            #     logger.info("Processing mode_ca help payload.")
-            #     await mode_ca_command(emulated_update, None) 
-            #     try: 
-            #         original_markup = query.message.reply_markup
-            #         if original_markup:
-            #             new_keyboard = []
-            #             for row in original_markup.inline_keyboard:
-            #                 new_row = []
-            #                 for button_in_row in row:
-            #                     if button_in_row.callback_data == "help:mode_ca":
-            #                         new_row.append(InlineKeyboardButton(f"🔍 CA {'🟢' if search_mode == 'ca_only' else '⚪'}", callback_data="help:mode_ca"))
-            #                     elif button_in_row.callback_data == "help:mode_full": 
-            #                         new_row.append(InlineKeyboardButton(f"🔍 FULL {'🟢' if search_mode == 'full' else '⚪'}", callback_data="help:mode_full"))
-            #                     else: new_row.append(button_in_row)
-            #                 new_keyboard.append(new_row)
-            #             await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_keyboard))
-            #     except Exception as e: logger.error(f"Error updating mode buttons after mode_ca: {e}")
-            #     return
             
             # --- Andere direkte Befehlsaufrufe (stelle sicher, dass jeder mit 'return' endet) ---
             elif payload == "stats": await stats_command(emulated_update, None); return
@@ -3712,6 +4118,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             elif payload == "help": await help_command(emulated_update, None); return
             elif payload == "show_rates": await show_ratings_command(emulated_update, None); return
             elif payload == "build_global": await build_global_from_backups_command(emulated_update, None); return
+            elif payload == "global_info": await global_list_info_command(emulated_update, None); return 
             elif payload == "status": await status_command(emulated_update, None); return
             elif payload == "autofollow_status": await autofollow_status_command(emulated_update, None); return
             elif payload == "cancel_fast_follow": await cancel_fast_follow_command(emulated_update, None); return
@@ -3891,7 +4298,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                                     new_button_text = f"📝 CA {'🟢' if search_ca_enabled else '🔴'}"
                                     new_row.append(InlineKeyboardButton(new_button_text, callback_data="help:toggle_ca"))
                                 elif button.callback_data == "help:toggle_keywords": # Keep other buttons in row updated
-                                    new_button_text = f"🔑 Keywords {'🟢' if search_keywords_enabled else '🔴'}"
+                                    new_button_text = f"🔑 Words {'🟢' if search_keywords_enabled else '🔴'}"
                                     new_row.append(InlineKeyboardButton(new_button_text, callback_data="help:toggle_keywords"))
                                 elif button.callback_data == "help:toggle_tickers": # Keep other buttons in row updated
                                     new_button_text = f"💲 Ticker {'🟢' if search_tickers_enabled else '🔴'}"
@@ -3950,6 +4357,141 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                         await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_keyboard))
                 except Exception as e: logger.error(f"Error updating help button for headless toggle: {e}")
                 await query.answer(f"Headless mode: {status_text}") 
+            elif payload == "toggle_like_repost":
+                logger.info("Processing toggle_like_repost help payload.")
+                like_repost_buttons_enabled = not like_repost_buttons_enabled
+                save_settings()
+                status_text = "ENABLED 🟢" if like_repost_buttons_enabled else "DISABLED 🔴"
+                logger.info(f"Like/Repost buttons toggled to {status_text} via help button by user {query.from_user.id}")
+                try:
+                    original_markup = query.message.reply_markup
+                    if original_markup:
+                        new_keyboard = []
+                        for row in original_markup.inline_keyboard:
+                            new_row = []
+                            for button in row:
+                                if button.callback_data == "help:toggle_like_repost":
+                                    new_button_text = f"👍Like & Repost 🔄 {'🟢' if like_repost_buttons_enabled else '🔴'}"
+                                    new_row.append(InlineKeyboardButton(new_button_text, callback_data="help:toggle_like_repost"))
+                                else: new_row.append(button)
+                            new_keyboard.append(new_row)
+                        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_keyboard))
+                except Exception as e: logger.error(f"Error updating help button for L/R toggle: {e}")
+                await query.answer(f"Like/Repost Buttons: {status_text}")
+                return
+
+            elif payload == "toggle_ratings":
+                logger.info("Processing toggle_ratings help payload.")
+                rating_buttons_enabled = not rating_buttons_enabled
+                save_settings()
+                # Determine the full status text for the answer
+                full_status_text_for_answer = "ENABLED 🟢" if rating_buttons_enabled else "DISABLED 🔴"
+                logger.info(f"Rating buttons toggled to {full_status_text_for_answer} by user {query.from_user.id}")
+                
+                # Answer the query first
+                await query.answer(f"Rating Buttons: {full_status_text_for_answer}") # Use the full status text
+
+                # Delete the old help message and send a new one to reflect button changes
+                try:
+                    await query.message.delete() 
+                except Exception as e_del:
+                    logger.warning(f"Could not delete old help message: {e_del}")
+                
+                # emulated_update should be defined earlier in your button_callback_handler
+                # If not, you might need to reconstruct it or pass necessary info to show_help_message
+                await show_help_message(emulated_update) 
+                return # Important to return after resending the help message
+            
+            elif payload == "toggle_show_unrated":
+                logger.info("Processing toggle_show_unrated help payload.")
+                show_posts_from_unrated_enabled = not show_posts_from_unrated_enabled
+                save_settings()
+                status_text = "ENABLED ✅" if show_posts_from_unrated_enabled else "DISABLED ❌"
+                logger.info(f"Show Unrated Posts toggled to {status_text} by user {query.from_user.id}")
+                try:
+                    original_markup = query.message.reply_markup
+                    if original_markup:
+                        new_keyboard = []
+                        for row in original_markup.inline_keyboard:
+                            new_row = []
+                            for button in row:
+                                if button.callback_data == "help:toggle_show_unrated":
+                                    new_button_text = f"🆕 Unrated {'✅' if show_posts_from_unrated_enabled else '❌'}"
+                                    new_row.append(InlineKeyboardButton(new_button_text, callback_data="help:toggle_show_unrated"))
+                                else: new_row.append(button)
+                            new_keyboard.append(new_row)
+                        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_keyboard))
+                except Exception as e: logger.error(f"Error updating help button for show_unrated toggle: {e}")
+                await query.answer(f"Show Unrated Posts: {status_text}")
+                return
+
+            elif payload == "set_min_avg_rating":
+                logger.info("Processing set_min_avg_rating help payload.")
+                # This button click will trigger a message asking the user for input.
+                # The actual setting will be handled by a new command or message handler.
+                await query.message.reply_text(
+                    f"🔢 Please enter the minimum average rating (0.0 - 5.0) to show posts.\n"
+                    f"Current: {min_average_rating_for_posts:.1f}\n\n"
+                    f"Use the command: `/setminavgrating <value>`\n\n"
+                    f"Example: `/setminavgrating 3.5` (shows posts from users with avg rating >= 3.5)\n"
+                    f"Set to `0.0` to effectively disable this filter (or show all rated).",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                await query.answer("✏️ Enter new minimum average rating via command.")
+                # No resume_scraping here, as it's a quick info message.
+                return
+            elif payload == "configure_links":
+                logger.info("Processing configure_links help payload.")
+                # Diese Logik ist im Grunde die gleiche wie im /togglelink Befehl ohne Argumente
+                # um das Menü anzuzeigen.
+                message_text = "🔗 **Link Display Settings:**\n"
+                message_text += "Status der einzelnen Links (klicke zum Umschalten):\n\n"
+                
+                buttons = []
+                sol_links_info = [
+                    ("sol_axiom", "Axiom (SOL)"), ("sol_bullx", "BullX (SOL)"), 
+                    ("sol_rugcheck", "RugCheck (SOL)"), ("sol_dexs", "DexScreener (SOL)"),
+                    ("sol_pumpfun", "Pumpfun (SOL)"), ("sol_solscan", "Solscan (SOL)")
+                ]
+                bsc_links_info = [
+                    ("bsc_dexs", "DexScreener (BSC)"), ("bsc_gmgn", "GMGN (BSC)"),
+                    ("bsc_fourmeme", "FOURmeme (BSC)"), ("bsc_pancake", "PancakeSwap (BSC)"),
+                    ("bsc_scan", "BscScan (BSC)")
+                ]
+                current_row = []
+                # Verwende link_display_config direkt, da es global ist
+                for key, name in sol_links_info + bsc_links_info:
+                    status_emoji = "🟢" if link_display_config.get(key, False) else "🔴"
+                    button_text = f"{status_emoji} {name}"
+                    current_row.append(InlineKeyboardButton(button_text, callback_data=f"togglelink:{key}"))
+                    if len(current_row) == 2:
+                        buttons.append(current_row)
+                        current_row = []
+                if current_row:
+                    buttons.append(current_row)
+                
+                buttons.append([InlineKeyboardButton("🔙 Close Menu", callback_data="togglelink:close")])
+                reply_markup = InlineKeyboardMarkup(buttons)
+                
+                # Sende als neue Nachricht oder bearbeite die Hilfenachricht
+                # Hier senden wir es als neue Nachricht, um die Hilfenachricht nicht zu ersetzen.
+                # Alternativ könnte man die Hilfenachricht bearbeiten, aber das kann unübersichtlich werden.
+                try:
+                    # Versuche, die aktuelle Hilfenachricht zu löschen, bevor das neue Menü gesendet wird
+                    await query.message.delete()
+                except Exception as e_del_help:
+                    logger.warning(f"Could not delete original help message before showing link config: {e_del_help}")
+
+                await query.message.get_bot().send_message( # Verwende get_bot().send_message für eine neue Nachricht
+                    chat_id=query.message.chat_id,
+                    text=message_text,
+                    reply_markup=reply_markup,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                # Kein resume_scraping hier, da die Interaktion über die neuen Buttons weitergeht.
+                return
+                await query.answer(f"Rating Buttons: {status_text}")
+                return
                 await query.message.reply_text(f"✅ Headless mode is now {status_text}. Restarting WebDriver...")
                 await restart_driver_and_login(query)
                 return
@@ -4033,21 +4575,30 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                  await query.answer("❌ Error: Invalid rating format.", show_alert=True)
                  return
             try:
-                sub_parts = parts[1].split(":", 2)
-                if len(sub_parts) != 3:
-                    logger.warning(f"Invalid rating format details: {parts[1]}")
+                # Expect "value:source_key" from parts[1]
+                sub_parts = parts[1].split(":", 1) # Max 1 split, expecting 2 parts
+                if len(sub_parts) != 2:
+                    logger.warning(f"Invalid rating format details (expected value:source_key): {parts[1]}")
                     await query.answer("❌ Error: Invalid rating format (details).", show_alert=True)
                     return
-                rating_value_str, source_key, encoded_name = sub_parts
-                rating_value = int(rating_value_str)
-                try: decoded_name = base64.urlsafe_b64decode(encoded_name).decode()
-                except Exception as dec_err: logger.error(f"Failed to decode name '{encoded_name}': {dec_err}", exc_info=True); decoded_name = source_key
+                rating_value_str, source_key = sub_parts # Unpack into two variables
+
+                # Convert rating_value_str to int (rating_value was used later, ensure it's defined)
+                rating_value = int(rating_value_str) # This was missing, added for clarity
+
+                # decoded_name logic:
+                # If source_key exists in ratings_data and has a name, use it.
+                # Otherwise, for new entries or entries with missing names, default to source_key.
+                decoded_name = source_key # Default to source_key
+                if source_key in ratings_data and ratings_data[source_key].get("name"):
+                    decoded_name = ratings_data[source_key]["name"]
+                
                 if not (1 <= rating_value <= 5):
                     logger.warning(f"Invalid rating value received: {rating_value}")
                     await query.answer("❌ Invalid value (1-5).", show_alert=True)
                     return
 
-                global ratings_data; entry_needs_update = False
+                entry_needs_update = False
                 if source_key not in ratings_data:
                     ratings_data[source_key] = {"name": decoded_name, "ratings": {str(i): 0 for i in range(1, 6)}}; entry_needs_update = True
                     logger.debug(f"Initialized new rating entry for {source_key} with name '{decoded_name}'")
@@ -4577,7 +5128,7 @@ async def repost_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- End Existing Logic ---
     await resume_scraping()
 
-# --- Account / Reboot / Shutdown / Help / Stats / Ping ---
+# --- Account / Help / Stats / Ping ---
 async def account_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Displays the current account (Handler for /account)."""
     await pause_scraping()
@@ -4684,22 +5235,22 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_list_info = f"{current_list_count} Users in {current_list_filename}"
 
     # 7. New Schedules Status
-    sync_sched_disp = f"Sync: {'🟢 ON' if schedule_sync_enabled else '🔴 OFF'} at {schedule_sync_start_time}-{schedule_sync_end_time}"
-    fl_sched_disp = f"FollowList: {'🟢 ON' if schedule_follow_list_enabled else '🔴 OFF'} at {schedule_follow_list_start_time}-{schedule_follow_list_end_time}"
+    sync_sched_disp = f"{'🟢 ' if schedule_sync_enabled else '🔴'} Sync: at {schedule_sync_start_time}-{schedule_sync_end_time}"
+    fl_sched_disp = f"{'🟢 ' if schedule_follow_list_enabled else '🔴'} FollowList: at {schedule_follow_list_start_time}-{schedule_follow_list_end_time}"
     new_schedules_info = f"{sync_sched_disp}\n   └ {fl_sched_disp}"
 
     # --- Build message ---
-    ticker_status_text = "ENABLED 🟢" if search_tickers_enabled else "DISABLED 🔴"
-    headless_status_text = "ENABLED 🟢" if is_headless_enabled else "DISABLED 🔴"
+    ticker_status_text = "🟢" if search_tickers_enabled else "🔴"
+    headless_status_text = "🟢" if is_headless_enabled else "🔴"
     status_message = (
         f"📊 **Bot Overall Status** 📊\n\n"
         f"{'▶️' if not is_scraping_paused else ('⏸️⏰' if is_schedule_pause else '⏸️🟡')} **Operation:** {running_status}\n"
         f"🥷 **Active Account:** {account_info}\n"
-        f"🔑 **Keyword 🔎:** {'ENABLED 🟢' if search_keywords_enabled else 'DISABLED 🔴'}\n"
-        f"📝 **CA 🔎:** {'ENABLED 🟢' if search_ca_enabled else 'DISABLED 🔴'}\n"
-        f"💲 **Ticker 🔎:** {ticker_status_text}\n"
+        f"🔑 {'🟢' if search_keywords_enabled else '🔴'} **Keyword 🔎**\n"
+        f"📝 {'🟢' if search_ca_enabled else '🔴'} **CA 🔎** \n"
+        f"💲 {ticker_status_text} **Ticker 🔎** \n"
         f"⏰ **Main Schedule:** {schedule_details}\n"
-        f"👻 **Headless Mode:** {headless_status_text}\n" 
+        f"👻 {headless_status_text} **Headless Mode**\n" 
         f"🌍 **Global Follow List:** {global_list_info}\n"
         f"🤖 **Auto-Follow (Curr. Acc):** {autofollow_stat}\n"
         f"🗓️ **Other Schedules:**\n   └ {new_schedules_info}\n" 
@@ -5126,7 +5677,8 @@ async def show_help_message(update: Update):
     """Displays the help message (adapted for /commands)."""
     # Create keyboard markup with buttons for common commands (Buttons remain the same)
     separator_button = InlineKeyboardButton(" ", callback_data="noop_separator")
-    global search_tickers_enabled, is_headless_enabled # Need both for button text
+    global search_tickers_enabled, is_headless_enabled, like_repost_buttons_enabled, rating_buttons_enabled # Added new globals
+    global show_posts_from_unrated_enabled, min_average_rating_for_posts # Added for rating filters
     keyboard = [
         [ # Combined Pause/Resume Button - Shows current status
             InlineKeyboardButton(
@@ -5143,6 +5695,11 @@ async def show_help_message(update: Update):
             InlineKeyboardButton(f"🔑 Words {'🟢' if search_keywords_enabled else '🔴'}", callback_data="help:toggle_keywords"),
             InlineKeyboardButton(f"📝 CA {'🟢' if search_ca_enabled else '🔴'}", callback_data="help:toggle_ca"),
             InlineKeyboardButton(f"💲 Ticker {'🟢' if search_tickers_enabled else '🔴'}", callback_data="help:toggle_tickers")
+        ],
+        [ 
+            separator_button,
+            InlineKeyboardButton("🔗 Links Config", callback_data="help:configure_links"),
+            separator_button
         ],
         [separator_button],
         [ # All Schedules Status
@@ -5170,7 +5727,7 @@ async def show_help_message(update: Update):
         ],
         [separator_button],
         [ # Keywords
-            InlineKeyboardButton("🔑 Keywords", callback_data="help:keywords"),
+            InlineKeyboardButton("🔑 Words", callback_data="help:keywords"),
             InlineKeyboardButton("🔑➕ Add", callback_data="help:prepare_addkeyword"),
             InlineKeyboardButton("🔑➖ Remove", callback_data="help:prepare_removekeyword")
         ],
@@ -5204,11 +5761,33 @@ async def show_help_message(update: Update):
             InlineKeyboardButton("🌍 Global Info", callback_data="help:global_info"),
             InlineKeyboardButton("🏓 Ping", callback_data="help:ping")
         ],
-        [separator_button],
+        [separator_button], 
+        [
+            InlineKeyboardButton(f"👍 Like & Repost 🔄 {'🟢' if like_repost_buttons_enabled else '🔴'}", callback_data="help:toggle_like_repost"),
+            InlineKeyboardButton(f"💎 Ratings {'🟢' if rating_buttons_enabled else '🔴'}", callback_data="help:toggle_ratings")
+        ],
+    ] # End of the main keyboard list initialization
+
+    # Dynamically add Rating Filter buttons if Rating Buttons are enabled
+    if rating_buttons_enabled:
+        keyboard.extend([
+            [ # Rating Filter Buttons
+                InlineKeyboardButton(f"🆕 Unrated {'✅' if show_posts_from_unrated_enabled else '❌'}", callback_data="help:toggle_show_unrated"),
+                InlineKeyboardButton(f"⭐ Avg Min {min_average_rating_for_posts:.1f} {'✅' if min_average_rating_for_posts > 0.0 else '❌'}", callback_data="help:set_min_avg_rating")
+            ]
+        ])
+    
+    # Add the final separator and headless toggle.
+    # This assumes the headless toggle is the *very last* item or part of the last items.
+    # If you have other buttons that should always appear after the (optional) rating filters,
+    # ensure they are added here or that the logic correctly places them.
+    keyboard.extend([
+        [separator_button], # This separator will appear before the headless button
         [
             InlineKeyboardButton(f"👻 Headless {'🟢' if is_headless_enabled else '🔴'}", callback_data="help:toggle_headless")
-        ],
-    ]
+        ]
+    ])
+
     reply_markup = InlineKeyboardMarkup(keyboard)
 
 
@@ -5216,88 +5795,100 @@ async def show_help_message(update: Update):
 
     next_account_display_val = (current_account + 1) % len(ACCOUNTS) + 1 if ACCOUNTS and len(ACCOUNTS) > 0 else 1
 
-    await update.message.reply_text(
-        "🆘 `/help` - Show menu 🆘\n"
+    # Use send_message instead of reply_text
+    
+    # First, build the entire HTML string
+    help_text_html = (
+        "🆘 <code>/help</code> - Show menu 🆘\n"  # Changed to <code>
         " \n"
         "🚶‍♂️‍➡️    Follow / Unfollow    🚶‍♂️\n"
         "   <code>/follow username</code>\n"
         "   <code>/unfollow username</code>\n"
-        "   <code>/addusers @user1</code> user2 ...  - \n"
+        "   <code>/addusers @user1 user2 ...</code>  - \n" # Changed to <code>
         "      └ Adds to follow list.\n"
-        "   <code>/autofollowmode off</code> slow fast\n"
+        "   <code>/autofollowmode off|slow|fast</code>\n" # Changed to <code> and added options
         f"   <code>/autofollowinterval {auto_follow_interval_minutes[0]}-{auto_follow_interval_minutes[1]}</code> - interval (Slow Mode)\n"
-        "   /cancelfastfollow\n"
-        "   /autofollowstatus\n"
-        "   /clearfollowlist\n"
+        "   <code>/cancelfastfollow</code>\n" # Changed to <code>
+        "   <code>/autofollowstatus</code>\n" # Changed to <code>
+        "   <code>/clearfollowlist</code>\n" # Changed to <code>
         "  \n"
         "👍    Like / Repost    🔄\n"
         "   <code>/like tweet_url</code>\n"
         "   <code>/repost tweet_url</code>\n"
         "  \n"
         "🔑    Keywords    🔑\n"
-        "   /keywords  - Shows list\n"
-        "   <code>/addkeyword word1</code>,word2...\n"
-        "   <code>/removekeyword word1</code>,word2...\n"
+        "   <code>/keywords</code>  - Shows list\n" # Changed to <code>
+        "   <code>/addkeyword word1,word2...</code>\n" # Changed to <code>
+        "   <code>/removekeyword word1,word2...</code>\n" # Changed to <code>
         "  \n"
         "🥷    Accounts    🥷\n"
-        "   /account  - Show active account\n"
+        "   <code>/account</code>  - Show active account\n" # Changed to <code>
         f"   <code>/switchaccount {next_account_display_val}</code> \n"
         "      └ Switches to acc [nmbr]\n"
         "  \n"
         "🔍    Search Mode    🔍\n"
-        "   /mode  - current search mode\n"
-        "   /modefull  - Sets mode to CA + Keywords\n"
-        "   /modeca  - Sets mode to CA Only\n"
-        "   /searchtickers\n"
+        "   <code>/mode</code>  - current search mode\n" # Changed to <code>
+        "   <code>/modefull</code>  - Sets mode to CA + Keywords\n" # Changed to <code>
+        "   <code>/modeca</code>  - Sets mode to CA Only\n" # Changed to <code>
+        "   <code>/searchtickers</code>\n" # Changed to <code>
         "      └ scan for $Tickers on|off\n"
         f"   <code>/setmaxage {max_tweet_age_minutes}</code>\n"
         "      └ Sets max post age(min) (default: 15)\n"
         "  \n"
+        "🔗    CA Link configuration    🔗\n"
+        "   <code>/togglelink</code> - opens link display\n"
+        "  \n"
         "⏯️    Control    ⏯️\n"
-        "   /pause\n"
-        "   /resume\n"
+        "   <code>/pause</code>\n" # Changed to <code>
+        "   <code>/resume</code>\n" # Changed to <code>
         "  \n"
         "🗓️    All Schedules    🗓️\n"
-        "   /allschedules - Shows status of all schedules\n\n"
+        "   <code>/allschedules</code> - Shows status of all schedules\n\n" # Changed to <code>
         "   ▫️ Main Bot Pause Schedule:\n"
-        "     /schedule  - current main schedule\n"
-        "     /scheduleon | /scheduleoff\n"
+        "     <code>/schedule</code>  - current main schedule\n" # Changed to <code>
+        "     <code>/scheduleon</code> | <code>/scheduleoff</code>\n" # Changed to <code>
         f"     <code>/scheduletime {schedule_pause_start}-{schedule_pause_end}</code>\n\n"
         "   ▫️ Scheduled Sync:\n"
-        "     /schedulesync on|off\n"
-        f"     <code>/schedulesynctime {schedule_sync_start_time}-{schedule_sync_end_time}</code>\n\n"        "   ▫️ Scheduled Follow List:\n"
-        "     /schedulefollowlist on|off\n"
+        "     <code>/schedulesync on|off</code>\n" # Changed to <code>
+        f"     <code>/schedulesynctime {schedule_sync_start_time}-{schedule_sync_end_time}</code>\n\n"
+        "   ▫️ Scheduled Follow List:\n"
+        "     <code>/schedulefollowlist on|off</code>\n" # Changed to <code>
         f"     <code>/schedulefollowlisttime {schedule_follow_list_start_time}-{schedule_follow_list_end_time}</code>\n"
-        "  \n"        "  \n"
+        "  \n"        
+        "  \n"
         "📊    Statistics & Status    📊\n"
-        "   /status\n\n"
-        "   /stats\n"
-        "   /rates  - collected ratings\n"
-        "   /globallistinfo  - global follower list\n"
-        "   /ping  - test\n"
+        "   <code>/status</code>\n\n" # Changed to <code>
+        "   <code>/stats</code>\n" # Changed to <code>
+        "   <code>/rates</code>  - collected ratings\n" # Changed to <code>
+        "   <code>/globallistinfo</code>  - global follower list\n" # Changed to <code>
+        "   <code>/ping</code>  - test\n" # Changed to <code>
         "  \n"
         "💾  Following DB & Management  💾\n"
         "   <code>/scrapefollowing username</code>\n"
         "         └ Scans following of [username] & saves to DB\n"
-        "   <code>/addfromdb </code> f:50k s:3 k:WORD1 WORD2..\n"
+        "   <code>/addfromdb f:50k s:3 k:WORD1 WORD2...</code>\n" # Changed to <code>
         "         └ Adds from DB. Filters:\n"
-        "           f[ollowers]: Min. follower count (e.g., `f:10k` or `followers:10000`)\n"
-        "           s[een]: Min. times seen in scans (e.g., `s:3`)\n"
-        "           k[eywords]: Keywords in bio (e.g., `k:btc eth` or `keywords:solana nft`)\n"
-        "   /backupfollowers  - Saves snapshot of the active account\n"
-        "   /syncfollows  - Synchronizes active account with global list\n"
-        "   /buildglobalfrombackups \n"
+        "           f[ollowers]: Min. follower count (e.g., <code>f:10k</code> or <code>followers:10000</code>)\n"
+        "           s[een]: Min. times seen in scans (e.g., <code>s:3</code>)\n"
+        "           k[eywords]: Keywords in bio (e.g., <code>k:btc eth</code> or <code>keywords:solana nft</code>)\n"
+        "   <code>/backupfollowers</code>  - Saves snapshot of the active account\n" # Changed to <code>
+        "   <code>/syncfollows</code>  - Synchronizes active account with global list\n" # Changed to <code>
+        "   <code>/buildglobalfrombackups</code> \n" # Changed to <code>
         "         └ Adds users from all backups to the global list\n"
-        "   /cancelbackup ,  /cancelsync ,  /canceldbscrape \n"
+        "   <code>/cancelbackup</code> ,  <code>/cancelsync</code> ,  <code>/canceldbscrape</code> \n" # Changed to <code>
         "         └ Cancels running processes\n"
         "  \n"
-        "   /toggleheadless \n"
-        "         └ Toggles Headless mode ON/OFF (Restart required!)\n",
-        reply_markup=reply_markup,
-        parse_mode=ParseMode.HTML # Wichtig, damit <code> funktioniert
+        "   <code>/toggleheadless</code> \n"
+        "         └ Toggles Headless mode ON/OFF (Autom. Browser restart!)\n"
     )
-    # Important: This function must call resume at the end, as the calling handler paused
-    # await resume_scraping()
+
+    await update.message.get_bot().send_message(
+        chat_id=update.message.chat_id,
+        text=help_text_html, # Pass the pre-formatted HTML string
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True # Hinzugefügt, um Link-Vorschauen zu vermeiden
+    )
 
 async def add_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Adds usernames to the current account's list, checks against global followed list."""
@@ -6393,31 +6984,50 @@ async def build_global_from_backups_command(update: Update, context: ContextType
     missing_backups = []
     processed_accounts = 0
 
-    await update.message.reply_text("⏳ Reading all existing account backups...")
+    await update.message.reply_text("⏳ Reading all existing `follower_backup_*.txt` files...")
 
-    # Iterate through all configured accounts
-    for i, account_info in enumerate(ACCOUNTS):
-        acc_num = i + 1
-        acc_username = account_info.get("username")
-        if not acc_username:
-            logger.warning(f"Skipping account {acc_num}: No username configured.")
-            continue
+    # Get current working directory
+    script_dir = os.getcwd() # Oder os.path.dirname(os.path.abspath(__file__)) wenn das Skript nicht von CWD ausgeführt wird
+    
+    # Find all files matching the backup pattern
+    # FOLLOWER_BACKUP_TEMPLATE ist z.B. "follower_backup_{}.txt"
+    # Wir müssen den {} Teil durch einen Wildcard ersetzen für glob
+    pattern_base = FOLLOWER_BACKUP_TEMPLATE.split('{}')[0] # "follower_backup_"
+    
+    backup_files_found = []
+    for filename in os.listdir(script_dir):
+        if filename.startswith(pattern_base) and filename.endswith(".txt"): # Einfache Prüfung
+            # Verfeinerte Prüfung, um sicherzustellen, dass es wirklich eine Backup-Datei ist
+            # Extrahiere den Teil, der der Username sein könnte
+            potential_user_part = filename[len(pattern_base):-len(".txt")]
+            # Hier könnten wir noch prüfen, ob potential_user_part gültig aussieht,
+            # aber für den Anfang reicht es, alle passenden Dateien zu nehmen.
+            # Speziell für "adhoc_session_backup"
+            if potential_user_part == "adhoc_session_backup" or (potential_user_part and not any(c in potential_user_part for c in ['*', '?'])):
+                 backup_files_found.append(os.path.join(script_dir, filename))
 
-        safe_username = re.sub(r'[\\/*?:"<>|]', "_", acc_username)
-        backup_filepath = FOLLOWER_BACKUP_TEMPLATE.format(safe_username)
 
-        if os.path.exists(backup_filepath):
-            logger.info(f"Reading backup for @{acc_username} from {os.path.basename(backup_filepath)}...")
-            backup_set = load_set_from_file(backup_filepath)
-            combined_set.update(backup_set) # Add users to the total set (Union)
-            processed_accounts += 1
-            logger.debug(f"  -> Added {len(backup_set)} users. Combined set size: {len(combined_set)}")
+    if not backup_files_found:
+        await update.message.reply_text("❌ No `follower_backup_*.txt` files found in the current directory.")
+        return
+
+    for backup_filepath in backup_files_found:
+        # Extrahieren eines "Display-Namens" aus dem Dateinamen für Logging
+        display_file_name = os.path.basename(backup_filepath)
+        logger.info(f"Reading backup from {display_file_name}...")
+        
+        backup_set = load_set_from_file(backup_filepath)
+        if backup_set: # Nur wenn das Set nicht leer ist
+            combined_set.update(backup_set)
+            processed_accounts += 1 # Zählt jetzt die Anzahl der verarbeiteten Dateien
+            logger.debug(f"  -> Added {len(backup_set)} users from {display_file_name}. Combined set size: {len(combined_set)}")
         else:
-            logger.warning(f"Backup file not found for account @{acc_username}. Skipping.")
-            missing_backups.append(f"@{acc_username}")
+            logger.info(f"  -> Backup file {display_file_name} was empty or could not be read.")
+            missing_backups.append(display_file_name + " (empty/unreadable)")
 
-    if processed_accounts == 0:
-        await update.message.reply_text("❌ No backup files found. Please run `/backupfollowers` for at least one account first.")
+
+    if processed_accounts == 0: # Wenn alle gefundenen Dateien leer waren
+        await update.message.reply_text("❌ All found `follower_backup_*.txt` files were empty or unreadable.")
         return
 
     # Load the *current* global set to see how many are new
@@ -7084,7 +7694,7 @@ async def show_detailed_schedules_command(update: Update, context: ContextTypes.
     message = (
         f"🗓️ **All Schedule Statuses** ({USER_TIMEZONE_STR}) 🗓️\n\n"
         f"⏸️ **Main Bot Pause Schedule:** {main_sched_status}\n"
-        f"   └ Time: {schedule_pause_start} - {schedule_pause_end} {main_sched_next_run}\n\n"
+        f"   └ Window: {schedule_pause_start} - {schedule_pause_end} {main_sched_next_run}\n\n"
         f"🔄 **Scheduled Sync:** {sync_sched_status}\n"
         f"   └ Window: {schedule_sync_start_time} - {schedule_sync_end_time} {sync_run_status_text}\n\n"
         f"🚶‍♂️‍➡️ **Scheduled Follow List:** {follow_list_sched_status}\n"
@@ -7174,33 +7784,6 @@ async def account_request(update: Update):
     await update.message.reply_text(f"🥷 Current Account: {current_account+1}")
     await resume_scraping()
 
-async def reboot_request(update: Update):
-    """Process reboot requests centrally"""
-    await update.message.reply_text(f"♻️ R E B O O T")
-    try:
-        # Save counts before rebooting
-        save_posts_count()
-        # Wait a moment to ensure the message is sent
-        await asyncio.sleep(5)
-        # Execute system reboot command
-        os.system("sudo reboot")
-    except Exception as reboot_error:
-        await send_telegram_message(f"❌ Error during reboot: {str(reboot_error)}")
-    await resume_scraping()
-
-async def shutdown_request(update: Update):
-    """Process shutdown requests centrally"""
-    await update.message.reply_text(f"😴 SHUTDOWN")
-    try:
-        # Save counts before shutdown
-        save_posts_count()
-        # Wait a moment to ensure the message is sent
-        await asyncio.sleep(5)
-        # Execute system shutdown command
-        os.system("sudo shutdown now")
-    except Exception as shutdown_error:
-        await send_telegram_message(f"❌ Error during shutdown: {str(shutdown_error)}")
-    await resume_scraping()
 
 async def show_keywords(update: Update):
     """Displays the current keywords"""
@@ -7407,29 +7990,227 @@ def detect_chain(contract):
         return 'bsc'
     return 'unknown'
 
+
+def get_dexscreener_pair_address_for_solana(contract_address: str) -> Union[str, None]:
+    """
+    Fetches the pairAddress from DexScreener for a given Solana contract address.
+    Tries to find the most relevant pair if multiple exist.
+    Returns the pairAddress string or None if not found or an error occurs.
+    """
+    search_url = f"https://api.dexscreener.com/latest/dex/search?q={contract_address}"
+    logger.info(f"[DexScreener] Fetching pair data for {contract_address} from {search_url}")
+
+    try:
+        response = requests.get(search_url, timeout=10) # Synchroner Aufruf
+        response.raise_for_status()  # Prüft auf HTTP-Fehler
+        data = response.json()
+
+        if not data or not data.get("pairs") or not isinstance(data["pairs"], list) or len(data["pairs"]) == 0:
+            logger.info(f"[DexScreener] No pairs found for {contract_address}. API Response: {str(data)[:300]}")
+            return None
+        
+        target_pairs = []
+        for pair in data["pairs"]:
+            if not isinstance(pair, dict):
+                continue
+            
+            if pair.get("chainId", "").lower() != "solana":
+                logger.debug(f"[DexScreener] Skipping pair {pair.get('pairAddress')} for {contract_address} - wrong chainId: {pair.get('chainId')}")
+                continue
+
+            base_token_address = pair.get("baseToken", {}).get("address", "").lower()
+            quote_token_address = pair.get("quoteToken", {}).get("address", "").lower()
+            if contract_address.lower() == base_token_address or contract_address.lower() == quote_token_address:
+                target_pairs.append(pair)
+        
+        if not target_pairs:
+            logger.info(f"[DexScreener] No pairs found where {contract_address} is base or quote token on Solana chain.")
+            return None
+        best_pair_data = target_pairs[0] 
+        pair_address = best_pair_data.get("pairAddress")
+
+        if pair_address:
+            logger.info(f"[DexScreener] Found pairAddress '{pair_address}' for {contract_address} (Base: {best_pair_data.get('baseToken',{}).get('symbol')}, Quote: {best_pair_data.get('quoteToken',{}).get('symbol')})")
+            return pair_address
+        else:
+            logger.warning(f"[DexScreener] First matching pair for {contract_address} has no pairAddress. Pair data: {str(best_pair_data)[:300]}")
+            return None
+
+    except requests.exceptions.Timeout:
+        logger.error(f"[DexScreener] Timeout fetching data for {contract_address}.")
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"[DexScreener] HTTP error for {contract_address}: {e}. Status: {e.response.status_code}. Response: {e.response.text[:300]}")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"[DexScreener] Request error for {contract_address}: {e}")
+    except json.JSONDecodeError as e:
+        logger.error(f"[DexScreener] JSON decode error for {contract_address}: {e}. Response text: {response.text[:300] if 'response' in locals() else 'N/A'}")
+    except Exception as e:
+        logger.error(f"[DexScreener] Unexpected error for {contract_address}: {e}", exc_info=True)
+    
+    return None
+
+def get_dexscreener_image_url_for_solana(contract_address: str) -> Union[str, None]:
+    """
+    Fetches the image URL EXCLUSIVELY from the 'openGraph' field (expected within an 'info' object) 
+    from DexScreener for the first relevant Solana pair matching the contract_address.
+    Returns the image URL string or None if 'openGraph' is not found or not a valid URL.
+    """
+    search_url = f"https://api.dexscreener.com/latest/dex/search?q={contract_address}"
+    logger.info(f"[DexScreenerImage] Fetching image data for CA: {contract_address} from URL: {search_url} (TARGETING 'info.openGraph')")
+    print(f"DEBUG IMAGE FUNC: Called for CA: {contract_address}")
+
+    try:
+        response = requests.get(search_url, timeout=15)
+        logger.debug(f"[DexScreenerImage] Response status for {contract_address}: {response.status_code}")
+        print(f"DEBUG IMAGE FUNC: Response status for {contract_address}: {response.status_code}")
+        response.raise_for_status()
+        
+        data = response.json()
+        logger.debug(f"[DexScreenerImage] API JSON data for {contract_address} (first 500 chars): {str(data)[:500]}")
+        print(f"DEBUG IMAGE FUNC: API JSON data for {contract_address} (first 500 chars): {str(data)[:500]}")
+
+        if not data or not data.get("pairs") or not isinstance(data["pairs"], list) or len(data["pairs"]) == 0:
+            logger.info(f"[DexScreenerImage] No 'pairs' array or empty for {contract_address}.")
+            print(f"DEBUG IMAGE FUNC: No 'pairs' array or empty for {contract_address}.")
+            return None
+
+        logger.info(f"[DexScreenerImage] Found {len(data['pairs'])} pair(s) for {contract_address}. Iterating...")
+        print(f"DEBUG IMAGE FUNC: Found {len(data['pairs'])} pair(s) for {contract_address}. Iterating...")
+
+        for i, pair_data_candidate in enumerate(data["pairs"]):
+            print(f"DEBUG IMAGE FUNC: Checking pair #{i} for {contract_address}: {str(pair_data_candidate)[:300]}")
+
+            if not isinstance(pair_data_candidate, dict):
+                print(f"DEBUG IMAGE FUNC: Pair #{i} is not a dict. Skipping.")
+                continue
+
+            candidate_chain_id = pair_data_candidate.get("chainId", "").lower()
+            print(f"DEBUG IMAGE FUNC: Pair #{i} chainId: '{candidate_chain_id}'")
+
+            if candidate_chain_id == "solana":
+                base_token_addr = pair_data_candidate.get("baseToken", {}).get("address", "").lower()
+                quote_token_addr = pair_data_candidate.get("quoteToken", {}).get("address", "").lower()
+                print(f"DEBUG IMAGE FUNC: Pair #{i} (Solana) - Base: '{base_token_addr}', Quote: '{quote_token_addr}', Searched CA: '{contract_address.lower()}'")
+
+                if contract_address.lower() == base_token_addr or contract_address.lower() == quote_token_addr:
+                    logger.info(f"[DexScreenerImage] Found RELEVANT Solana pair #{i} for {contract_address}.")
+                    print(f"DEBUG IMAGE FUNC: Pair #{i} IS RELEVANT for {contract_address}.")
+                    
+                    info_object = pair_data_candidate.get("info")
+                    open_graph_url = None
+
+                    if isinstance(info_object, dict):
+                        print(f"DEBUG IMAGE FUNC: 'info' object found in pair #{i}: {str(info_object)[:200]}")
+                        # EXAKT das Feld "openGraph" innerhalb des "info"-Objekts suchen
+                        open_graph_url = info_object.get("openGraph")
+                        print(f"DEBUG IMAGE FUNC: Value of 'info.openGraph' in pair #{i}: '{open_graph_url}'")
+                    else:
+                        print(f"DEBUG IMAGE FUNC: 'info' object NOT found or not a dict in pair #{i}. Cannot get 'openGraph'.")
+                        # Da "openGraph" im "info"-Objekt erwartet wird, hier None zurückgeben, wenn "info" fehlt.
+                        return None 
+
+                    if open_graph_url and isinstance(open_graph_url, str) and open_graph_url.startswith("http"):
+                        logger.info(f"[DexScreenerImage] SUCCESS: Found and using 'openGraph' URL from 'info' object in pair #{i} for {contract_address}: {open_graph_url}")
+                        print(f"DEBUG IMAGE FUNC: SUCCESS: Using 'openGraph' URL from 'info': {open_graph_url}")
+                        return open_graph_url
+                    
+                    if open_graph_url: # "openGraph" war da, aber ungültig
+                        logger.warning(f"[DexScreenerImage] Field 'info.openGraph' (value: '{open_graph_url}') found in pair #{i} for {contract_address}, but it's not a valid starting HTTP URL. No image will be used.")
+                        print(f"DEBUG IMAGE FUNC: 'info.openGraph' in pair #{i} was not a valid HTTP URL: '{open_graph_url}'")
+                    else: # "openGraph" Feld nicht im "info"-Objekt gefunden
+                        logger.info(f"[DexScreenerImage] 'openGraph' field NOT FOUND or is None in 'info' object of relevant pair #{i} for {contract_address}. No image will be used.")
+                        print(f"DEBUG IMAGE FUNC: 'openGraph' field NOT FOUND or None in 'info' object of relevant pair #{i}.")
+                    
+                    return None # Nur "openGraph" aus "info" zählt, und es war nicht gültig/vorhanden
+                else:
+                    print(f"DEBUG IMAGE FUNC: Pair #{i} (Solana) is NOT relevant for CA {contract_address} (base/quote mismatch).")
+            else:
+                print(f"DEBUG IMAGE FUNC: Pair #{i} is NOT on Solana chain (is '{candidate_chain_id}').")
+        
+        logger.info(f"[DexScreenerImage] No relevant Solana pair containing a valid 'info.openGraph' URL was found for {contract_address} after checking all {len(data['pairs'])} pairs.")
+        print(f"DEBUG IMAGE FUNC: No relevant Solana pair with 'info.openGraph' found for {contract_address}.")
+        return None
+
+    # ... (Rest der Fehlerbehandlung bleibt gleich) ...
+    except requests.exceptions.Timeout:
+        logger.error(f"[DexScreenerImage] Timeout fetching image data for {contract_address}.")
+        print(f"DEBUG IMAGE FUNC: Timeout for {contract_address}.")
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"[DexScreenerImage] HTTP error for {contract_address}: {e}. Status: {e.response.status_code}. Response: {e.response.text[:300]}")
+        print(f"DEBUG IMAGE FUNC: HTTP Error for {contract_address}: {e.response.status_code}")
+    except json.JSONDecodeError as e:
+        logger.error(f"[DexScreenerImage] JSON decode error for {contract_address}: {e}. Response text: {response.text[:300] if 'response' in locals() else 'N/A'}")
+        print(f"DEBUG IMAGE FUNC: JSON Decode Error for {contract_address}.")
+    except Exception as e: 
+        logger.error(f"[DexScreenerImage] Unexpected error fetching/processing image URL for {contract_address}: {e}", exc_info=True)
+        print(f"DEBUG IMAGE FUNC: Unexpected Error for {contract_address}: {e}")
+    
+    print(f"DEBUG IMAGE FUNC: Returning None at the end for {contract_address}.")
+    return None
+
 def get_contract_links(contract, chain):
-    """Generate links for exploring a contract on various platforms"""
-    links = [f""]
+    """Generate links for exploring a contract on various platforms based on config."""
+    global link_display_config # Zugriff auf die globale Konfiguration
+    # ===== START: get_contract_links =====
+    # print(f"--- GET_CONTRACT_LINKS --- ENTERED for contract: {contract}, chain: {chain}") # Kann für Debugging bleiben
+
+    links_list = []
 
     if chain == 'solana':
-            links.extend([
-                f"<a href=\"https://neo.bullx.io/terminal?chainId=1399811149&address={contract}\">Bull✖️</a>\n",
+        # print(f"--- GET_CONTRACT_LINKS --- Chain is SOLANA for {contract}.")
+        if link_display_config.get("sol_bullx", False):
+            links_list.append(f"<a href=\"https://neo.bullx.io/terminal?chainId=1399811149&address={contract}\">Bull✖️</a>\n")
+        # --- Axiom link generation (conditional) ---
+        if link_display_config.get("sol_axiom", False):
+            # print(f"--- GET_CONTRACT_LINKS --- Attempting Axiom link generation for {contract}.")
+            contractaxiom_pair_address = None
+            dex_api_url = f"https://api.dexscreener.com/latest/dex/search?q={contract}"
+            try:
+                response = requests.get(dex_api_url, timeout=10)
+                response.raise_for_status()
+                data = response.json()
+                if data and data.get("pairs") and isinstance(data["pairs"], list) and len(data["pairs"]) > 0:
+                    first_pair = data["pairs"][0]
+                    if isinstance(first_pair, dict) and first_pair.get("pairAddress"):
+                        contractaxiom_pair_address = first_pair["pairAddress"]
+            except Exception: # Einfaches Fehlerhandling hier, da es nur ein Link ist
+                pass # print(f"--- GET_CONTRACT_LINKS --- Axiom API UNEXPECTED ERROR for {contract}: {e}")
 
-                f"  <a href=\"https://rugcheck.xyz/tokens/{contract}#search\">RugCheck 🕵️‍♂️</a>\n",
-                f"    <a href=\"https://dexscreener.com/solana/{contract}\">Dex Screener 🦅</a>\n",
-                f"  <a href=\"https://pump.fun/coin/{contract}\">pumpfun 💊</a>\n",
-                f"<a href=\"https://solscan.io/token/{contract}\">Solscan 📡</a>\n"
-            ])
+            if contractaxiom_pair_address:
+                links_list.append(f"  <a href=\"https://axiom.trade/meme/{contractaxiom_pair_address}\">AXIOM 🔺</a>\n")
+        # --- End Axiom link generation ---
+
+        # --- Standard Solana links (conditional) ---
+        if link_display_config.get("sol_rugcheck", False):
+            links_list.append(f"    <a href=\"https://rugcheck.xyz/tokens/{contract}#search\">RugCheck 🕵️‍♂️</a>\n")
+        if link_display_config.get("sol_dexs", False):
+            links_list.append(f"      <a href=\"https://dexscreener.com/solana/{contract}\">Dex Screener 🦅</a>\n")
+        if link_display_config.get("sol_pumpfun", False):
+            links_list.append(f"    <a href=\"https://pump.fun/coin/{contract}\">pumpfun 💊</a>\n")
+        if link_display_config.get("sol_solscan", False):
+            links_list.append(f" <a href=\"https://solscan.io/token/{contract}\">Solscan 📡</a>\n")
+        # print(f"--- GET_CONTRACT_LINKS --- Standard Solana links ADDED (conditionally) for {contract}.")
+
     elif chain == 'bsc':
-        links.extend([
-            f"<a href=\"https://gmgn.ai/bsc/token/sMF2eWcC_{contract}\">GMGN 🦖</a>\n",
-            f"  <a href=\"https://four.meme/token/{contract}\">FOUR meme 🥦</a>\n",
-            f"   <a href=\"https://dexscreener.com/bsc/{contract}\">Dex Screener 🦅</a>\n",
-            f"  <a href=\"https://pancakeswap.finance/?outputCurrency={contract}&chainId=56&inputCurrency=BNB\">PancageSwap 🥞</a>\n",
-            f"<a href=\"https://bscscan.com/address/{contract}\">BSC Scan 📡</a>\n"
-        ])
+        # print(f"--- GET_CONTRACT_LINKS --- Chain is BSC for {contract}.")
+        if link_display_config.get("bsc_dexs", False):
+            links_list.append(f"<a href=\"https://dexscreener.com/bsc/{contract}\">Dex Screener 🦅</a>\n")
+        if link_display_config.get("bsc_gmgn", False):
+            links_list.append(f"  <a href=\"https://gmgn.ai/bsc/token/sMF2eWcC_{contract}\">GMGN 🦖</a>\n")
+        if link_display_config.get("bsc_fourmeme", False):
+            links_list.append(f"    <a href=\"https://four.meme/token/{contract}\">FOUR meme 🥦</a>\n")
+        if link_display_config.get("bsc_pancake", False):
+            links_list.append(f"  <a href=\"https://pancakeswap.finance/?outputCurrency={contract}&chainId=56&inputCurrency=BNB\">PancageSwap 🥞</a>\n")
+        if link_display_config.get("bsc_scan", False):
+            links_list.append(f"<a href=\"https://bscscan.com/address/{contract}\">BSC Scan 📡</a>\n")
+        # print(f"--- GET_CONTRACT_LINKS --- Standard BSC links ADDED (conditionally) for {contract}.")
+    # else:
+        # print(f"--- GET_CONTRACT_LINKS --- Chain is UNKNOWN ('{chain}') for {contract}.")
 
-    return ''.join(links)
+    final_links_str = "".join(links_list)
+    # print(f"--- GET_CONTRACT_LINKS --- EXITING for {contract}. Result (first 100): '{final_links_str[:100]}'")
+    # ===== END: get_contract_links =====
+    return final_links_str
 
 def format_time(datetime_str):
     global max_tweet_age_minutes, USER_CONFIGURED_TIMEZONE, USER_TIMEZONE_STR # Access global settings
@@ -7541,6 +8322,8 @@ def format_token_info(tweet_text):
             ticker_section = "\n💲 " + "".join(f"<code>{html.escape(ticker)}</code> " for ticker in unique_tickers).strip()
 
     # --- Contract Address (CA) Extraction and Formatting ---
+    dexscreener_image_url_for_post = None 
+
     try:
         ca_matches = re.findall(TOKEN_PATTERN, tweet_text)
     except NameError:
@@ -7571,6 +8354,12 @@ def format_token_info(tweet_text):
             except NameError:
                 chain = "unknown" # Fallback if detect_chain is missing
 
+            if chain == 'solana' and dexscreener_image_url_for_post is None:
+                img_url = get_dexscreener_image_url_for_solana(contract) # 'contract' ist hier deine Schleifenvariable
+                if img_url:
+                    dexscreener_image_url_for_post = img_url
+                    logger.info(f"[FormatTokenInfo]    Using DexScreener image for post (from CA {contract}): {dexscreener_image_url_for_post}")
+
             contract_section += f"<code>{html.escape(contract)}</code>\n"
             contract_section += f"🧬 {chain.upper()}\n"
 
@@ -7586,65 +8375,11 @@ def format_token_info(tweet_text):
 
     contract_section = contract_section.strip()
 
-    # Return ticker section, contract section, and a flag indicating if tickers were found (and enabled)
+    # Return ticker section, contract section, a flag indicating if tickers were found (and enabled),
+    # and the dexscreener image url if found for a Solana CA in this post
     ticker_found_flag = bool(ticker_section) # True if ticker_section is not empty
-    return ticker_section, contract_section, ticker_found_flag
-
-# def format_token_info(post_text):
-#     """
-#     Extracts and formats Tickers ($) and Contract Addresses (CA)
-#     from a post text. Filters out pure currency amounts and amounts
-#     with K/M/B/T suffixes from tickers.
-#     """
-
-#     # --- Ticker ($) Extraction and Cleanup ---
-#     all_potential_tickers = [word for word in post_text.split() if word.startswith("$")]
-#     tickers = []
-#     punctuation_to_strip = '.,;:!?()&"\'+-/' # Remove punctuation at the end
-
-#     # Regex to recognize pure numeric amounts (optional with .,) and those with K/M/B/T
-#     currency_pattern = r"^[0-9][0-9,.]*([KkMmBbTt])?$"
-
-#     for potential_ticker in all_potential_tickers:
-#         cleaned = potential_ticker.rstrip(punctuation_to_strip)
-#         if len(cleaned) <= 1: continue
-#         value_part = cleaned[1:]
-#         if re.fullmatch(currency_pattern, value_part, re.IGNORECASE): continue
-#         tickers.append(cleaned)
-
-#     ticker_section = ""
-#     if tickers:
-#         unique_tickers = sorted(list(set(tickers)))
-#         ticker_section = "\n💲 " + "".join(f"<code>{html.escape(ticker)}</code> " for ticker in unique_tickers).strip()
-#     # --- End Conditional Ticker Logic ---
-
-#     # --- Contract Address (CA) Extraction and Formatting ---
-#     try: ca_matches = re.findall(TOKEN_PATTERN, post_text)
-#     except NameError: print("ERROR: TOKEN_PATTERN is not defined!"); ca_matches = []
-
-#     filtered_ca_matches = []; seen_tokens = set()
-#     for match in ca_matches:
-#         try: chain = detect_chain(match)
-#         except NameError: chain = "unknown"
-#         if chain != 'unknown' and match not in seen_tokens:
-#             filtered_ca_matches.append(match); seen_tokens.add(match)
-#         elif match not in seen_tokens: seen_tokens.add(match) # Add unknown CAs to seen to avoid duplicates
-
-#     contract_section = ""
-#     if filtered_ca_matches:
-#         contract_section += "\n📝 "
-#         for contract in filtered_ca_matches:
-#             try: chain = detect_chain(contract)
-#             except NameError: chain = "unknown"
-#             contract_section += f"<code>{html.escape(contract)}</code>\n"
-#             contract_section += f"🧬 {chain.upper()}\n"
-#             try: links_html = get_contract_links(contract, chain)
-#             except NameError: links_html = ""
-#             if links_html: contract_section += "\n" + links_html
-#             contract_section += "\n"
-#     contract_section = contract_section.strip()
-
-#     return ticker_section, contract_section
+    logger.debug(f"[FormatTokenInfo] Returning: ticker_found_flag={ticker_found_flag}, dexscreener_og_image_url='{dexscreener_image_url_for_post}'")
+    return ticker_section, contract_section, ticker_found_flag, dexscreener_image_url_for_post
 
 async def process_tweets():
     """
@@ -7655,6 +8390,9 @@ async def process_tweets():
     global driver, is_scraping_paused, first_run, processed_tweets, KEYWORDS, TOKEN_PATTERN, search_mode, ratings_data
 
     if is_scraping_paused: return
+    if driver is None:
+        logger.warning("process_tweets called but driver is None. Skipping.")
+        return
 
     try:
         button_tweet_count = await check_new_tweets_button()
@@ -7938,7 +8676,7 @@ async def process_tweets():
                     # --- Relevance Check and Sending ---
                     # format_token_info now returns: ticker_section, contract_section, ticker_actually_found_and_enabled
                     # ticker_found from format_token_info already considers if search_tickers_enabled is True
-                    ticker_section, contract_section, ticker_found_and_enabled = format_token_info(tweet_content)
+                    ticker_section, contract_section, ticker_found_and_enabled, dexscreener_img_url = format_token_info(tweet_content)
                     
                     contains_keyword_match = any(keyword.lower() in tweet_content.lower() for keyword in KEYWORDS)
                     contains_ca_match = bool(contract_section) # True if a CA was found and formatted
@@ -7962,6 +8700,53 @@ async def process_tweets():
                         reasons.append("Ticker")
 
                     if is_relevant:
+                        # --- Rating Filter Check ---
+                        author_avg_rating = -1.0 # Default for unrated or error
+                        author_total_ratings = 0
+                        is_author_rated = author_handle in ratings_data
+
+                        if is_author_rated:
+                            rating_info = ratings_data[author_handle].get("ratings", {})
+                            if isinstance(rating_info, dict):
+                                for star_str, count in rating_info.items():
+                                    try:
+                                        star = int(star_str)
+                                        if 1 <= star <= 5:
+                                            author_total_ratings += count
+                                            author_avg_rating += star * count # Temporarily sum, will divide later
+                                    except ValueError: continue
+                                if author_total_ratings > 0:
+                                    author_avg_rating = author_avg_rating / author_total_ratings
+                                else: # Has entry but no actual ratings
+                                    author_avg_rating = -1.0 # Treat as unrated for filtering
+                                    is_author_rated = False # Correct flag
+                            else: # Invalid rating structure
+                                author_avg_rating = -1.0
+                                is_author_rated = False
+                        
+                        # Decision logic based on filters
+                        passes_rating_filter = False
+                        if not is_author_rated: # Author has no rating data at all
+                            if show_posts_from_unrated_enabled:
+                                passes_rating_filter = True
+                                print(f"    post {tweet_id} from unrated author @{author_handle} passes (Show Unrated: ON).")
+                            else:
+                                print(f"    post {tweet_id} from unrated author @{author_handle} SKIPPED (Show Unrated: OFF).")
+                        else: # Author is rated
+                            if author_avg_rating >= min_average_rating_for_posts:
+                                passes_rating_filter = True
+                                print(f"    post {tweet_id} from @{author_handle} (Avg: {author_avg_rating:.1f}) passes (Min Avg: {min_average_rating_for_posts:.1f}).")
+                            else:
+                                print(f"    post {tweet_id} from @{author_handle} (Avg: {author_avg_rating:.1f}) SKIPPED (Min Avg: {min_average_rating_for_posts:.1f}).")
+                        
+                        if not passes_rating_filter:
+                            # If it doesn't pass the rating filter, it's no longer relevant for sending
+                            is_relevant = False 
+                            print(f"    post {tweet_id} marked as NOT relevant due to rating filter.")
+                        # --- End Rating Filter Check ---
+
+                    # Continue with the original "if is_relevant:" block
+                    if is_relevant: # This 'is_relevant' might have been changed by the rating filter
                         # reasons list is already built above
                         
                         reasons = sorted(list(set(reasons))) # Final list of reasons for display
@@ -7981,7 +8766,8 @@ async def process_tweets():
 
                         # --- Get rating info ---
                         rating_display = ""
-                        if author_handle in ratings_data:
+                        # Check if rating buttons are enabled before trying to display the rating
+                        if rating_buttons_enabled and author_handle in ratings_data: # Added rating_buttons_enabled check
                             rating_info = ratings_data[author_handle].get("ratings", {})
                             if isinstance(rating_info, dict):
                                 total_ratings = 0
@@ -7998,7 +8784,7 @@ async def process_tweets():
                                     rating_display = f" {average_rating:.1f}💎({total_ratings})" # Space at the beginning
                         # --- End rating info ---
 
-                        user_info_line = f"👤 <b><a href=\"https://x.com/{html.escape(author_handle.lstrip('@'))}\">{html.escape(author_name)}</a></b> (<code><i>{html.escape(author_handle)}</i></code>){rating_display}" # Rating appended here
+                        user_info_line = f"👤 <b><a href=\"https://x.com/{html.escape(author_handle.lstrip('@'))}\">{html.escape(author_name)}</a></b> (<code><i>{html.escape(author_handle)}</i></code>){rating_display}" # Rating appended here (will be empty if ratings disabled)
                         message_parts = [user_info_line]
 
                         # --- Build message (for repost) ---
@@ -8040,22 +8826,48 @@ async def process_tweets():
                         final_reply_markup = None
                         combined_keyboard = []  # Initialize this once, at the beginning
 
-                        # Rating Buttons (only if CA search enabled AND CA present)
-                        if search_ca_enabled and contains_ca_match:
-                            source_key = author_handle
+                        # Rating Buttons (if post is relevant AND ratings are enabled)
+                        if rating_buttons_enabled:
+                            source_key = author_handle # This is the @handle, e.g., @RAFAELA_RIGO_
+                            
+                            # author_name is the display name, e.g., R🌟🌟🌟ELO🌟 RIGO
+                            author_name_for_display_logic = str(author_name) if author_name else source_key
+
+                            # Determine what to use for the 'name' part in callback_data for ratings
+                            name_to_encode_for_callback = author_name_for_display_logic
                             try:
-                                author_name_str = str(author_name) if author_name else source_key
-                                encoded_name = base64.urlsafe_b64encode(author_name_str.encode()).decode()
-                            except Exception as enc_err:
-                                logger.warning(f"Name encoding failed for {source_key}: {enc_err}. Using key.")
-                                encoded_name = base64.urlsafe_b64encode(source_key.encode()).decode()
-                            # Rating Buttons
-                            rating_buttons_row = [InlineKeyboardButton(str(i)+"💎", callback_data=f"rate:{i}:{source_key}:{encoded_name}") for i in range(1, 6)]
+                                # Check if author_name_for_display_logic contains only ASCII characters
+                                author_name_for_display_logic.encode('ascii')
+                                # If no error, it's ASCII, so we can use it directly for encoding
+                            except UnicodeEncodeError:
+                                # Contains non-ASCII characters. For callback_data robustness,
+                                # we'll use the source_key (the @handle) instead of the complex name.
+                                logger.info(f"Author name '{author_name_for_display_logic}' for {source_key} contains non-ASCII. "
+                                            f"Using handle '{source_key}' for rating callback_data's encoded name part.")
+                                name_to_encode_for_callback = source_key
+                            
+                            # Now, base64 encode the chosen name_to_encode_for_callback
+                            # This will be either the original ASCII author_name or the source_key (handle)
+                            try:
+                                encoded_name_for_callback_data = base64.urlsafe_b64encode(name_to_encode_for_callback.encode()).decode()
+                            except Exception as enc_err_cb:
+                                # Fallback if even encoding the handle fails (highly unlikely)
+                                logger.warning(f"Encoding for callback name part ('{name_to_encode_for_callback}') failed: {enc_err_cb}. "
+                                               f"Super-fallback: encoding source_key '{source_key}' again for callback.")
+                                encoded_name_for_callback_data = base64.urlsafe_b64encode(source_key.encode()).decode()
+                            
+                            # Create Rating Buttons. The callback_data will now only contain rate:value:source_key
+                            # The encoded_name is removed to save space.
+                            # The name for ratings_data will be handled in the callback.
+                            rating_buttons_row = [
+                                InlineKeyboardButton(str(i) + "💎", callback_data=f"rate:{i}:{source_key}")
+                                for i in range(1, 6)
+                            ]
                             combined_keyboard.append(rating_buttons_row)
 
                         # Like/Repost/FullText Buttons
                         action_buttons = []
-                        if tweet_id:  # tweet_id should always be present
+                        if like_repost_buttons_enabled and tweet_id:  # Check if L/R buttons are enabled
                             action_buttons.append(InlineKeyboardButton("👍 Like", callback_data=f"like:{tweet_id}"))
                             action_buttons.append(InlineKeyboardButton("🔄 Repost", callback_data=f"repost:{tweet_id}"))
 
@@ -8094,7 +8906,15 @@ async def process_tweets():
                         # +++ END DEBUG LOGGING +++
 
                         # The original send line follows here:
-                        await send_telegram_message(final_message, image_urls, tweet_url, reply_markup=final_reply_markup)
+                        final_images_to_send = []
+                        if dexscreener_img_url: # Diese Variable kommt jetzt von format_token_info
+                            final_images_to_send.append(dexscreener_img_url)
+                            logger.info(f"    Using DexScreener image for post {tweet_id}: {dexscreener_img_url}")
+                        elif image_urls: 
+                            final_images_to_send.extend(image_urls)
+                            logger.info(f"    Using originally scraped images for post {tweet_id}: {image_urls}")
+                        
+                        await send_telegram_message(final_message, final_images_to_send, tweet_url, reply_markup=final_reply_markup)
                         process_success = True # Belongs to sending
 
                     else: # Belongs to 'if is_relevant:'
@@ -8236,34 +9056,6 @@ async def account_request(update: Update):
     """Displays the current account"""
     await update.message.reply_text(f"🥷 Current Account: {current_account+1}")
     await resume_scraping()
-
-# async def reboot_request(update: Update):
-#     """Process reboot requests centrally"""
-#     await update.message.reply_text(f"♻️ R E B O O T")
-#     try:
-#         # Save counts before rebooting
-#         save_posts_count()
-#         # Wait a moment to ensure the message is sent
-#         await asyncio.sleep(5)
-#         # Execute system reboot command
-#         os.system("sudo reboot")
-#     except Exception as reboot_error:
-#         await send_telegram_message(f"❌ Error during reboot: {str(reboot_error)}")
-#     await resume_scraping()
-
-# async def shutdown_request(update: Update):
-#     """Process shutdown requests centrally"""
-#     await update.message.reply_text(f"😴 SHUTDOWN")
-#     try:
-#         # Save counts before shutdown
-#         save_posts_count()
-#         # Wait a moment to ensure the message is sent
-#         await asyncio.sleep(5)
-#         # Execute system shutdown command
-#         os.system("sudo shutdown now")
-#     except Exception as shutdown_error:
-#         await send_telegram_message(f"❌ Error during shutdown: {str(shutdown_error)}")
-#     await resume_scraping()
 
 async def show_keywords(update: Update):
     """Displays the current keywords"""
@@ -8470,82 +9262,6 @@ def detect_chain(contract):
         return 'bsc'
     return 'unknown'
 
-def get_contract_links(contract, chain):
-    """Generate links for exploring a contract on various platforms"""
-    links = [f""]
-
-    if chain == 'solana':
-            links.extend([
-                f"<a href=\"https://neo.bullx.io/terminal?chainId=1399811149&address={contract}\">Bull✖️</a>\n",
-
-                f"  <a href=\"https://rugcheck.xyz/tokens/{contract}#search\">RugCheck 🕵️‍♂️</a>\n",
-                f"    <a href=\"https://dexscreener.com/solana/{contract}\">Dex Screener 🦅</a>\n",
-                f"  <a href=\"https://pump.fun/coin/{contract}\">pumpfun 💊</a>\n",
-                f"<a href=\"https://solscan.io/token/{contract}\">Solscan 📡</a>\n"
-            ])
-    elif chain == 'bsc':
-        links.extend([
-            f"<a href=\"https://gmgn.ai/bsc/token/sMF2eWcC_{contract}\">GMGN 🦖</a>\n",
-            f"  <a href=\"https://four.meme/token/{contract}\">FOUR meme 🥦</a>\n",
-            f"   <a href=\"https://dexscreener.com/bsc/{contract}\">Dex Screener 🦅</a>\n",
-            f"  <a href=\"https://pancakeswap.finance/?outputCurrency={contract}&chainId=56&inputCurrency=BNB\">PancageSwap 🥞</a>\n",
-            f"<a href=\"https://bscscan.com/address/{contract}\">BSC Scan 📡</a>\n"
-        ])
-
-    return ''.join(links)
-
-# def format_time(datetime_str):
-#     is_recent = False # Default: Not recent
-#     formatted_string = "📅 Time invalid"
-#     try:
-#         # Attempt to use the configured timezone
-#         local_tz = ZoneInfo("Europe/Berlin")
-#     except Exception:
-#         # Fallback to a fixed offset if timezone info is unavailable
-#         print("WARNING: Could not load 'Europe/Berlin' timezone. Using UTC+2 fallback.")
-#         local_tz = timezone(timedelta(hours=2), "UTC+02:00_Fallback")
-
-#     try:
-#         # Parse the UTC time from the tweet
-#         tweet_time_utc = datetime.fromisoformat(datetime_str.replace('Z', '+00:00')).replace(tzinfo=timezone.utc)
-#         # Convert to the local timezone
-#         tweet_time_local = tweet_time_utc.astimezone(local_tz)
-#         # Get the current time in the same local timezone
-#         current_time_local = datetime.now(local_tz)
-#         # Calculate the difference
-#         time_diff = current_time_local - tweet_time_local
-#         seconds_ago = time_diff.total_seconds()
-
-#         # --- Determine if the post is recent (within 15 minutes) ---
-#         # 900 seconds = 15 minutes
-#         if 0 <= seconds_ago < 900:
-#             is_recent = True
-#         # --- End recent check ---
-
-#         # --- Format the display string based on age ---
-#         if seconds_ago < 0:
-#             # post is from the future (clock skew?)
-#             formatted_string = f"📅 {tweet_time_local.strftime('%H:%M %d.%m.%y')} (Future?)"
-#         elif seconds_ago < 3600: # Under 1 hour (includes the <15 min case)
-#             minutes_ago = int(seconds_ago // 60)
-#             formatted_string = f"📅 {tweet_time_local.strftime('%H:%M %d.%m.%y')} ({minutes_ago} min)"
-#         elif seconds_ago < 86400: # Under 1 day (but older than 1 hour)
-#             hours_ago = int(seconds_ago // 3600)
-#             formatted_string = f"📅 {tweet_time_local.strftime('%H:%M %d.%m.%y')} ({hours_ago} hrs)"
-#         else: # Older than 1 day
-#             formatted_string = f"📅 {tweet_time_local.strftime('%d.%m.%y %H:%M')}"
-#         # --- End string formatting ---
-
-#     except ValueError:
-#         # Error parsing the datetime string, keep default "invalid" message
-#         pass
-#     except Exception as e:
-#         # Log other unexpected errors during time formatting
-#         print(f"ERROR in format_time: {e}")
-#         # Keep default "invalid" message
-
-#     return formatted_string, is_recent
-
 
 async def process_full_text_request(query, context, tweet_url): # Added context
     """Processes the request to get full post text and update the message."""
@@ -8693,69 +9409,6 @@ async def handle_callback_query(update, context):
             # ... (code to edit button text to "Full Text (⏳)") ...
         else: logger.warning(f"Invalid full callback format: {data}")
 
-    elif action_type == "rate":
-        # Extract the rating data
-        rate_parts = data.split(":", 3) # Expect rate:value:key:name
-        if len(rate_parts) != 4:
-            logger.warning(f"Invalid rating format: {data}")
-            return
-
-        rating_value = rate_parts[1]
-        source_key = rate_parts[2]
-        encoded_name = rate_parts[3]
-
-        try:
-            rating_int = int(rating_value)
-            if not 1 <= rating_int <= 5:
-                logger.warning(f"Invalid rating value: {rating_int}")
-                return
-
-            try:
-                author_name = base64.urlsafe_b64decode(encoded_name.encode()).decode()
-            except:
-                author_name = source_key
-
-            global ratings_data # Ensure access
-            if source_key not in ratings_data:
-                 ratings_data[source_key] = {"name": author_name, "ratings": {str(i): 0 for i in range(1, 6)}}
-            elif "ratings" not in ratings_data[source_key] or not isinstance(ratings_data[source_key].get("ratings"), dict):
-                 ratings_data[source_key]["ratings"] = {str(i): 0 for i in range(1, 6)}
-            ratings_data[source_key]["name"] = author_name
-
-            rating_key_str = str(rating_int)
-            ratings_data[source_key]["ratings"][rating_key_str] = ratings_data[source_key]["ratings"].get(rating_key_str, 0) + 1
-            save_ratings()
-
-            total_ratings = 0; weighted_sum = 0
-            for star_str, count in ratings_data[source_key].get("ratings", {}).items():
-                try:
-                    star = int(star_str)
-                    if 1 <= star <= 5: total_ratings += count; weighted_sum += star * count
-                except ValueError: continue
-
-            if total_ratings > 0:
-                average_rating = weighted_sum / total_ratings
-                rating_display = f"{average_rating:.1f}⭐({total_ratings})"
-                logger.info(f"Rating recorded for {author_name}: {rating_int} stars. New avg: {rating_display}")
-            else:
-                logger.info(f"Rating recorded for {author_name}: {rating_int} stars.")
-
-            # --- Remove rating buttons ---
-            try:
-                original_markup = query.message.reply_markup; new_keyboard = []
-                if original_markup:
-                    for row in original_markup.inline_keyboard:
-                        is_rating_header = any(b.callback_data == "rate_noop" for b in row)
-                        is_rating_buttons = any(b.callback_data.startswith("rate:") for b in row)
-                        if not is_rating_header and not is_rating_buttons: new_keyboard.append(row)
-                if new_keyboard: await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_keyboard))
-                else: await query.edit_message_reply_markup(reply_markup=None)
-            except Exception as edit_err: logger.warning(f"Could not edit reply markup after rating: {edit_err}")
-
-        except Exception as e:
-            print(f"Error processing rating: {e}")
-            logger.error("Error processing rating", exc_info=True)
-
     elif action_type == "cloudflare_solved":
         logger.info(f"Processing cloudflare_solved callback: {data}")
         try:
@@ -8874,6 +9527,67 @@ async def handle_callback_query(update, context):
 
     elif action_type == "rate_noop":
         pass # Do nothing for the rating header
+
+    elif action_type == "togglelink":
+        if len(parts) > 1:
+            link_key_to_toggle = parts[1]
+            
+            if link_key_to_toggle == "close":
+                try:
+                    await query.message.delete() # Lösche die Menü-Nachricht
+                except Exception as e_del:
+                    logger.warning(f"Could not delete link toggle menu: {e_del}")
+                return # Wichtig: Beende hier, da die Nachricht weg ist
+
+            if link_key_to_toggle in link_display_config:
+                link_display_config[link_key_to_toggle] = not link_display_config[link_key_to_toggle]
+                save_link_display_config()
+                logger.info(f"Link display for '{link_key_to_toggle}' toggled to {link_display_config[link_key_to_toggle]} by user {user_id} via button.")
+                
+                # Update the message with new buttons
+                # (Wir rufen im Grunde die Logik von toggle_link_display_command ohne Argumente erneut auf)
+                message_text = "🔗 **Link Display Settings:**\n"
+                message_text += "Status der einzelnen Links (klicke zum Umschalten):\n\n"
+                
+                buttons = []
+                sol_links_info = [
+                    ("sol_axiom", "Axiom (SOL)"), ("sol_bullx", "BullX (SOL)"), 
+                    ("sol_rugcheck", "RugCheck (SOL)"), ("sol_dexs", "DexScreener (SOL)"),
+                    ("sol_pumpfun", "Pumpfun (SOL)"), ("sol_solscan", "Solscan (SOL)")
+                ]
+                bsc_links_info = [
+                    ("bsc_dexs", "DexScreener (BSC)"), ("bsc_gmgn", "GMGN (BSC)"),
+                    ("bsc_fourmeme", "FOURmeme (BSC)"), ("bsc_pancake", "PancakeSwap (BSC)"),
+                    ("bsc_scan", "BscScan (BSC)")
+                ]
+                current_row = []
+                for key, name in sol_links_info + bsc_links_info:
+                    status_emoji = "🟢" if link_display_config.get(key, False) else "🔴"
+                    button_text = f"{status_emoji} {name}"
+                    current_row.append(InlineKeyboardButton(button_text, callback_data=f"togglelink:{key}"))
+                    if len(current_row) == 2:
+                        buttons.append(current_row)
+                        current_row = []
+                if current_row:
+                    buttons.append(current_row)
+                buttons.append([InlineKeyboardButton("🔙 Close Menu", callback_data="togglelink:close")])
+                new_reply_markup = InlineKeyboardMarkup(buttons)
+                
+                try:
+                    await query.edit_message_text(text=message_text, reply_markup=new_reply_markup, parse_mode=ParseMode.MARKDOWN)
+                except telegram.error.BadRequest as e:
+                    if "message is not modified" in str(e).lower():
+                        pass # Ist ok, wenn sich nur der Status geändert hat, aber der Text gleich blieb
+                    else:
+                        logger.error(f"Error editing link toggle menu: {e}")
+                except Exception as e_edit:
+                     logger.error(f"Error editing link toggle menu: {e_edit}")
+            else:
+                await query.answer(f"Unknown link key: {link_key_to_toggle}", show_alert=True)
+        else:
+            await query.answer("Error: Missing link key in callback.", show_alert=True)
+        return # Callback hier beendet
+
     else:
         # Handle other callbacks (sync, help, etc.) - Call the main handler
         # Ensure button_callback_handler exists and is correctly defined elsewhere
@@ -8886,10 +9600,13 @@ async def check_new_tweets_button():
     Checks for the 'Show new tweets' button, clicks it, logs the count found
     on the button with structure, and returns that count.
     Returns 0 if the button is not found or no count could be extracted.
+    Handles potential popups intercepting the click.
     """
     global driver # Access the global WebDriver
     num_new_tweets_on_button = 0 # Default value
     try:
+        if driver is None:
+            return 0
         # Wait briefly for the button
         button = WebDriverWait(driver, 2).until(
              EC.presence_of_element_located((By.XPATH, '//button[.//span[contains(text(), "Show") and contains(text(), "post")]]'))
@@ -8903,18 +9620,40 @@ async def check_new_tweets_button():
             if match:
                 num_new_tweets_on_button = int(match.group(1))
         except Exception as e_extract:
-             # print(f"INFO: Could not extract number from button text: {e_extract}") # Optional
              num_new_tweets_on_button = 1 # Conservative assumption
 
+        # Attempt to click the button
+        try:
+            button.click()
+        except ElementClickInterceptedException:
+            print("INFO: 'Show new tweets' button click intercepted. Attempting to close popup...")
+            try:
+                # Try to find and click the specific close button for the popup
+                # This XPath targets a button with aria-label="Close" and role="button"
+                popup_close_button = WebDriverWait(driver, 3).until(
+                    EC.element_to_be_clickable((By.XPATH, '//button[@aria-label="Close"][@role="button"]'))
+                )
+                print("INFO: Found 'Close' button for popup. Clicking it...")
+                popup_close_button.click()
+                await asyncio.sleep(random.uniform(1.0, 1.5)) # Wait for popup to potentially close
 
-        # Click immediately if button found
-        button.click()
+                # Retry clicking the original "Show new tweets" button
+                print("INFO: Retrying to click 'Show new tweets' button...")
+                # Re-locate the button as the DOM might have changed or the old reference might be stale
+                button = WebDriverWait(driver, 2).until(
+                    EC.element_to_be_clickable((By.XPATH, '//button[.//span[contains(text(), "Show") and contains(text(), "post")]]'))
+                )
+                button.click()
+                print("INFO: Successfully clicked 'Show new tweets' button after closing popup.")
+
+            except Exception as e_popup_close:
+                print(f"ERROR: Failed to close popup or retry click on 'Show new tweets' button: {e_popup_close}")
+                return 0 # Return 0 if handling the popup fails
 
         # === STRUCTURED LOGGING ===
-        print("\n############################") # Blank line before + Header
-        print(f"New Tweets button clicked (approx. {num_new_tweets_on_button} tweets)") # Translated
-        print("############################\n") # Header + Blank line after
-        # === END STRUCTURED LOGGING ===
+        print("\n############################")
+        print(f"New Tweets button clicked (approx. {num_new_tweets_on_button} tweets)")
+        print("############################\n")
 
         # Short wait for new tweets to load
         await asyncio.sleep(random.uniform(1.5, 2.5))
@@ -8923,10 +9662,11 @@ async def check_new_tweets_button():
 
     except (TimeoutException, NoSuchElementException):
         # No new tweets button found, this is normal
-        return 0 # Return 0 if no button found
+        return 0
     except Exception as e:
-        print(f"Error checking/clicking the 'New Tweets' button: {e}") # Translated
-        return 0 # Return 0 on error
+        # Log other errors, including if the initial button.click() (outside the intercept) fails for other reasons
+        print(f"Error checking/clicking the 'New Tweets' button: {e}")
+        return 0
 
 async def autofollow_mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Sets the Auto-Follow mode (off, slow, fast)."""
@@ -9194,15 +9934,257 @@ async def check_and_process_queue(application):
     else:
         return False
 
+async def set_min_avg_rating_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sets the minimum average rating for posts to be shown."""
+    global min_average_rating_for_posts
+    # pause/resume is handled by the admin wrapper
+
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text(
+            f"ℹ️ Please provide the minimum average rating (0.0 - 5.0).\n"
+            f"Current: {min_average_rating_for_posts:.1f}\n\n"
+            f"Format: `/setminavgrating <value>`\n\n"
+            f"Example: `/setminavgrating 3.5`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    try:
+        new_value_str = context.args[0]
+        new_value = float(new_value_str)
+        if 0.0 <= new_value <= 5.0:
+            min_average_rating_for_posts = new_value
+            save_settings()
+            await update.message.reply_text(f"✅ Minimum average rating for posts set to {min_average_rating_for_posts:.1f}.")
+            logger.info(f"Minimum average rating for posts set to {min_average_rating_for_posts:.1f} by user {update.message.from_user.id}")
+            # Optionally, resend the help message to update the button text
+            await show_help_message(update)
+        else:
+            await update.message.reply_text("❌ Value must be between 0.0 and 5.0.")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid input. Please provide a number (e.g., 3.0, 4.5).")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error setting minimum average rating: {e}")
+        logger.error(f"Error setting min_average_rating_for_posts to '{context.args[0]}': {e}", exc_info=True)
+
+async def toggle_show_unrated_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggles showing posts from unrated users."""
+    global show_posts_from_unrated_enabled
+    # pause/resume is handled by the admin wrapper
+
+    show_posts_from_unrated_enabled = not show_posts_from_unrated_enabled
+    save_settings()
+    status_text = "ENABLED ✅" if show_posts_from_unrated_enabled else "DISABLED ❌"
+    await update.message.reply_text(f"🆕 Showing posts from unrated users is now {status_text}.")
+    logger.info(f"Show Unrated Posts toggled to {status_text} by user {update.message.from_user.id} via command.")
+    # Optionally, resend the help message to update the button text
+    await show_help_message(update)
+
+async def toggle_link_display_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggles the display of a specific link type or shows current settings."""
+    global link_display_config
+
+    if not context.args:
+        # Show current settings
+        message = "🔗 **Link Display Settings:**\n"
+        message += "Status der einzelnen Links (klicke zum Umschalten):\n\n" # German text
+        
+        buttons = []
+        
+        sol_links_info = [
+            ("sol_axiom", "Axiom (SOL)"), ("sol_bullx", "BullX (SOL)"), 
+            ("sol_rugcheck", "RugCheck (SOL)"), ("sol_dexs", "DexScreener (SOL)"),
+            ("sol_pumpfun", "Pumpfun (SOL)"), ("sol_solscan", "Solscan (SOL)")
+        ]
+        bsc_links_info = [
+            ("bsc_dexs", "DexScreener (BSC)"), ("bsc_gmgn", "GMGN (BSC)"),
+            ("bsc_fourmeme", "FOURmeme (BSC)"), ("bsc_pancake", "PancakeSwap (BSC)"),
+            ("bsc_scan", "BscScan (BSC)")
+        ]
+
+        current_row = []
+        for key, name in sol_links_info + bsc_links_info: 
+            status_emoji = "🟢" if link_display_config.get(key, False) else "🔴"
+            button_text = f"{status_emoji} {name}"
+            # Callback-Daten: "togglelink:<key>"
+            current_row.append(InlineKeyboardButton(button_text, callback_data=f"togglelink:{key}"))
+            if len(current_row) == 2: 
+                buttons.append(current_row)
+                current_row = []
+        if current_row: 
+            buttons.append(current_row)
+        
+        buttons.append([InlineKeyboardButton("🔙 Close Menu", callback_data="togglelink:close")]) # Schließen Button
+        reply_markup = InlineKeyboardMarkup(buttons)
+        
+        await update.message.reply_text(message, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+        return 
+
+    # Argumente vorhanden -> versuche einen bestimmten Link umzuschalten (obwohl wir das jetzt über Buttons machen)
+    # Dieser Teil ist jetzt weniger relevant, da die Buttons die Hauptinteraktion sind.
+    # Man könnte ihn für direkte Befehle wie /togglelink sol_dexs behalten, aber die Button-Lösung ist benutzerfreundlicher.
+    link_key_to_toggle = context.args[0].lower()
+    if link_key_to_toggle in link_display_config:
+        link_display_config[link_key_to_toggle] = not link_display_config[link_key_to_toggle]
+        save_link_display_config()
+        status = "ENABLED" if link_display_config[link_key_to_toggle] else "DISABLED"
+        await update.message.reply_text(f"✅ Display for link type '{link_key_to_toggle}' is now {status}.")
+        logger.info(f"Link display for '{link_key_to_toggle}' set to {status} by user {update.message.from_user.id}")
+        # Erneut das Menü anzeigen, um den aktualisierten Status zu zeigen
+        # Dafür müssen wir context.args leeren, damit der obere Teil der Funktion getriggert wird
+        context.args = [] 
+        await toggle_link_display_command(update, context)
+    else:
+        await update.message.reply_text(f"❌ Unknown link type '{link_key_to_toggle}'. Use `/togglelink` to see available types.")
+        await resume_scraping() # resume, da Befehl hier endet
+
+# async def toggle_link_display_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     """Toggles the display of a specific link type or shows current settings."""
+#     global link_display_config
+#     # ... (rest of the function) ...
+#     else:
+#         await update.message.reply_text(f"❌ Unknown link type '{link_key_to_toggle}'. Use `/togglelink` to see available types.")
+#         await resume_scraping() # resume, da Befehl hier endet
+
+async def end_manual_session_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ends the manual login session, logs out, and shuts down the bot."""
+    global MANUAL_LOGIN_SESSION_ACTIVE, driver, application # Access globals
+    manual_session_login_confirmed = False # True when user confirms manual login in this session
+
+    if not MANUAL_LOGIN_SESSION_ACTIVE:
+        await update.message.reply_text("ℹ️ Not currently in a manual login session.")
+        # No resume_scraping() here as this command doesn't pause if not in session.
+        return
+
+    await update.message.reply_text("Ending manual login session...")
+    logger.info(f"Manual login session ended by command from user {update.message.from_user.id}.")
+    try:
+        await logout() # Perform X logout
+    except Exception as e_logout:
+        logger.error(f"Error during logout in endmanualsession: {e_logout}")
+        await update.message.reply_text(f"⚠️ Error during X logout: {e_logout}. Proceeding with shutdown.")
+
+    if driver:
+        try:
+            driver.quit()
+            driver = None
+            logger.info("WebDriver quit successfully during endmanualsession.")
+        except Exception as e_driver:
+            logger.error(f"Error quitting WebDriver in endmanualsession: {e_driver}")
+            await update.message.reply_text(f"⚠️ Error quitting WebDriver: {e_driver}. Proceeding with shutdown.")
+
+    global bot_should_exit # Signal an die Hauptschleife
+
+    await update.message.reply_text("Session ended. Bot is shutting down...")
+    print("Manual session ended by command. Bot will shut down shortly via main loop.")
+
+    bot_should_exit = True # Signal an die Hauptschleife
+
+async def confirm_login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Confirms that the user has manually logged in during an ad-hoc session."""
+    global ADHOC_LOGIN_SESSION_ACTIVE, adhoc_login_confirmed, driver
+
+    if not ADHOC_LOGIN_SESSION_ACTIVE:
+        await update.message.reply_text("ℹ️ This command is only for ad-hoc login sessions.")
+        return
+
+    if adhoc_login_confirmed:
+        await update.message.reply_text("ℹ️ Login already confirmed for this session.")
+        return
+
+    if not driver or "x.com/home" not in driver.current_url and "x.com/login" in driver.current_url : # Basic check if still on login page
+        # More robust check: try to find a timeline element
+        try:
+            WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.XPATH, '//div[@data-testid="primaryColumn"]//section[@role="region"]'))
+            )
+            # If above doesn't throw, we are likely on the timeline
+        except:
+            await update.message.reply_text("⚠️ It seems you are not fully logged into X yet (timeline not detected). Please complete the login in the browser and try `/confirmlogin` again.")
+            return
+
+    adhoc_login_confirmed = True
+    # Try to get the username of the manually logged-in account
+    # This is tricky without knowing the structure perfectly after a manual login.
+    # We can try to navigate to the profile page of "some" known entity and extract from there,
+    # or try to find the current user's profile link on the page.
+    # For now, let's just confirm.
+    global adhoc_scraped_username # Declare global for assignment
+    logged_in_username_display = "Unknown (manual ad-hoc)" # For display
+    adhoc_scraped_username = None # Reset before trying to scrape
+
+    try:
+        profile_button = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.XPATH, '//a[@data-testid="AppTabBar_Profile_Link"]'))
+        )
+        href = profile_button.get_attribute('href')
+        if href:
+            actual_handle = href.split('/')[-1]
+            if re.match(r'^[A-Za-z0-9_]{1,15}$', actual_handle):
+                adhoc_scraped_username = actual_handle # Store without "@"
+                logged_in_username_display = "@" + actual_handle
+    except Exception as e:
+        print(f"Could not determine username for adhoc session: {e}")
+
+    if adhoc_scraped_username:
+        await update.message.reply_text(f"✅ Login confirmed for ad-hoc session (User: {logged_in_username_display}).\n"
+                                         "You can now use `/backupfollowers`.\n"
+                                         "Use `/endadhocsession` when finished.")
+        logger.info(f"Ad-hoc login confirmed by user {update.message.from_user.id}. Logged in as {logged_in_username_display}. Stored handle: {adhoc_scraped_username}")
+    else:
+        await update.message.reply_text(f"✅ Login confirmed for ad-hoc session (User: {logged_in_username_display}).\n"
+                                         "⚠️ Could not automatically determine your X username. Backup might fail.\n"
+                                         "You can now use `/backupfollowers` (it will try with a generic URL if username is unknown).\n"
+                                         "Use `/endadhocsession` when finished.")
+        logger.warning(f"Ad-hoc login confirmed by user {update.message.from_user.id}, but username could not be scraped.")
+
+async def end_adhoc_session_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ends the ad-hoc login session, logs out, and shuts down the bot."""
+    global ADHOC_LOGIN_SESSION_ACTIVE, adhoc_login_confirmed, driver, application
+
+    if not ADHOC_LOGIN_SESSION_ACTIVE:
+        await update.message.reply_text("ℹ️ Not currently in an ad-hoc login session.")
+        return
+
+    await update.message.reply_text("Ending ad-hoc login session...")
+    logger.info(f"Ad-hoc login session ended by command from user {update.message.from_user.id}.")
+    try:
+        await logout() # Attempt to log out from X
+    except Exception as e_logout:
+        logger.error(f"Error during logout in endadhocsession: {e_logout}")
+        await update.message.reply_text(f"⚠️ Error during X logout: {e_logout}. Proceeding with shutdown.")
+
+    if driver:
+        try:
+            driver.quit()
+            driver = None
+            logger.info("WebDriver quit successfully during endadhocsession.")
+        except Exception as e_driver:
+            logger.error(f"Error quitting WebDriver in endadhocsession: {e_driver}")
+            await update.message.reply_text(f"⚠️ Error quitting WebDriver: {e_driver}. Proceeding with shutdown.")
+
+    global bot_should_exit # Signal an die Hauptschleife
+
+    await update.message.reply_text("Ad-hoc session ended. Bot is shutting down...")
+    print("Ad-hoc session ended by command. Bot will shut down shortly via main loop.")
+    
+    bot_should_exit = True # Signal an die Hauptschleife, dass sie beenden soll
+
+    # Das Stoppen der Telegram-Anwendung und sys.exit() wird jetzt vom finally-Block in run() übernommen,
+    # nachdem die Hauptschleife durch bot_should_exit beendet wurde.
+    # Wir müssen hier nicht mehr application.stop() oder sys.exit() aufrufen.
+
+
 async def run():
     """Main loop with correct state handling for pause/resume."""
-    global application, global_followed_users_set, is_scraping_paused, is_schedule_pause, pause_event
+    global application, global_followed_users_set, is_scraping_paused, is_schedule_pause, pause_event, manual_session_login_confirmed
     global last_follow_attempt_time, current_account_usernames_to_follow, is_periodic_follow_active
     global schedule_pause_start, schedule_pause_end # Access for messages
     global search_mode, current_account # For start message
     global schedule_sync_enabled, schedule_sync_start_time, schedule_sync_end_time, last_sync_schedule_run_date
     global schedule_follow_list_enabled, schedule_follow_list_start_time, schedule_follow_list_end_time, last_follow_list_schedule_run_date
     global cancel_sync_flag, cancel_scheduled_follow_list_flag # Declare these as global
+    global driver, last_driver_restart_time # Add driver and last_driver_restart_time here
 
     network_error_count = 0
     last_error_time = time.time()
@@ -9272,16 +10254,22 @@ async def run():
         add_admin_command_handler(application, "schedulefollowlisttime", schedule_follow_list_time_command)
         add_admin_command_handler(application, "allschedules", show_detailed_schedules_command) # Shows status of all
 
-        # Admin Management Commands (now also registered via the helper)
-        # IMPORTANT: The functions themselves NO LONGER need the @admin_required decorator!
         add_admin_command_handler(application, "addadmin", add_admin_command)
         add_admin_command_handler(application, "removeadmin", remove_admin_command)
         add_admin_command_handler(application, "listadmins", list_admins_command)
         # Ticker Search Toggle Command
         add_admin_command_handler(application, "searchtickers", search_tickers_command)
+        # Rating Filter Commands
+        add_admin_command_handler(application, "setminavgrating", set_min_avg_rating_command)
+        add_admin_command_handler(application, "toggleshowunrated", toggle_show_unrated_command)        
         # Headless Mode Toggle Command
         add_admin_command_handler(application, "toggleheadless", toggle_headless_command)
 
+        add_admin_command_handler(application, "togglelink", toggle_link_display_command)
+        add_admin_command_handler(application, "endmanualsession", end_manual_session_command)
+        add_admin_command_handler(application, "confirmlogin", confirm_login_command) # For adhoc
+        add_admin_command_handler(application, "endadhocsession", end_adhoc_session_command) # For adhoc
+        add_admin_command_handler(application, "manual_login_complete", manual_login_complete_command)
 
         # Callback Handler for Buttons
         application.add_handler(CallbackQueryHandler(handle_callback_query)) # Use the new unified handler
@@ -9319,13 +10307,18 @@ async def run():
         # --- End Robust Initialization ---
 
         print("Loading settings, counters, and lists...")
-        load_settings(); load_posts_count(); load_schedule(); load_ratings()
+        load_settings(); load_posts_count(); load_schedule(); load_ratings(); load_link_display_config()
         load_following_database() # Load Following DB
         load_admins() # Load Admin list
         global_followed_users_set = load_set_from_file(GLOBAL_FOLLOWED_FILE)
         print(f"{len(global_followed_users_set)} users loaded globally.")
         load_current_account_follow_list()
         print("Starting Telegram polling...")
+        print("Parsing script version...")
+        parse_script_version() # Call the new parser
+
+        print("Checking for updates (startup)...")
+        await handle_update_notification() # Check for updates and notify if new
         try: # Skip old updates
             updates = await application.bot.get_updates(offset=-1, limit=1)
             if updates: await application.bot.get_updates(offset=updates[-1].update_id + 1)
@@ -9333,63 +10326,156 @@ async def run():
         except Exception as e: print(f"Error skipping old updates: {e}")
         await application.start()
         await application.updater.start_polling(drop_pending_updates=True, timeout=30) # etc.
-        print("Initializing WebDriver and X Login...")
-        await initialize()
+        if ADHOC_LOGIN_SESSION_ACTIVE:
+            global driver # Ensure driver is global for this scope
+            driver = create_driver()
+            driver.get("https://x.com/login")
+            print("Browser opened to X login page. Please log in manually.")
+            # Telegram bot setup for /confirmlogin
+            if not application.running: # Ensure Telegram bot is running to receive /confirmlogin
+                await application.initialize()
+                await application.start()
+                await application.updater.start_polling(drop_pending_updates=True, timeout=30)
+            
+            admin_user_id_to_notify_adhoc = None
+            if INITIAL_ADMIN_USER_ID and INITIAL_ADMIN_USER_ID.isdigit():
+                admin_user_id_to_notify_adhoc = int(INITIAL_ADMIN_USER_ID)
+            elif admin_user_ids:
+                admin_user_id_to_notify_adhoc = next(iter(admin_user_ids), None)
 
-        # --- Load initial bot status from settings and adjust via schedule if needed ---
-        # is_scraping_paused and is_periodic_follow_active are already set in load_settings()
-        # pause_event is also set in load_settings()
-
-        is_schedule_pause = False # Schedule pause is a runtime status, not persistent
-
-        # Check if the schedule would force a pause *now*
-        initial_schedule_check = check_schedule()
-        if initial_schedule_check is True:
-            # If the schedule wants a pause AND the bot is currently running (according to settings)
-            if not is_scraping_paused:
-                print("INFO: Start time is within the scheduled pause period (Schedule active). Overriding loaded status -> PAUSED.")
-                is_scraping_paused = True
-                is_schedule_pause = True
-                pause_event.clear()
-                # No save_settings() here, as this is just the initial state
+            if admin_user_id_to_notify_adhoc:
+                try:
+                    await application.bot.send_message(
+                        chat_id=admin_user_id_to_notify_adhoc,
+                        text="🤖 Ad-hoc Login Session 🤖\n\n"
+                             "A browser window has been opened to x.com/login.\n"
+                             "Please log in with your desired X account directly in the browser.\n\n"
+                             "Once you are successfully logged into X (you see your timeline), "
+                             "send the command `/confirmlogin` to me."
+                    )
+                except Exception as e:
+                    print(f"Error sending adhoc login instructions: {e}")
             else:
-                # Bot is already paused (manually or from last run), schedule also wants pause
-                print("INFO: Start time is within the scheduled pause period, bot is already paused (according to settings).")
-                # Set is_schedule_pause if the reason is now the schedule
-                is_schedule_pause = True # Mark that the *current* pause is (also) due to schedule
-        # The case initial_schedule_check == "resume" is not handled here,
-        # as the bot starts paused by default or the saved state applies.
-        # The main loop will handle the resume case correctly.
+                print("Adhoc login session active. No admin ID to notify for /confirmlogin instruction.")
+            # The bot will now wait for /confirmlogin
+        else: # Normal or MANUAL_LOGIN_SESSION_ACTIVE mode
+            # Pass the flag based on MANUAL_LOGIN_SESSION_ACTIVE
+            await initialize(save_cookies_for_session=(not MANUAL_LOGIN_SESSION_ACTIVE))
 
-        running_status = "⏸️ PAUSED 🟡 (Schedule)" if is_scraping_paused and is_schedule_pause else ("⏸️ PAUSED 🟡 (Manual)" if is_scraping_paused else "▶️ RUNNING 🟢")
-        schedule_status = "ON 🟢" if schedule_enabled else "OFF ❌"
-        current_username_welcome = get_current_account_username() or "N/A"
-        autofollow_mode_display = auto_follow_mode.upper()
-        if auto_follow_mode == "slow":
-            autofollow_mode_display += f" ({auto_follow_interval_minutes[0]}-{auto_follow_interval_minutes[1]} min)"
-        elif auto_follow_mode == "off":
-             autofollow_mode_display = "OFF ⏸️"
-        ticker_status_welcome = "ON 🟢" if search_tickers_enabled else "OFF 🔴"
-        headless_status_welcome = "ON 🟢" if is_headless_enabled else "OFF 🔴"
-        welcome_message = (
-            f"🤖 raw-bot-X 🚀 START\n"
-            f"👉 Acc {current_account+1} (@{current_username_welcome})\n\n"
-            f"📊 ▫️STATUS▫️\n"
-            f"{running_status}\n"
-            f"🔑 Keyword 🔎: {'ON 🟢' if search_keywords_enabled else 'OFF 🔴'}\n"
-            f"📝 CA 🔎: {'ON 🟢' if search_ca_enabled else 'OFF 🔴'}\n"
-            f"💲 Ticker 🔎: {ticker_status_welcome}\n"
-            f"👻 Headless Mode: {headless_status_welcome}\n" # New line for Headless status
-            f"⏰ Schedule: {schedule_status} ({schedule_pause_start} - {schedule_pause_end})\n"
-            f"🏃🏼‍♂️‍➡️ Auto-Follow: {autofollow_mode_display}\n"
-            f"🌍 Timezone: {USER_TIMEZONE_STR}\n"
-        )
+        if MANUAL_LOGIN_SESSION_ACTIVE:
+            # In this mode, the browser is opened to x.com/login.
+            # The bot waits for the user to log in manually and confirm.
+            admin_user_id_to_notify = None
+            if INITIAL_ADMIN_USER_ID and INITIAL_ADMIN_USER_ID.isdigit():
+                admin_user_id_to_notify = int(INITIAL_ADMIN_USER_ID)
+            elif admin_user_ids:
+                admin_user_id_to_notify = next(iter(admin_user_ids), None)
+
+            if admin_user_id_to_notify:
+                try:
+                    # The account_number passed via command line is now ONLY for backup file association
+                    account_for_backup_display = get_current_account_username() or f"Account Index {current_account}"
+                    manual_session_instructions = (
+                        f"🤖 Manual Login Session Active 🤖\n\n"
+                        f"A browser window has been opened to x.com/login.\n"
+                        f"Please log in with your desired X account directly in the browser.\n\n"
+                        f"This session is associated with backup files for: **{account_for_backup_display}**.\n\n"
+                        f"Once you are successfully logged into X (you see your timeline), "
+                        f"send the command `/manual_login_complete` to me.\n\n"
+                        f"After confirmation, you can use:\n"
+                        f"  `/backupfollowers`\n"
+                        f"  `/endmanualsession` (to logout & shutdown bot)"
+                    )
+                    await application.bot.send_message(
+                        chat_id=admin_user_id_to_notify,
+                        text=manual_session_instructions,
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                    print(f"Manual login session active. Instructions sent to admin. Waiting for /manual_login_complete.")
+                except Exception as e:
+                    print(f"Error sending manual login session instructions: {e}")
+            else:
+                print("Manual login session active. No admin ID to notify. Please log in via browser and use /manual_login_complete.")
+            # The main loop will now wait for manual_session_login_confirmed to be True
+        elif ADHOC_LOGIN_SESSION_ACTIVE:
+            # In adhoc mode, after sending instructions, we just wait.
+            # The main loop will handle the ADHOC_LOGIN_SESSION_ACTIVE flag.
+            print("Ad-hoc session: Waiting for user login and /confirmlogin command.")
+            pass # Explicitly do nothing more here in the init phase for adhoc
+        else: 
+
+            is_schedule_pause = False # Schedule pause is a runtime status, not persistent
+
+            # Check if the schedule would force a pause *now*
+            initial_schedule_check = check_schedule()
+            if initial_schedule_check is True:
+                # If the schedule wants a pause AND the bot is currently running (according to settings)
+                if not is_scraping_paused:
+                    print("INFO: Start time is within the scheduled pause period (Schedule active). Overriding loaded status -> PAUSED.")
+                    is_scraping_paused = True
+                    is_schedule_pause = True
+                    pause_event.clear()
+                    # No save_settings() here, as this is just the initial state
+                else:
+                    # Bot is already paused (manually or from last run), schedule also wants pause
+                    print("INFO: Start time is within the scheduled pause period, bot is already paused (according to settings).")
+                    # Set is_schedule_pause if the reason is now the schedule
+                    is_schedule_pause = True # Mark that the *current* pause is (also) due to schedule
+            # The case initial_schedule_check == "resume" is not handled here,
+            # as the bot starts paused by default or the saved state applies.
+            # The main loop will handle the resume case correctly.
+
+            running_status = "⏸️ PAUSED 🟡 (Schedule)" if is_scraping_paused and is_schedule_pause else ("⏸️ PAUSED 🟡 (Manual)" if is_scraping_paused else "▶️ RUNNING 🟢")
+            running_status_top = "🟥🟥🟥" if is_scraping_paused and is_schedule_pause else ("🟥🟥🟥" if is_scraping_paused else "🟩🟩🟩")
+            schedule_status = "🟢" if schedule_enabled else "🔴"
+            current_username_welcome = get_current_account_username() or "N/A"
+            autofollow_mode_display = auto_follow_mode.upper()
+            if auto_follow_mode == "slow":
+                autofollow_mode_display += f"🐌 ({auto_follow_interval_minutes[0]}-{auto_follow_interval_minutes[1]} min)"
+            elif auto_follow_mode == "off":
+                 autofollow_mode_display = "🔴"
+            ticker_status_welcome = "🟢" if search_tickers_enabled else "🔴"
+            lr_buttons_status_welcome = "🟢" if like_repost_buttons_enabled else "🔴"
+            show_unrated_welcome = "🟢" if show_posts_from_unrated_enabled else "❌"
+            min_avg_rating_welcome = f"{'🟢' if min_average_rating_for_posts > 0.0 else '❌'} Min Avg Rating {min_average_rating_for_posts:.1f} "
+            rating_buttons_status_welcome = "🟢" if rating_buttons_enabled else "🔴"
+            headless_status_welcome = "🟢" if is_headless_enabled else "🔴"
+            welcome_message = (
+                f"🤖 raw-bot-X 🚀 START\n"
+                f"👉 Acc {current_account+1} (@{current_username_welcome})\n\n"
+                f"{running_status_top}▫️*STATUS*▫️{running_status_top}\n\n"
+                f"\n"
+                f"{running_status}\n\n"
+                f"🔎 Tracking\n"
+                f"  └🔑 {'🟢' if search_keywords_enabled else '🔴'} Keyword\n"
+                f"  └📝 {'🟢' if search_ca_enabled else '🔴'} CA\n"
+                f"  └💲 {ticker_status_welcome} Ticker\n\n"
+                f"👻 {headless_status_welcome} Headless Mode\n\n" 
+                f"⏰ {schedule_status} Schedule: ({schedule_pause_start} - {schedule_pause_end})\n\n"
+                f"👍 {lr_buttons_status_welcome} Like & Repost 🔄\n\n"
+                f"💎 {rating_buttons_status_welcome} Ratings\n"
+                f"  └🆕 {show_unrated_welcome} Unrated User\n"
+                f"  └💎 {min_avg_rating_welcome}\n\n"                
+                f"🏃🏼‍♂️‍➡️ {autofollow_mode_display} Auto-Follow\n\n"
+                f"🌍 Timezone: {USER_TIMEZONE_STR}\n"
+            )
+            if LATEST_VERSION_INFO: # Check if an update was found during startup
+                welcome_message += (
+                    f"\n\n🎉 <b>UPDATE AVAILABLE!</b> 🎉\n"
+                    f"   New Version: <b>{LATEST_VERSION_INFO['version']}</b> (Current: {SCRIPT_VERSION})\n"
+                    f"   <a href='{LATEST_VERSION_INFO['url']}'>Download Here</a>"
+                )
 
 
-        keyboard = [[InlineKeyboardButton("ℹ️ Show Help", callback_data="help:help")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await send_telegram_message(welcome_message, reply_markup=reply_markup)
-        print("Start message sent.")
+            keyboard = [[InlineKeyboardButton("ℹ️ Show Help", callback_data="help:help")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await send_telegram_message(welcome_message, reply_markup=reply_markup)
+            print("Start message sent.")
+
+
+            # --- Main Loop ---
+            print("Starting main loop...")
+
 
         # --- Initial Queue Check on Startup ---
         if not is_headless_enabled: # Only check if not starting in headless
@@ -9420,8 +10506,25 @@ async def run():
 
         # --- Main Loop ---
         print("Starting main loop...")
-        while True:
+        while not bot_should_exit: # Prüfe hier die neue Variable
             try:
+                if bot_should_exit: # Zusätzliche Prüfung am Anfang jeder Iteration
+                    break
+
+                if MANUAL_LOGIN_SESSION_ACTIVE:
+                    if not manual_session_login_confirmed:
+                        # print("DEBUG: Manual session active, login not yet confirmed. Waiting...") # Optional debug
+                        await asyncio.sleep(2) # Wait for /manual_login_complete
+                        continue # Skip all other processing
+                    else:
+                        # Login confirmed, allow admin commands but no scraping/auto-tasks
+                        # print("DEBUG: Manual session active, login confirmed. Waiting for commands.") # Optional debug
+                        await asyncio.sleep(5) # Keep alive for commands
+                        continue # Skip scraping/auto-tasks
+                elif ADHOC_LOGIN_SESSION_ACTIVE and not adhoc_login_confirmed:
+                    await asyncio.sleep(2) # Wait for /confirmlogin
+                    continue
+
                 # --- New Scheduled Task Checks (Sync & Follow List) ---
                 # These run regardless of the main bot's pause state.
                 # They will internally manage pausing/resuming the main scraping if they use the browser.
@@ -9631,17 +10734,19 @@ async def run():
                 # 3. If we are here, the bot is NOT paused
 
                 # ---  Periodic WebDriver Restart ---
-                global last_driver_restart_time, driver # Access globals
+                # Access last_driver_restart_time globally here, driver will be handled inside the if block
+                global last_driver_restart_time
                 restart_interval_seconds = 4 * 60 * 60 # 4 hours
 
                 if time.time() - last_driver_restart_time > restart_interval_seconds:
+                    # 'driver' is already global from the top of the run() function
                     print(f"INFO: {restart_interval_seconds / 3600:.1f} hours passed since last driver restart. Restarting...")
                     await send_telegram_message("🔄 Starting scheduled WebDriver restart for memory release...")
                     await pause_scraping() # Pause main scraping
                     login_ok_after_restart = False
                     try:
                         # Close old driver safely
-                        if driver:
+                        if driver: # Now 'driver' refers to the global one
                             print("Closing old WebDriver...")
                             try:
                                 driver.quit()
@@ -9661,6 +10766,11 @@ async def run():
                             await send_telegram_message("✅ WebDriver restart and login successful.")
                             last_driver_restart_time = time.time() # Update timestamp ONLY on success
                             login_ok_after_restart = True
+
+                            # --- Check for updates after successful restart & login ---
+                            print("INFO: Checking for updates after WebDriver restart...")
+                            await handle_update_notification() # This will check and send if new & unnotified
+                            # --- End update check ---
                         else:
                             print("ERROR: Login after WebDriver restart failed!")
                             await send_telegram_message("❌ ERROR: Login after WebDriver restart failed! Trying again at the next interval.")
@@ -9846,6 +10956,62 @@ async def run():
         if application and application.running:
             print("Stopping Telegram..."); await application.updater.stop(); await application.stop(); await application.shutdown(); print("Telegram stopped.")
         print("Cleanup completed. Script finished.")
+
+async def manual_login_complete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Confirms that the user has manually logged in during a MANUAL_LOGIN_SESSION_ACTIVE."""
+    global MANUAL_LOGIN_SESSION_ACTIVE, manual_session_login_confirmed, driver
+
+    if not MANUAL_LOGIN_SESSION_ACTIVE:
+        await update.message.reply_text("ℹ️ This command is only for pre-configured manual login sessions.")
+        return
+
+    if manual_session_login_confirmed:
+        await update.message.reply_text("ℹ️ Login already confirmed for this manual session.")
+        return
+
+    if not driver:
+        await update.message.reply_text("⚠️ WebDriver not found. Cannot confirm login state. Please restart the session.")
+        return
+
+    # Basic check: Are we still on the login page or on the home timeline?
+    current_url = ""
+    try:
+        current_url = driver.current_url
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Error getting current URL from browser: {e}. Please ensure browser is responsive.")
+        return
+
+    if "x.com/login" in current_url and "x.com/home" not in current_url:
+        # More robust check: try to find a timeline element if not clearly on /home
+        try:
+            WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.XPATH, '//div[@data-testid="primaryColumn"]//section[@role="region"]'))
+            )
+            # If above doesn't throw, we are likely on the timeline even if URL is not /home
+        except:
+            await update.message.reply_text("⚠️ It seems you are not fully logged into X yet (login page or no timeline detected). Please complete the login in the browser and try `/manual_login_complete` again.")
+            return
+
+    manual_session_login_confirmed = True
+    # Try to get the username of the manually logged-in account
+    logged_in_username = "Unknown (manual session)"
+    try:
+        profile_button = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.XPATH, '//a[@data-testid="AppTabBar_Profile_Link"]'))
+        )
+        href = profile_button.get_attribute('href')
+        if href:
+            logged_in_username = "@" + href.split('/')[-1]
+    except Exception as e:
+        print(f"Could not determine username for manual session: {e}")
+
+    account_for_backup_display = get_current_account_username() or f"Account Index {current_account}"
+    await update.message.reply_text(f"✅ Manual login confirmed (User: {logged_in_username}).\n"
+                                     f"Backup operations will be associated with: **{account_for_backup_display}**.\n"
+                                     "You can now use `/backupfollowers`.\n"
+                                     "Use `/endmanualsession` when finished.",
+                                     parse_mode=ParseMode.MARKDOWN)
+    logger.info(f"Manual login session confirmed by user {update.message.from_user.id}. Logged in as ~{logged_in_username}")
 
 async def show_ratings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Displays the collected ratings, including Top 3."""
@@ -10204,7 +11370,9 @@ async def restart_driver_and_login(update_or_query):
     finally:
         # --- Start Queued Scrapes (only if login succeeded and headless is OFF) ---
         if login_ok_after_restart and not is_headless_enabled:
+            print("DEBUG: RUN_PATH_2 - Before initial queue check")
             queued_usernames = read_and_clear_scrape_queue()
+            print("DEBUG: RUN_PATH_2 - Starting main loop...")
             if queued_usernames:
                 logger.info(f"Found {len(queued_usernames)} usernames in scrape queue after restart. Starting tasks...")
                 await send_msg(f"✅ Headless mode disabled. Starting {len(queued_usernames)} queued scrape task(s)...")
@@ -10256,77 +11424,172 @@ async def cleanup():
 # ... (Rest of your script: __main__ block etc.) ...
 # Ensure the __main__ block calls `asyncio.run(run())`
 if __name__ == '__main__':
-    # ... (Your argument parsing code to set ACTIVE_BOT_TOKEN and current_account) ...
     # Default values
     account_index_to_use = 0
     bot_token_to_use = DEFAULT_BOT_TOKEN
     bot_identifier = "Default"
+    # MANUAL_LOGIN_SESSION_ACTIVE and ADHOC_LOGIN_SESSION_ACTIVE are False by default (global scope)
 
     # === ASCII Art Animation at Start (AFTER nest_asyncio) ===
     try:
-        # Ensure the function and variable are defined above
         display_ascii_animation(ascii_art)
     except NameError:
         print("WARNING: Could not display ASCII art (function/variable not found).")
     # =====================================
 
-    # Argument Parsing (as provided by you)
+    # Argument Parsing
     num_args = len(sys.argv)
-    valid_args = True
-    if num_args == 1:
+    valid_args = True # Assume valid arguments initially for each mode
+
+    # Determine the mode of operation first
+    current_operation_mode = "normal" # Default to normal operation
+    if num_args > 1:
+        if sys.argv[1].lower() == "login_manual_session":
+            current_operation_mode = "manual_session"
+        elif sys.argv[1].lower() == "adhoc_login":
+            current_operation_mode = "adhoc_session"
+
+    # --- Process based on operation mode ---
+    if current_operation_mode == "manual_session":
+        print("INFO: 'login_manual_session' argument now redirects to 'adhoc_login' behavior.")
+        current_operation_mode = "adhoc_session" # Umleiten zum adhoc_login Flow
+        # MANUAL_LOGIN_SESSION_ACTIVE bleibt False
+
+    # Der nächste Block ist dann der für adhoc_session
+    if current_operation_mode == "adhoc_session": # Diese Bedingung wird jetzt auch für login_manual_session getriggert
+        ADHOC_LOGIN_SESSION_ACTIVE = True
+        bot_identifier = "AdHoc"
+        bot_token_to_use = DEFAULT_BOT_TOKEN
         print("")
-        print("")
-        print("No argument provided. Starting with default bot and Account 1.")
-    elif num_args == 2:
-        arg1 = sys.argv[1]
-        if arg1.lower() == "test":
-            print("")
-            print("")
-            print("Argument 'test' recognized. Starting with test bot and Account 1.")
-            bot_token_to_use = TEST_BOT_TOKEN
-            bot_identifier = "Test"
-            if not bot_token_to_use: print("ERROR: TEST_BOT_TOKEN not in config.env!"); valid_args = False
-        else:
+        print("MANUAL LOGIN SESSION MODE ACTIVATED (Pre-configured Account)")
+        print("----------------------------------------------------------")
+        if num_args == 2: # login_manual_session (no account specified)
+            account_index_to_use = 0
+            print("Using Account 1 for this manual login session.")
+        elif num_args == 3: # login_manual_session <account_number>
             try:
-                req_acc_num = int(arg1); req_idx = req_acc_num - 1
+                req_acc_num = int(sys.argv[2])
+                req_idx = req_acc_num - 1
                 if 0 <= req_idx < len(ACCOUNTS):
-                    print(f"Argument '{arg1}' recognized as account no. Starting default bot, Account {req_acc_num}.")
                     account_index_to_use = req_idx
-                else: print(f"Warning: Invalid account no. '{req_acc_num}'. Available: 1-{len(ACCOUNTS)}."); valid_args = False
-            except ValueError: print(f"Warning: Invalid argument '{arg1}'. Expected: Account no. or 'test'."); valid_args = False
-        if not valid_args: print("Using default bot and Account 1 as fallback."); account_index_to_use = 0; bot_token_to_use = DEFAULT_BOT_TOKEN; bot_identifier = "Default"; valid_args = True
-    elif num_args == 3:
-        arg1, arg2 = sys.argv[1], sys.argv[2]
-        if arg1.lower() == "test": bot_token_to_use = TEST_BOT_TOKEN; bot_identifier = "Test";
-        elif arg1.lower() == "default": bot_token_to_use = DEFAULT_BOT_TOKEN; bot_identifier = "Default";
-        else: print(f"Warning: Invalid bot ID '{arg1}'. Expected: 'test'/'default'."); valid_args = False;
-        if valid_args:
-             try:
-                 req_acc_num = int(arg2); req_idx = req_acc_num - 1
-                 if 0 <= req_idx < len(ACCOUNTS): account_index_to_use = req_idx
-                 else: print(f"Warning: Invalid account no. '{req_acc_num}'. Available: 1-{len(ACCOUNTS)}."); valid_args = False
-             except ValueError: print(f"Warning: Invalid account no. '{arg2}'."); valid_args = False
-        if not valid_args: print("Invalid arguments. Starting default bot, Account 1."); account_index_to_use = 0; bot_token_to_use = DEFAULT_BOT_TOKEN; bot_identifier = "Default"; valid_args = True
-    else: print("Warning: Too many arguments. Starting default bot, Account 1."); account_index_to_use = 0; bot_token_to_use = DEFAULT_BOT_TOKEN; bot_identifier = "Default";
+                    print(f"Using Account {req_acc_num} for this manual login session.")
+                else:
+                    print(f"Warning: Invalid account no. '{req_acc_num}' for manual session. Available: 1-{len(ACCOUNTS)}.")
+                    valid_args = False
+            except ValueError:
+                print(f"Warning: Invalid account no. '{sys.argv[2]}' for manual session.")
+                valid_args = False
+        else: # login_manual_session with too many args
+            print("Warning: Too many arguments for 'login_manual_session'. Expected: login_manual_session [account_number]")
+            valid_args = False
+        
+        if not valid_args: # Fallback for MANUAL_LOGIN_SESSION_ACTIVE if args were bad
+            print("Defaulting to Account 1 for manual session due to argument error.")
+            account_index_to_use = 0
+            # valid_args is not strictly needed to be True here as we've defaulted and will proceed.
 
-    # Final check and set globals
-    if not bot_token_to_use: print("ERROR: No valid bot token (Default/Test). Check config.env!"); sys.exit(1)
-    if not (0 <= account_index_to_use < len(ACCOUNTS)): print(f"ERROR: Internal error - Account index {account_index_to_use} invalid."); sys.exit(1)
+    elif current_operation_mode == "adhoc_session":
+        ADHOC_LOGIN_SESSION_ACTIVE = True
+        bot_identifier = "AdHoc"
+        bot_token_to_use = DEFAULT_BOT_TOKEN
+        print("")
+        print("ADHOC LOGIN SESSION MODE ACTIVATED (User-Provided Credentials in Browser)")
+        print("-----------------------------------------------------------------------")
+        print("Please log in manually in the browser window that will open.")
+        print("After successful login, use the /confirmlogin command in Telegram.")
+        current_account = -1 # Indicate no specific pre-configured account for this mode
+        # account_index_to_use is not relevant here as we don't pick from ACCOUNTS
+        # No further argument validation needed for adhoc_session itself beyond the command.
 
+    else: # current_operation_mode == "normal"
+        # Normal argument parsing
+        if num_args == 1:
+            print("")
+            print("")
+            print("No argument provided. Starting with default bot and Account 1.")
+        elif num_args == 2:
+            arg1 = sys.argv[1]
+            # Note: "login_manual_session" and "adhoc_login" are already handled above
+            if arg1.lower() == "test":
+                print("")
+                print("")
+                print("Argument 'test' recognized. Starting with test bot and Account 1.")
+                bot_token_to_use = TEST_BOT_TOKEN
+                bot_identifier = "Test"
+                if not bot_token_to_use: print("ERROR: TEST_BOT_TOKEN not in config.env!"); valid_args = False
+            else: # Assumed to be an account number
+                try:
+                    req_acc_num = int(arg1); req_idx = req_acc_num - 1
+                    if 0 <= req_idx < len(ACCOUNTS):
+                        print(f"Argument '{arg1}' recognized as account no. Starting default bot, Account {req_acc_num}.")
+                        account_index_to_use = req_idx
+                    else: print(f"Warning: Invalid account no. '{req_acc_num}'. Available: 1-{len(ACCOUNTS)}."); valid_args = False
+                except ValueError: print(f"Warning: Invalid argument '{arg1}'. Expected: Account no. or 'test'."); valid_args = False
+            
+            if not valid_args: # Fallback for 2-arg normal mode
+                print("Using default bot and Account 1 as fallback."); 
+                account_index_to_use = 0; bot_token_to_use = DEFAULT_BOT_TOKEN; bot_identifier = "Default";
+        
+        elif num_args == 3: # Normal mode with bot type and account number
+            arg1, arg2 = sys.argv[1], sys.argv[2]
+            if arg1.lower() == "test": bot_token_to_use = TEST_BOT_TOKEN; bot_identifier = "Test";
+            elif arg1.lower() == "default": bot_token_to_use = DEFAULT_BOT_TOKEN; bot_identifier = "Default";
+            else: print(f"Warning: Invalid bot ID '{arg1}'. Expected: 'test'/'default'."); valid_args = False;
+            
+            if valid_args: # Only proceed if bot ID was valid
+                 try:
+                     req_acc_num = int(arg2); req_idx = req_acc_num - 1
+                     if 0 <= req_idx < len(ACCOUNTS): account_index_to_use = req_idx
+                     else: print(f"Warning: Invalid account no. '{req_acc_num}'. Available: 1-{len(ACCOUNTS)}."); valid_args = False
+                 except ValueError: print(f"Warning: Invalid account no. '{arg2}'."); valid_args = False
+            
+            if not valid_args: # Fallback if any part of normal 3-arg was bad
+                print("Invalid arguments for normal mode. Starting default bot, Account 1."); 
+                account_index_to_use = 0; bot_token_to_use = DEFAULT_BOT_TOKEN; bot_identifier = "Default";
+        
+        else: # num_args > 3 (and not a special mode)
+            print("Warning: Too many arguments for normal mode. Starting default bot, Account 1."); 
+            account_index_to_use = 0; bot_token_to_use = DEFAULT_BOT_TOKEN; bot_identifier = "Default";
+
+    # Final check for bot token (applies to all modes)
+    if not bot_token_to_use:
+        print("ERROR: No valid bot token configured. Check config.env!");
+        sys.exit(1)
     ACTIVE_BOT_TOKEN = bot_token_to_use
-    current_account = account_index_to_use
 
-    print(f"\n\n\n---> Starting script with Bot: '{bot_identifier}', Account: {account_index_to_use + 1} <---\n")
+    # Set current_account based on the mode (adhoc already set current_account = -1)
+    if not ADHOC_LOGIN_SESSION_ACTIVE: # For normal and manual_session
+        if not (0 <= account_index_to_use < len(ACCOUNTS)):
+            if len(ACCOUNTS) == 0:
+                print(f"ERROR: No accounts configured in ACCOUNTS list. Cannot use account index {account_index_to_use}.")
+            else:
+                print(f"ERROR: Invalid account index {account_index_to_use}. Max index: {len(ACCOUNTS)-1}.");
+            sys.exit(1)
+        current_account = account_index_to_use
+
+    # Print startup message
+    if MANUAL_LOGIN_SESSION_ACTIVE:
+        # Ensure current_account is valid before accessing ACCOUNTS for the message
+        if 0 <= current_account < len(ACCOUNTS):
+             print(f"\n---> Starting MANUAL LOGIN SESSION with Bot: '{bot_identifier}', for Account: {current_account + 1} (@{ACCOUNTS[current_account].get('username', 'N/A')}) <---\n")
+        else:
+             print(f"\n---> Starting MANUAL LOGIN SESSION with Bot: '{bot_identifier}', for Account Index: {current_account} (Error: Index out of bounds or no accounts) <---\n")
+    elif ADHOC_LOGIN_SESSION_ACTIVE:
+        print(f"\n---> Starting ADHOC LOGIN SESSION with Bot: '{bot_identifier}' <---\n")
+    else: # Normal mode
+        if 0 <= current_account < len(ACCOUNTS):
+            print(f"\n\n\n---> Starting script with Bot: '{bot_identifier}', Account: {current_account + 1} (@{ACCOUNTS[current_account].get('username', 'N/A')}) <---\n")
+        else:
+            print(f"\n\n\n---> Starting script with Bot: '{bot_identifier}', Account Index: {current_account} (Error: Index out of bounds or no accounts) <---\n")
 
     # Start script
     try:
-        # Get or create event loop and run run()
-        asyncio.run(run()) # Preferred method in Python 3.7+
+        asyncio.run(run())
     except KeyboardInterrupt:
         print("Bot stopped due to KeyboardInterrupt...")
     except RuntimeError as e:
          if "Cannot run the event loop while another loop is running" in str(e) or "This event loop is already running" in str(e):
-              print("Error: Event loop conflict. Trying nest_asyncio (already applied). Script might be unstable.")
+              print("Error: Event loop conflict. nest_asyncio already applied. Script might be unstable.")
          else:
              print(f"Unexpected runtime error in __main__: {e}")
              import traceback

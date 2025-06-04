@@ -1,28 +1,26 @@
+# Secrets & Config
 config.env
+*.env
+*.env.gpg
 
+# Data files
 *.cookies.json
+*.json
+*.txt
 
-admins.json
-settings.json
-posts_count.json
-ratings.json
-schedule.json
-add_contacts_*.txt
-follower_backup_*.txt
-global_followed_users.txt
-keywords.json
-settings.json
-
+# Python cache
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 
+# Virtual environments
 venv/
 *.venv/
 env/
 *.env/
 
+# Editor files
 .vscode/
 .idea/
 *.sublime-project
