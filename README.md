@@ -286,15 +286,6 @@ On X, left panel go to -> ... More -> Settings and privacy -> Accessibility, dis
 
 ## Configuration
 
-### How to get Telegram credentials:
-- `BOT_TOKEN` & `: Get from [@BotFather](https://t.me/botfather) -> `/newbot`
-- `BOT_USERNAME`: Set a name, has no function yet. Telegram uses the Botfather name.
-- `CHANNEL_ID`: Add [@Phanes_bot](https://t.me/Phanes) to your group/channel -> type `/id` Group/Channel ID will be YourTelegramChannelID
-- `ADMIN_USER_ID`: Search for `@userinfobot` -> open a chat with it -> click `/start` down below. The ID will be YourAdminUserID
->Admin ID is important, only admins can interact with the bot.
-
-- `ACCOUNT_1_USERNAME`: The account username, is your X account username (e.g., @yourhandle), entered here without the '@' symbol.
-
 ### Create a file in the bot directory:
 `Linux` - create the file **config.env** and put the code down below inside or rename the downloaded file config.env.example.
 `Windows` - you first have to ensure that your file extension is showing. Otherwise your file would be named config.env.txt rather than config.env.
@@ -314,6 +305,15 @@ Check "File name extensions": In the "Show/hide" section of the ribbon, you'll s
 Now create the file **config.env** and put the code down below inside or rename the downloaded file config.env.example.
 
 Set your YourBotToken, YourBotUsername, YourTelegramChannelID, YourAdminUserID, email, password, and username, and save the file.
+
+### How to get Telegram credentials:
+- `BOT_TOKEN` & `: Get from [@BotFather](https://t.me/botfather)` -> `/newbot`
+- `BOT_USERNAME`: Set a name, has no function yet. Telegram uses the Botfather name.
+- `CHANNEL_ID`: Add [@Phanes_bot](https://t.me/Phanes) to your group/channel -> type `/id` Group/Channel ID will be YourTelegramChannelID
+- `ADMIN_USER_ID`: Search for `@userinfobot` -> open a chat with it -> click `/start` down below. The ID will be YourAdminUserID
+>Admin ID is important, only admins can interact with the bot.
+
+- `ACCOUNT_1_USERNAME`: The account username, is your X account username (e.g., @yourhandle), entered here without the '@' symbol.
 
 The cookie file will be created the first time you log in. You can leave the name as it is.
 `ACCOUNT_1_COOKIES=x_0.cookies.json` 
@@ -367,7 +367,6 @@ rates - Show collected source ratings and Top 3
 globallistinfo - Show status of the global follower list
 autofollowstatus - Show auto-follow status for current account
 listadmins - List current bot admins
-
 pause - Pause post searching and other activities
 resume - Resume post searching and other activities
 searchtickers - Toggle searching for $Tickers ON/OFF
@@ -376,7 +375,6 @@ toggleheadless - Toggle headless mode ON/OFF (requires WebDriver restart)
 setminavgrating - Set min average rating filter for posts (e.g., /setminavgrating 3.5)
 toggleshowunrated - Toggle showing posts from unrated users ON/OFF
 togglelink - Show/configure CA link display settings
-
 scheduleon - Activate the main bot pause schedule
 scheduleoff - Deactivate the main bot pause schedule
 scheduletime - Set main bot pause schedule (e.g., /scheduletime 22:00-08:00)
@@ -384,10 +382,8 @@ schedulesync - Toggle scheduled sync ON/OFF
 schedulesynctime - Set time window for scheduled sync (e.g., /schedulesynctime 03:00-03:30)
 schedulefollowlist - Toggle scheduled follow list processing ON/OFF
 schedulefollowlisttime - Set time window for scheduled follow list (e.g., /schedulefollowlisttime 04:00-04:30)
-
 addkeyword - Add keywords (e.g., /addkeyword btc,eth)
 removekeyword - Remove keywords (e.g., /removekeyword sol)
-
 follow - Follow a user (e.g., /follow elonmusk)
 unfollow - Unfollow a user (e.g., /unfollow vitalikbuterin)
 addusers - Add users to current account's follow list (e.g., /addusers user1 @user2)
@@ -395,23 +391,18 @@ autofollowmode - Set auto-follow mode (off|slow|fast)
 autofollowinterval - Set slow auto-follow interval (e.g., /autofollowinterval 10-20 minutes)
 cancelfastfollow - Cancel running Fast-Follow task
 clearfollowlist - Clear current account's follow list (asks confirmation)
-
 like - Like a post by URL (e.g., /like <tweet_url>)
 repost - Repost a post by URL (e.g., /repost <tweet_url>)
-
 switchaccount - Switch X account (e.g. /switchaccount 2 or /switchaccount for next)
-
 backupfollowers - Backup current account's 'following' list
 syncfollows - Sync current account's 'following' with global list (asks confirmation)
 buildglobalfrombackups - Update global list from all account backups (asks confirmation)
 initglobalfrombackup - Overwrite global list from one account's backup (e.g., /initglobalfrombackup 1)
 cancelbackup - Cancel ongoing follower backup process
 cancelsync - Cancel ongoing follower sync process
-
 scrapefollowing - Scan 'following' of user(s) to DB (e.g. /scrapefollowing user1 user2)
 addfromdb - Add users from DB to follow list (e.g., /addfromdb f:10k s:2 k:dev)
 canceldbscrape - Cancel ongoing database scrape process
-
 addadmin - Add a bot admin (e.g., /addadmin 123456789 @userinfobot)
 removeadmin - Remove a bot admin (e.g., /removeadmin 987654321)
 ```
