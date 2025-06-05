@@ -513,10 +513,21 @@ Right click on win_set_bot_permissions.bat -> open as Administrator
 ## Aaaaaand you are done
 
 ### Start on Linux
+
+Without virtual environment (xvenv)
 ```bash
 cd ~/rawbotx/raw-bot-X
 python3 main.py
 ```
+With virtual environment
+```bash
+cd ~/rawbotx/raw-bot-X
+source xvenv/bin/activate
+python3 main.py
+```
+
+
+
 Type in your given config password. Now it should start running.
 
 As you see the start screen in your Telegram channel, the bot is paused. 
