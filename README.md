@@ -118,9 +118,9 @@ Sends results to your Telegram group with:
 
 **Installation time: approximately 15 minutes to 1 hour** 
 
-[Jump to Linux Installation](#-installation-linux-start)
-[Jump to Windows Installation](#-installation-windows-start)
-[Jump to Raspberry Pi Installation](#-installation-rpi-start)
+[Jump to Linux Installation](#installation-linux-start)
+[Jump to Windows Installation](#installation-windows-start)
+[Jump to Raspberry Pi Installation](#installation-rpi-start)
 
 
 ## Installation Linux START
@@ -183,7 +183,7 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-[Click for next step -> Chrome](#-configuration)
+[Click for next step -> Chrome](#configuration)
 
 ## Installation Linux END
 
@@ -268,7 +268,7 @@ C:\rawbotx\raw-bot-X\Chrome-win64
 C:\rawbotx\raw-bot-X\Chromedriver-win64
 ```
 
-[Click for next step -> Configuration](#-configuration)
+[Click for next step -> Configuration](#configuration)
 
 ## Installation Windows END
 
@@ -279,7 +279,7 @@ C:\rawbotx\raw-bot-X\Chromedriver-win64
 On X, left panel go to -> ... More -> Settings and privacy -> Accessibility, display, and languages 
 -> Data usage -> Autoplay -> never (Autostart Video deactivated)
 -> Datasaver ✅ (lower image quality)
-[Click for next step -> Configuration](#-configuration)
+[Click for next step -> Configuration](#configuration)
 
 ## Installation Raspberry Pi END
 
@@ -436,7 +436,7 @@ python main.py
 >The bot will login automatically with your name and password
 
 
-## Next step is optional safety measures for encryption and file permission. If you don't want this, you are done and can take a look at [Updating](#-aaaaaand-you-are-done) Otherwise go to the next step.
+## Next step is optional safety measures for encryption and file permission. If you don't want this, you are done and can take a look at [Updating](#aaaaaand-you-are-done) Otherwise go to the next step.
 
 
 ## Stop the script 
