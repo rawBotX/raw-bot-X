@@ -177,8 +177,9 @@ https://googlechromelabs.github.io/chrome-for-testing/#stable
 ~/rawbotx/raw-bot-X/Chromedriver-linux64
 ```
 
-### 6. Install Dependencies
+### 6. Install pip and Dependencies
 ```bash
+sudo apt install python3-pip
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
